@@ -1,0 +1,20 @@
+# C formatting for the SME kernels. Tuned to the existing hand-written style
+# (4-space indent, ~100 col, K&R braces, right-aligned pointers) so it formats
+# rather than rewrites.
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+BinPackParameters: true
+BinPackArguments: true
+AlignAfterOpenBracket: Align
+SpaceAfterCStyleCast: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+IndentCaseLabels: true

@@ -1,0 +1,33 @@
+[package]
+name = "sme-gemm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+sme-gemm = { path = ".." }
+
+[[bin]]
+name = "diff_i8"
+path = "fuzz_targets/diff_i8.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diff_f32"
+path = "fuzz_targets/diff_f32.rs"
+test = false
+doc = false
+bench = false
+
+# Keep symbols for crash triage.
+[profile.release]
+debug = 1
+
+[workspace]

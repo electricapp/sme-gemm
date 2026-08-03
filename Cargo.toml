@@ -1,0 +1,133 @@
+[package]
+name = "sme-gemm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Apple-Silicon-tuned SME (Scalable Matrix Extension) GEMM kernels for f16/bf16/f32/f64, i8/i16 and 4-bit weights on M4+"
+license = "MIT OR Apache-2.0"
+keywords = ["gemm", "sme", "matmul", "aarch64", "apple"]
+categories = ["mathematics", "hardware-support"]
+repository = "https://github.com/electricapp/sme-gemm"
+readme = "README.md"
+
+[dependencies]
+half = { version = "2", default-features = false }
+candle-core = { version = "0.10", optional = true }
+ort = { version = "2.0.0-rc.12", optional = true, features = ["coreml", "xnnpack", "half"] }
+burn = { version = "0.21", optional = true, default-features = false, features = ["ndarray"] }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+half = { version = "2", features = ["num-traits"] }
+proptest = "1"
+criterion = "0.5"
+# tests/guard_page.rs: mmap/mprotect guard pages around kernel operands.
+libc = "0.2"
+
+[[bench]]
+name = "gemm"
+harness = false
+
+[features]
+default = []
+# A candle CustomOp2 adapter that runs A@B on the SME kernels (CPU, f32/f16).
+candle = ["dep:candle-core"]
+# Benchmark vs ONNX Runtime (CPU / XNNPACK / CoreML EPs); examples/vs_ort.
+ort = ["dep:ort"]
+# Benchmark vs the burn framework's NdArray CPU backend; examples/vs_burn.
+burn = ["dep:burn"]
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "deny"
+missing_debug_implementations = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_qualifications = "deny"
+unused_lifetimes = "deny"
+# A GEMM crate is exactly where a silent numeric or lifetime slip is expensive,
+# so the rest of the rustc lint surface is on too.
+missing_copy_implementations = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+elided_lifetimes_in_paths = "deny"
+single_use_lifetimes = "deny"
+unused_import_braces = "deny"
+unused_macro_rules = "deny"
+meta_variable_misuse = "deny"
+variant_size_differences = "deny"
+non_ascii_idents = "deny"
+let_underscore_drop = "deny"
+unit_bindings = "deny"
+redundant_lifetimes = "deny"
+ffi_unwind_calls = "deny"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_rust_codeblocks = "deny"
+bare_urls = "deny"
+unescaped_backticks = "deny"
+redundant_explicit_links = "deny"
+missing_crate_level_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# The unsafe surface is the FFI boundary; every block must justify itself.
+undocumented_unsafe_blocks = "deny"
+missing_assert_message = "deny"
+unwrap_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+# `a*b + c` -> `a.mul_add(b, c)` fuses the rounding. This crate's whole contract
+# is that the SME path and the scalar reference agree to a stated tolerance, and
+# several sites are the reference itself, so changing rounding here is a bug.
+suboptimal_flops = "allow"
+# Epilogue/Dequant hold raw pointers into caller slices and are read-only on both
+# sides of the FFI; the hand-written Send/Sync impls carry that argument.
+non_send_fields_in_send_ty = "allow"
+# Directly contradicts the (more useful) `unreachable_pub` above: this one wants
+# `pub` on items in private modules, that one then flags them as unreachable.
+redundant_pub_crate = "allow"
+# usize<->isize stride conversions and f64->f32 are inherent to the FFI/math
+# glue; try_into().unwrap() everywhere would only add panics and noise.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# GEMM math: m/n/k/i/j/l and a_rs/a_cs naming is the field's convention.
+similar_names = "allow"
+many_single_char_names = "allow"
+# Duplicate transitive versions come from the optional benchmark comparands
+# (candle/ort/burn) and dev-deps; nothing here is resolvable from this manifest.
+multiple_crate_versions = "allow"
+
+[[example]]
+name = "bench"
+
+[[example]]
+name = "vs_candle"
+required-features = ["candle"]
+
+[[example]]
+name = "vs_ort"
+required-features = ["ort"]
+
+[[example]]
+name = "vs_burn"
+required-features = ["burn"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+# Defense-in-depth for this crate's own builds (tests/fuzz/benches): a wrapped
+# dimension product can never silently pass a length check into the C FFI. The
+# load-bearing validators (check_strided, tensor_footprint, checked_dims) use
+# explicit checked arithmetic too, since profile flags do not apply downstream.
+overflow-checks = true

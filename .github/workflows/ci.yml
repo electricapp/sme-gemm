@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# NOTE on SME coverage: GitHub's hosted macOS arm64 runners are M1-class, and
+# SME (Scalable Matrix Extension) is Apple M4+ only, so the hand-written SME
+# kernels DO NOT execute here -- every entry point falls back to the portable
+# scalar reference. CI verifies that the crate BUILDS, LINTS, is FORMATTED, and
+# PASSES TESTS through that fallback. Exercising the real kernels needs M4+
+# hardware (self-hosted runner) and is covered by local runs on M4/M5.
+#
+# `macos-latest`, not a pinned older image: every TU compiles -mcpu=apple-m4,
+# which clang only accepts from 16 (Xcode 16) on. macos-14 ships clang 15 and
+# fails at the first C file. build.rs checks for this up front.
+#
+# The `ort` feature is intentionally excluded: it needs the onnxruntime native
+# library plus generated models that aren't available in CI.
+
+jobs:
+  build-test-lint:
+    name: build / test / clippy / fmt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust (clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'csrc/**', 'build.rs') }}
+
+      - name: Build (default features)
+        run: cargo build --release
+
+      - name: Build (candle + burn features)
+        run: cargo build --release --features candle,burn
+
+      - name: Test (release)
+        run: cargo test --release
+
+      # Crate sets clippy pedantic = deny via [lints]; a plain run must be clean.
+      - name: Clippy (all targets, candle + burn)
+        run: cargo clippy --release --all-targets --features candle,burn --
+
+      - name: Rustfmt check
+        run: cargo fmt --check
+
+  # Miri interprets the pure-Rust path (the SME kernels are FFI and never run
+  # under it) and checks the stride/pointer glue, packing, and reference
+  # implementations for undefined behavior. On x86_64 linux `half` uses its
+  # soft-float fallback, so the f16 properties run too (on aarch64 hosts they
+  # are `ignore`d: half's inline fcvt asm is uninterpretable).
+  miri:
+    name: miri (UB check, pure-Rust path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Miri (differential proptest + footprint validation)
+        run: cargo miri test --test proptest --test validation
