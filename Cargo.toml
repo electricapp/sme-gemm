@@ -12,7 +12,7 @@ readme = "README.md"
 
 [dependencies]
 half = { version = "2", default-features = false }
-candle-core = { version = "0.10", optional = true }
+candle-core = { version = "0.11", optional = true }
 ort = { version = "2.0.0-rc.12", optional = true, features = ["coreml", "xnnpack", "half"] }
 burn = { version = "0.21", optional = true, default-features = false, features = ["ndarray"] }
 
@@ -22,7 +22,7 @@ cc = "1"
 [dev-dependencies]
 half = { version = "2", features = ["num-traits"] }
 proptest = "1"
-criterion = "0.5"
+criterion = "0.8"
 # tests/guard_page.rs: mmap/mprotect guard pages around kernel operands.
 libc = "0.2"
 
