@@ -6,6 +6,68 @@ Hand-written against `arm_sme.h`, tuned for Apple's per-cluster shared SME unit
 (streaming-mode, SVL=512), dispatched across both the P- and E-cluster SME units
 via GCD.
 
+## SVE, SME, streaming mode
+
+[SVE][sve] is Arm's vector-length-agnostic SIMD: one binary runs at any hardware
+vector length, with predication in place of scalar tail loops. [SME][sme] builds
+on it with a two-dimensional accumulator, **ZA**, and outer-product instructions
+(`*MOPA`) that feed it. The C surface for both is [ACLE][acle]'s `arm_sve.h` and
+`arm_sme.h`; the normative definition is the [architecture supplement][spec].
+
+SME's compute instructions execute only in [streaming mode][streaming], entered
+and left with `SMSTART` / `SMSTOP`. Inside it the SVE registers take the
+_streaming_ vector length **SVL** (512 bits on Apple M4 and M5) and ZA is live;
+outside it ZA does not exist and part of the SVE and NEON instruction space is
+unavailable. The transition costs fixed time, so a kernel does as much work as
+it can per region, and small problems are routed around it.
+
+ZA is a 64×64-byte array (4 KB at SVL=512), addressed as tiles whose shape
+follows the element size: one 64×64 i8 tile, two 32×32 f16/bf16/i16, four 16×16
+f32/i32, eight 8×8 f64/i64. Apple gives each CPU _cluster_ one SME unit shared
+by its cores, rather than one per core, so the parallelism on offer is two
+units:
+
+```text
+        P-cluster                       E-cluster            (Apple M5)
+    ┌───┬───┬───┬───┐          ┌───┬───┬───┬───┬───┬───┐
+    │ P │ P │ P │ P │          │ E │ E │ E │ E │ E │ E │      cores
+    └─┬─┴─┬─┴─┬─┴─┬─┘          └─┬─┴─┬─┴─┬─┴─┬─┴─┬─┴─┬─┘
+      └───┴─┬─┴───┘              └───┴───┴─┬─┴───┴───┘
+       ┌────┴────┐                    ┌────┴────┐
+       │   SME   │                    │   SME   │             one unit per
+       │ ZA 4 KB │                    │ ZA 4 KB │             cluster, shared
+       └─────────┘                    └─────────┘
+```
+
+A MOPA reads two streaming-SVE vectors, forms their outer product, and
+accumulates it into a ZA tile — 1024 multiply-accumulates in one instruction for
+f16:
+
+```text
+     Zm →   b0   b1   b2   ..  b31      one streaming-SVE vector
+             │    │    │        │       (32 lanes of f16 at SVL=512)
+           ┌─┴────┴────┴────────┴─┐
+  Zn  a0 ─►│  ·    ·    ·       · │
+      a1 ─►│  ·    ·    ·       · │     ZA[i][j] += a[i] * b[j]
+      ..   │                      │
+     a31 ─►│  ·    ·    ·       · │
+           └──────────────────────┘
+              ZA0.H — 32×32 f16
+
+  GEMM tile:  for k in 0..K:  ZA += A[:,k] ⊗ B[k,:] ;  then store ZA → C
+```
+
+Widening forms take more of K per instruction into a wider tile: f16→f32 takes
+two K-steps into a 16×16 f32 tile (512 MACs, hence about half the rate of the
+f16→f16 form), i8→i32 takes four (1024, matching f16).
+
+[sve]: https://developer.arm.com/documentation/102476/latest/
+[sme]: https://developer.arm.com/documentation/109246/0101/
+[streaming]:
+  https://developer.arm.com/documentation/109246/0101/SME-Overview/Streaming-SVE-mode
+[acle]: https://arm-software.github.io/acle/main/acle.html
+[spec]: https://developer.arm.com/documentation/ddi0616/latest/
+
 ## Kernels
 
 | dtype          | path                                  | output | min CPU |
