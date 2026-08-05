@@ -127,6 +127,10 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p32, const float *bi
 // its use site in gemm_sme_f32_run).
 #define SME_F32_SERIAL_FLOPS ((uint64_t)1 << 22)
 
+// Largest A (in elements) the ZA-transpose pack takes; justified at its use site
+// in gemm_sme_f32_run.
+#define SME_F32_ZA_PACK_ELEMS ((size_t)1 << 20)
+
 // Workers for the direct-B path's dynamic M-chunk claiming. Deliberately one
 // fewer than the number of chunks: hand every worker exactly one and the call
 // ends on the slowest, which is an E-cluster worker every time. Leaving a chunk
@@ -513,6 +517,55 @@ static float *apack_scratch(size_t bytes) {
     return g_apack;
 }
 
+// Transpose row-major A into the packed [k, 16] layout using ZA itself: a
+// vertical load writes a memory vector into a tile COLUMN, a horizontal store
+// reads a tile ROW back out, so 16 of each transpose a 16x16 block. That is 32
+// instructions per 256 floats against the NEON path's 16 loads, 16 stores and
+// ~32 shuffles -- the NEON transpose is issue-bound at ~1 instruction per float,
+// and this is the only way past that. Only tile 0 is touched, and the caller's
+// accumulator tiles are dead at this point (this runs before the K-loop).
+__arm_locally_streaming __arm_new("za") static void packa_sme(float *a_pack, const float *lhs,
+                                                              long lhs_rs, size_t m, size_t k,
+                                                              size_t mt_lo, size_t mt_hi) {
+    svbool_t pg = svptrue_b32();
+    size_t per_tile = ep_cmul(k, 16);
+    for (size_t st = 2 * mt_lo; st < 2 * mt_hi; st++) {
+        size_t r0 = st * 16;
+        size_t vr = (r0 < m) ? ((m - r0 < 16) ? (m - r0) : 16) : 0;
+        float *dst = a_pack + st * per_tile;
+        size_t d = 0;
+        // Four depth-blocks in flight, one per ZA tile: every store of a tile
+        // depends on all sixteen loads into it, so a single tile leaves that
+        // latency exposed.
+        for (; d + 64 <= k; d += 64) {
+            if (vr < 16) svzero_za();
+            for (size_t i = 0; i < vr; i++) {
+                const float *src = lhs + (long)(r0 + i) * lhs_rs + (long)d;
+                svld1_ver_za32(0, (uint32_t)i, pg, src);
+                svld1_ver_za32(1, (uint32_t)i, pg, src + 16);
+                svld1_ver_za32(2, (uint32_t)i, pg, src + 32);
+                svld1_ver_za32(3, (uint32_t)i, pg, src + 48);
+            }
+            for (uint32_t r = 0; r < 16; r++) {
+                svst1_hor_za32(0, r, pg, dst + (d + r) * 16);
+                svst1_hor_za32(1, r, pg, dst + (d + 16 + r) * 16);
+                svst1_hor_za32(2, r, pg, dst + (d + 32 + r) * 16);
+                svst1_hor_za32(3, r, pg, dst + (d + 48 + r) * 16);
+            }
+        }
+        for (; d + 16 <= k; d += 16) {
+            if (vr < 16) svzero_za();
+            for (size_t i = 0; i < vr; i++)
+                svld1_ver_za32(0, (uint32_t)i, pg, lhs + (long)(r0 + i) * lhs_rs + (long)d);
+            for (uint32_t r = 0; r < 16; r++)
+                svst1_hor_za32(0, r, pg, dst + (d + r) * 16);
+        }
+        for (; d < k; d++)
+            for (size_t i = 0; i < 16; i++)
+                dst[d * 16 + i] = (i < vr) ? lhs[(long)(r0 + i) * lhs_rs + (long)d] : 0.0f;
+    }
+}
+
 // The small/medium f32 path: B is packed per N-tile into a small scratch instead
 #include "gemm_f32_small.h"
 
@@ -582,6 +635,12 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
                 // Blocks capture by const value, so capture the POINTER: taking
                 // &cursor inside the block would give each worker its own.
                 _Atomic size_t *cur = &cursor;
+                // ZA-transpose the A-pack while A is small enough to stay in
+                // cache; once it is DRAM-sized the NEON transpose's wider
+                // memory-level parallelism wins back more than the instruction
+                // count costs (0.91x at 16384x512x512, where A is 32 MB).
+                int sme_pack = lhs_cs == 1 &&
+                               ep_cmul(m, k) <= SME_F32_ZA_PACK_ELEMS;
                 dispatch_apply(f32_workers(sc_n),
                                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                                ^(size_t w) {
@@ -593,7 +652,11 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
                                      if (mt0 >= m_tiles) break;
                                      size_t mt1 =
                                          mt0 + sc_chunk < m_tiles ? mt0 + sc_chunk : m_tiles;
-                                     PACKA_SMALL(a_pack, mt0, mt1);
+                                     if (sme_pack) {
+                                         packa_sme(a_pack, lhs, lhs_rs, m, k, mt0, mt1);
+                                     } else {
+                                         PACKA_SMALL(a_pack, mt0, mt1);
+                                     }
                                      run_small(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k,
                                                mt0, mt1, alpha, beta, read_dst, ep);
                                  }
