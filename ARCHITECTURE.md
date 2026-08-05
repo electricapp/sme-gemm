@@ -89,15 +89,30 @@ path measures 1.00–1.01×.
 `dispatch_apply` entry and exit and the streaming-mode transition cost a few µs
 each, which dominates small problems. Each kernel forks:
 
-- **Small and medium: serial, direct-load.** One streaming region on the calling
-  thread, using a per-thread reusable A-pack scratch buffer with no per-call
-  `malloc`/`free`. The guard is roughly `n_chunks <= 1 || m*n*k < threshold`.
-- **Large: multi-cluster.** A shared `malloc`'d A-pack buffer and
+- **Direct-load B.** B is read straight from a row-major `rhs`, skipping the
+  pack entirely — worth more than the packing it saves, since packing reads and
+  writes all of B before a single MOPA issues. The cost is that B is re-read
+  once per M-tile, so the gate is B's own footprint (`n*k*elem`), not the
+  problem size: at equal flop counts a small-B shape prefers this path and a
+  large-B one collapses on it. Blocking the path over N does not raise the
+  limit, because a block still walks K at stride `n` and so covers B's whole
+  address range; making that range contiguous is what packing is for. The f64
+  budget is well under f32's, its N-tile being 8 lanes rather than 32.
+- **Packed B, multi-cluster.** B packed once, a shared `malloc`'d A-pack, and
   `dispatch_apply` over M-chunks.
 
-Rust has an analogous floor: `sme_worth_it(m,n,k)` requires
-`has_sme() && k >= 2 && m*n*k >= SME_MIN_FLOPS (1<<18)`, below which the scalar
-reference runs rather than paying streaming setup.
+Within the direct-load path the split is serial vs. `dispatch_apply` over
+M-chunks, on a flop floor rather than a chunk count: below a few MFLOP the
+dispatch costs more than the second cluster returns, and two shapes that chunk
+identically can want opposite answers.
+
+Rust has an analogous floor. `sme_worth_it(m,n,k)` requires
+`has_sme() && k >= 2` plus a flop minimum that depends on how much of a ZA tile
+the output fills: MOPA accumulates into a 32×32 tile whatever the shape, so a
+1×1 product still pays for 1024 lanes, and vector-shaped work loses to the
+scalar reference no matter how large `k` is. From `m*n >= 8` upward the padding
+is amortized and the floor drops to `1<<12`; below it the original `1<<18`
+stands.
 
 The floor applies only where the fallback costs O(m·n·k). For the pre-packed
 weight types, `Packed<T>` and `Q4Weights`, the fallback must unpack the weights
@@ -109,11 +124,21 @@ from Q4 measured 2.3–3.9× on decode-shaped calls.
 ### 2.4 Cache blocking
 
 The large path adds BLIS-style `jc→ic→mt→nt` blocking so each packed panel
-streams from DRAM once rather than once per opposing tile. Block sizes come from
-a per-dtype byte budget: `nc_blk`/`mc_blk` count whole 32-wide super-tiles, and
-`tile_bytes` is the full super-tile — two packed 16-lane bands in the
-widening/int kernels, or the single tile in f16f16/b16b16 where the tile is the
-super-tile — so the budget equals total resident bytes (A-block + B-block).
+streams from DRAM once rather than once per opposing tile.
+
+In f32 and f64 the `jc` loop sits **outside** the `dispatch_apply` over
+M-chunks, so one B-block serves every M-chunk while it is still L2-resident, and
+A is packed on the first block only. Nested the other way each chunk sweeps all
+of B and B leaves L2 before the next chunk reaches it, so packed B is
+re-streamed from DRAM once per chunk — gigabytes of it on a large square — and
+the inner blocking cannot help, since it only ever sees one chunk. A reduction
+epilogue spans all of N and so keeps a single block.
+
+Block sizes come from a per-dtype byte budget: `nc_blk`/`mc_blk` count whole
+32-wide super-tiles, and `tile_bytes` is the full super-tile — two packed
+16-lane bands in the widening/int kernels, or the single tile in f16f16/b16b16
+where the tile is the super-tile — so the budget equals total resident bytes
+(A-block + B-block).
 
 | kernels              | budget |
 | -------------------- | ------ |
@@ -127,10 +152,10 @@ the E-cluster L2 is 6 MB against the P-cluster's 16
 (`hw.perflevel1/0.l2cachesize`), so a P-sized block thrashes the E workers. For
 MOPA-bound dense shapes the constant barely matters: sweeping f16f16/b16b16 over
 8/16/24 MB from 2048³ through 1024×8192×8192 moves nothing outside ±3% noise,
-and not monotonically. Q4 is the exception, because there the budget also sets
-how many full dequant passes a shape pays — 16 MB is worth 2–6% for m ≥ 992,
-where 8 MB forces a second M-block and therefore a second dequant of the whole
-weight set.
+and not monotonically, and f32 behaves the same over 12–24 MB once the `jc` loop
+is hoisted. Q4 is the exception, because there the budget also sets how many
+full dequant passes a shape pays — 16 MB is worth 2–6% for m ≥ 992, where 8 MB
+forces a second M-block and therefore a second dequant of the whole weight set.
 
 When the whole problem fits, the blocks span everything and the outer loops run
 once, at no cost over the flat path.

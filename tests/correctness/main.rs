@@ -90,10 +90,11 @@ const SIZES: &[(usize, usize, usize)] = &[
     (96, 96, 256),
 ];
 
-// Shapes that BOTH clear the SME_MIN_FLOPS threshold (m*n*k >= 2^18 = 262144)
-// AND have non-multiple-of-32 tails in m/n/k, so the real SME kernels run and
-// their M/N/K-tail predicate handling is exercised (the default `SIZES` are
-// nearly all below threshold and silently test scalar-vs-scalar).
+// Shapes that BOTH clear the SME threshold AND have non-multiple-of-32 tails in
+// m/n/k, so the real SME kernels run and their M/N/K-tail predicate handling is
+// exercised at a size where the parallel paths engage. (Several of the default
+// `SIZES` now clear the tiled floor of 2^12 and reach the kernels too, but they
+// are small enough to stay on the serial arm.)
 //   65*257*257 = 4_293_185 ; 33*512*257 = 4_342_272
 //   97*300*131 = 3_812_100 ; 7*400*800  = 2_240_000   (all >= 262_144)
 //

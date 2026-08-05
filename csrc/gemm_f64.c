@@ -95,6 +95,33 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p64, const double *b
     svmopa_za64_f64_m(0, p64, p64, al, bl);                                                        \
     svmopa_za64_f64_m(1, p64, p64, al, bh)
 
+// Largest B (n*k*8 bytes) the direct-B path may read unpacked, and the flop
+// count below which it stays on one cluster; see gemm_f32.c. The budget is well
+// under f32's because an f64 N-tile is 8 lanes, not 32: unpacked B yields 64
+// useful bytes per n*8 stride against f32's 128 per n*4, so an equal footprint
+// costs twice the address span.
+#define SME_F64_DIRECT_B_BYTES ((size_t)4 * 1024 * 1024)
+#define SME_F64_SERIAL_FLOPS ((uint64_t)1 << 22)
+
+// Resident-bytes budget for the cache blocking below, in 16-wide super-tiles
+// (2 packed bands each). f64 panels are 2x the bytes of f32.
+static size_t f64_budget(size_t k) {
+    size_t tile_bytes = 2 * ep_cmul(k, 8) * sizeof(double);
+    size_t b = (size_t)(24u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
+    return b < 2 ? 2 : b;
+}
+
+// N-block width, shared by the driver's outer jc loop and run_streaming's inner
+// one so the two agree on block boundaries. Rounded down to an even split (see
+// gemm_f32.c): the budget is a ceiling, not a target.
+static size_t f64_nc_blk(size_t k, size_t n_tiles) {
+    size_t nc = f64_budget(k) / 2;
+    if (nc < 1) nc = 1;
+    if (nc >= n_tiles) return n_tiles;
+    size_t blocks = (n_tiles + nc - 1) / nc;
+    return (n_tiles + blocks - 1) / blocks;
+}
+
 // [nt_lo, nt_hi) is the N-tile sub-range this invocation owns -- pass
 // (0, n_tiles) for the whole problem, or a slice for the N-parallel flat-M path
 // (see the driver). f64 N-tiles are independent (no dual-tile lockstep), so any
@@ -125,16 +152,13 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     int has_tensor = has_ep && ep_has_tensor(nodes, n_nodes);
     int pure = (beta == 1.0 && !read_dst && !has_ep);
 
-    // Cache blocking (BLIS jc->ic): keep the B-block resident in L2. nc_blk /
-    // mc_blk count 16-wide super-tiles (= 2 packed bands each). f64 panels are
-    // 2x the bytes of f32, so the budget tracks total resident bytes.
-    size_t tile_bytes = 2 * per_tile * sizeof(double);
-    size_t budget = (size_t)(24u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
-    if (budget < 2) budget = 2;
+    // Cache blocking (BLIS jc->ic). nc_blk / mc_blk count 16-wide super-tiles
+    // (= 2 packed bands each). The jc loop here only blocks within one M-chunk;
+    // cross-chunk B reuse comes from the driver running this once per N-block
+    // (see gemm_sme_f64_run_packed).
+    size_t budget = f64_budget(k);
     size_t nt_span = nt_hi - nt_lo;
-    size_t nc_blk = budget / 2;
-    if (nc_blk < 1) nc_blk = 1;
-    if (nc_blk > nt_span) nc_blk = nt_span;
+    size_t nc_blk = f64_nc_blk(k, nt_span);
     size_t mc_blk = budget / 2;
     if (mc_blk < 1) mc_blk = 1;
     if (mc_blk > mt_hi - mt_lo) mc_blk = mt_hi - mt_lo;
@@ -445,10 +469,13 @@ int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, lon
         size_t vr = (r0 < m) ? ((m - r0 < 8) ? (m - r0) : 8) : 0;                                  \
         pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr); \
     }
-    if (rhs_cs == 1 && ep_flops(m, n, k) < (1u << 25)) {
+    // Direct-B gate is B's footprint, and the serial gate a flop floor; see
+    // gemm_f32.c for why.
+    size_t b_budget = SME_F64_DIRECT_B_BYTES / sizeof(double);
+    if (rhs_cs == 1 && ep_cmul(n, k) <= b_budget) {
         size_t sc_chunk = 2;
         size_t sc_n = (m_tiles + sc_chunk - 1) / sc_chunk;
-        if (sc_n <= 1) {
+        if (sc_n <= 1 || ep_flops(m, n, k) < SME_F64_SERIAL_FLOPS) {
             double *a_pack = apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(double)));
             if (a_pack) {
                 PACKA_SMALL(a_pack, 0, m_tiles);
@@ -562,13 +589,21 @@ int gemm_sme_f64_run_packed(size_t m, size_t n, size_t k, double *dst, long dst_
     }
     double *a_pack = (double *)xmalloc(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(double)));
     if (!a_pack) return -1;
-    dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
-      size_t mt0 = ci * M_CHUNK;
-      size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
-      PACKA_RANGE(a_pack, mt0, mt1);
-      run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, 0, n_tiles, k, alpha, beta,
-                    read_dst, ep);
-    });
+
+    // N-block loop OUTSIDE the M dispatch, so one B-block serves every M-chunk
+    // while it is still L2-resident; see gemm_f32.c for the traffic argument.
+    size_t nc_blk = f64_nc_blk(k, n_tiles);
+    for (size_t jc = 0; jc < n_tiles; jc += nc_blk) {
+        size_t jc_end = jc + nc_blk < n_tiles ? jc + nc_blk : n_tiles;
+        int pack_a = (jc == 0); // A-pack is shared and reused by later N-blocks
+        dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t mt0 = ci * M_CHUNK;
+          size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
+          if (pack_a) PACKA_RANGE(a_pack, mt0, mt1);
+          run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, jc, jc_end, k, alpha,
+                        beta, read_dst, ep);
+        });
+    }
 #undef PACKA_RANGE
     free(a_pack);
     return 0;

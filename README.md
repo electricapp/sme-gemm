@@ -155,22 +155,24 @@ at 4.2 here against 4.9 pre-packed above:
 | candle (`gemm` crate)       | 0.6     | 1.4     |
 | burn (`NdArray`, pure-Rust) | 0.1     | — ³     |
 
-Accelerate and sme-gemm are close on square shapes: Accelerate leads by ~5% at
-2048³ and ~10% at 4096³, sme-gemm by ~2% at 1024³. The margin is on skinny
-shapes:
+**vs. Accelerate across shapes** (`examples/vs_accelerate`, ratio > 1 = sme-gemm
+faster). Accelerate leads at 256³, where a call is a few tens of microseconds
+and streaming-mode entry plus the cross-cluster dispatch are most of it, and at
+2048³, where B has just outgrown the footprint that lets the kernel skip packing
+it:
 
-| shape (f32)            | sme-gemm | best other             |
-| ---------------------- | -------- | ---------------------- |
-| 16384×512×512 (skinny) | **2.3**  | 2.0 (Accelerate)       |
-| 4096×512×512 (skinny)  | **2.2**  | 1.9 (Accelerate)       |
-| 256×256×256 (tiny)     | 1.3      | **1.7** (Accelerate) ⁴ |
+| shape (both dtypes) | f32       | f64       |
+| ------------------- | --------- | --------- |
+| 256×256×256         | 0.78×     | 0.88×     |
+| 512×512×512         | 1.13×     | 1.25×     |
+| 1024×1024×1024      | 1.13×     | 1.05×     |
+| 2048×2048×2048      | 0.96×     | 1.06×     |
+| 4096×4096×4096      | 1.05×     | 1.10×     |
+| 4096×512×512        | **1.19×** | **1.16×** |
+| 16384×512×512       | **1.14×** | **1.17×** |
 
-The f16 margin on those shapes is wider, since no other backend here has a
+The f16 margin on skinny shapes is wider, since no other backend here has a
 native f16 kernel: 4.3 at 4096×512×512 against ORT's 1.2.
-
-**f64 vs. Accelerate `cblas_dgemm`** (>1 = sme-gemm faster): 1.04–1.18× from
-512³ through 2048³ and on skinny shapes; 0.88× at 256³ and 0.78× at 4096³, where
-the problem is memory-bound.
 
 **Flash attention** (`examples/attention`, `m×n×d`, ms): 4096×4096×64 runs 2.8
 (f16) / 3.2 (bf16) / 4.6 (f32). Against materializing `softmax(QK^T)V` it is
@@ -200,8 +202,6 @@ resident weight set.
 - ² No pre-packed entry point, so the call would re-pack the whole weight set
   and report packing cost rather than kernel throughput.
 - ³ No native f16 GEMM; f16 inputs run through f32.
-- ⁴ Accelerate's lower-overhead path leads on tiny shapes; sme-gemm leads from
-  ~512³ up.
 
 ORT's three execution providers land within 1% of each other on this graph,
 consistent with the single `MatMul` node staying on CPU rather than being

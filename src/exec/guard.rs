@@ -7,20 +7,31 @@ use crate::epilogue::{Dequant, EpOp, Epilogue};
 use crate::probe::has_sme;
 
 /// Below this many flops the streaming-mode setup does not amortize; use the
-/// scalar path (a NEON fallback will replace it).
+/// scalar path.
 pub(super) const SME_MIN_FLOPS: u128 = 1 << 18;
+
+/// The floor that applies once the output is wide enough to fill a useful share
+/// of a ZA tile ([`SME_MIN_TILED_MN`]). The scalar reference runs at roughly
+/// 1 GFLOP/s, two to three orders below the kernel, so it stops being the better
+/// choice far below [`SME_MIN_FLOPS`].
+pub(super) const SME_MIN_TILED_FLOPS: u128 = 1 << 12;
+
+/// MOPA accumulates into a 32x32 ZA tile whatever the output shape, so a 1x1
+/// product still pays for 1024 lanes. That padding is what makes SME lose on
+/// vector-shaped work; eight elements of output is where it stops dominating.
+pub(super) const SME_MIN_TILED_MN: u128 = 8;
 
 #[inline]
 pub(crate) fn sme_worth_it(m: usize, n: usize, k: usize) -> bool {
     // Saturating so an absurd (unallocatable) shape whose flop product exceeds
     // u128 reads as "huge, definitely worth it" rather than wrapping to a small
     // value (or panicking under overflow-checks).
-    has_sme()
-        && k >= 2
-        && (m as u128)
-            .saturating_mul(n as u128)
-            .saturating_mul(k as u128)
-            >= SME_MIN_FLOPS
+    let mn = (m as u128).saturating_mul(n as u128);
+    let mnk = mn.saturating_mul(k as u128);
+    // Strictly a lower floor: everything that cleared SME_MIN_FLOPS still does,
+    // so no shape that reaches the kernel today gets diverted to the reference.
+    let floor = if mn >= SME_MIN_TILED_MN { SME_MIN_TILED_FLOPS } else { SME_MIN_FLOPS };
+    has_sme() && k >= 2 && mnk >= floor
 }
 
 /// Assert that a strided `d0 x d1` view (row stride `rs`, col stride `cs`, in
