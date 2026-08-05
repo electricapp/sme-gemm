@@ -8,6 +8,7 @@
 #include <arm_neon.h>
 #include <arm_sme.h>
 #include <dispatch/dispatch.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -125,6 +126,19 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p32, const float *bi
 // Flop count below which the direct-B path stays on one cluster (justified at
 // its use site in gemm_sme_f32_run).
 #define SME_F32_SERIAL_FLOPS ((uint64_t)1 << 22)
+
+// Workers for the direct-B path's dynamic M-chunk claiming. Deliberately one
+// fewer than the number of chunks: hand every worker exactly one and the call
+// ends on the slowest, which is an E-cluster worker every time. Leaving a chunk
+// spare is what lets a P-cluster worker come back for it. Below four chunks
+// there is not enough left to steal and holding a worker back only
+// under-subscribes the machine.
+#define SME_F32_MAX_WORKERS 8
+static size_t f32_workers(size_t chunks) {
+    if (chunks <= 3) return chunks;
+    size_t w = chunks - 1;
+    return w > SME_F32_MAX_WORKERS ? SME_F32_MAX_WORKERS : w;
+}
 
 static size_t f32_budget(size_t k) {
     size_t tile_bytes = 2 * ep_cmul(k, 16) * sizeof(float);
@@ -557,13 +571,32 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
         } else {
             float *a_pack = (float *)malloc(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(float)));
             if (a_pack) {
-                dispatch_apply(sc_n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                               ^(size_t ci) {
-                                 size_t mt0 = ci * sc_chunk;
-                                 size_t mt1 = mt0 + sc_chunk < m_tiles ? mt0 + sc_chunk : m_tiles;
-                                 PACKA_SMALL(a_pack, mt0, mt1);
-                                 run_small(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k, mt0,
-                                           mt1, alpha, beta, read_dst, ep);
+                // Chunks are CLAIMED off a shared cursor rather than handed out
+                // one per worker, so the P-cluster takes more of them than the
+                // E-cluster instead of the call ending on the slower half. Each
+                // worker still packs the chunk it is about to compute, which
+                // keeps the NEON pack overlapping MOPA issue -- splitting the
+                // pack into its own pass to allow finer scheduling costs more
+                // than the balance it buys.
+                _Atomic size_t cursor = 0;
+                // Blocks capture by const value, so capture the POINTER: taking
+                // &cursor inside the block would give each worker its own.
+                _Atomic size_t *cur = &cursor;
+                dispatch_apply(f32_workers(sc_n),
+                               dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                               ^(size_t w) {
+                                 (void)w;
+                                 for (;;) {
+                                     size_t ci = atomic_fetch_add_explicit(cur, 1,
+                                                                           memory_order_relaxed);
+                                     size_t mt0 = ci * sc_chunk;
+                                     if (mt0 >= m_tiles) break;
+                                     size_t mt1 =
+                                         mt0 + sc_chunk < m_tiles ? mt0 + sc_chunk : m_tiles;
+                                     PACKA_SMALL(a_pack, mt0, mt1);
+                                     run_small(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k,
+                                               mt0, mt1, alpha, beta, read_dst, ep);
+                                 }
                                });
                 free(a_pack);
                 return 0;

@@ -13,7 +13,7 @@ readme = "README.md"
 [dependencies]
 half = { version = "2", default-features = false }
 candle-core = { version = "0.11", optional = true }
-ort = { version = "2.0.0-rc.12", optional = true, features = ["coreml", "xnnpack", "half"] }
+ort = { version = "2.0.0-rc.13", optional = true, features = ["coreml", "xnnpack", "half"] }
 burn = { version = "0.21", optional = true, default-features = false, features = ["ndarray"] }
 
 [build-dependencies]

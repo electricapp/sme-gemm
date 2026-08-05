@@ -7,6 +7,7 @@
 #include <arm_neon.h>
 #include <arm_sme.h>
 #include <dispatch/dispatch.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -102,6 +103,14 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p64, const double *b
 // costs twice the address span.
 #define SME_F64_DIRECT_B_BYTES ((size_t)4 * 1024 * 1024)
 #define SME_F64_SERIAL_FLOPS ((uint64_t)1 << 22)
+
+// Workers for the dynamic M-chunk claiming; see gemm_f32.c.
+#define SME_F64_MAX_WORKERS 8
+static size_t f64_workers(size_t chunks) {
+    if (chunks <= 3) return chunks;
+    size_t w = chunks - 1;
+    return w > SME_F64_MAX_WORKERS ? SME_F64_MAX_WORKERS : w;
+}
 
 // Resident-bytes budget for the cache blocking below, in 16-wide super-tiles
 // (2 packed bands each). f64 panels are 2x the bytes of f32.
@@ -486,13 +495,25 @@ int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, lon
         } else {
             double *a_pack = (double *)xmalloc(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(double)));
             if (a_pack) {
-                dispatch_apply(sc_n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                               ^(size_t ci) {
-                                 size_t mt0 = ci * sc_chunk;
-                                 size_t mt1 = mt0 + sc_chunk < m_tiles ? mt0 + sc_chunk : m_tiles;
-                                 PACKA_SMALL(a_pack, mt0, mt1);
-                                 run_small(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k, mt0,
-                                           mt1, alpha, beta, read_dst, ep);
+                // Chunks claimed off a shared cursor, packing kept with compute;
+                // see gemm_sme_f32_run for why.
+                _Atomic size_t cursor = 0;
+                _Atomic size_t *cur = &cursor;
+                dispatch_apply(f64_workers(sc_n),
+                               dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                               ^(size_t w) {
+                                 (void)w;
+                                 for (;;) {
+                                     size_t ci = atomic_fetch_add_explicit(cur, 1,
+                                                                           memory_order_relaxed);
+                                     size_t mt0 = ci * sc_chunk;
+                                     if (mt0 >= m_tiles) break;
+                                     size_t mt1 =
+                                         mt0 + sc_chunk < m_tiles ? mt0 + sc_chunk : m_tiles;
+                                     PACKA_SMALL(a_pack, mt0, mt1);
+                                     run_small(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k,
+                                               mt0, mt1, alpha, beta, read_dst, ep);
+                                 }
                                });
                 free(a_pack);
                 return 0;

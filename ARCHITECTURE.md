@@ -106,6 +106,17 @@ M-chunks, on a flop floor rather than a chunk count: below a few MFLOP the
 dispatch costs more than the second cluster returns, and two shapes that chunk
 identically can want opposite answers.
 
+When it does dispatch, chunks are **claimed off a shared atomic cursor** rather
+than handed out one per worker, and the pool is deliberately one worker short of
+the chunk count. Give every worker exactly one chunk and the call ends on the
+slowest, which is an E-cluster worker every time; leaving a chunk spare lets a
+P-cluster worker come back for it, so the faster cluster absorbs more of the
+problem. Below four chunks there is nothing left to steal and holding a worker
+back only under-subscribes the machine, so the pool is the chunk count there.
+Each worker packs the chunk it is about to compute, which keeps the NEON pack
+overlapping MOPA issue — hoisting the pack into its own pass to allow finer
+scheduling costs more than the balance it buys.
+
 Rust has an analogous floor. `sme_worth_it(m,n,k)` requires
 `has_sme() && k >= 2` plus a flop minimum that depends on how much of a ZA tile
 the output fills: MOPA accumulates into a 32×32 tile whatever the shape, so a
