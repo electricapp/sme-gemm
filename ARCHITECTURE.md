@@ -113,9 +113,18 @@ slowest, which is an E-cluster worker every time; leaving a chunk spare lets a
 P-cluster worker come back for it, so the faster cluster absorbs more of the
 problem. Below four chunks there is nothing left to steal and holding a worker
 back only under-subscribes the machine, so the pool is the chunk count there.
-Each worker packs the chunk it is about to compute, which keeps the NEON pack
-overlapping MOPA issue — hoisting the pack into its own pass to allow finer
-scheduling costs more than the balance it buys.
+Each worker packs the chunk it is about to compute, which keeps the pack
+overlapping MOPA issue — hoisting it into its own pass to allow finer scheduling
+costs more than the balance it buys.
+
+The A-pack itself runs through ZA rather than NEON while A is cache-resident. A
+vertical ZA load writes a memory vector into a tile _column_ and a horizontal
+store reads a _row_ back, so sixteen of each transpose a 16×16 block: 32
+instructions per 256 floats, against the NEON 4×4 transpose's 16 loads, 16
+stores and ~32 shuffles. That matters because the NEON transpose is issue-bound
+at about one instruction per float and cannot be tuned past it. Once A is
+DRAM-sized the NEON path's wider memory-level parallelism wins the trade back,
+so the ZA pack is gated on A's footprint.
 
 Rust has an analogous floor. `sme_worth_it(m,n,k)` requires
 `has_sme() && k >= 2` plus a flop minimum that depends on how much of a ZA tile
