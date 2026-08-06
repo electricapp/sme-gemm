@@ -30,7 +30,11 @@ pub(crate) fn sme_worth_it(m: usize, n: usize, k: usize) -> bool {
     let mnk = mn.saturating_mul(k as u128);
     // Strictly a lower floor: everything that cleared SME_MIN_FLOPS still does,
     // so no shape that reaches the kernel today gets diverted to the reference.
-    let floor = if mn >= SME_MIN_TILED_MN { SME_MIN_TILED_FLOPS } else { SME_MIN_FLOPS };
+    let floor = if mn >= SME_MIN_TILED_MN {
+        SME_MIN_TILED_FLOPS
+    } else {
+        SME_MIN_FLOPS
+    };
     has_sme() && k >= 2 && mnk >= floor
 }
 
