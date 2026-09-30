@@ -38,6 +38,8 @@ candle = ["dep:candle-core"]
 ort = ["dep:ort"]
 # Benchmark vs the burn framework's NdArray CPU backend; examples/vs_burn.
 burn = ["dep:burn"]
+# Metal MPS + MLCompute ANE backends for examples/dispatch (not the GEMM lib).
+dispatch-cmp = []
 
 [lints.rust]
 missing_docs = "deny"
@@ -122,6 +124,10 @@ required-features = ["ort"]
 [[example]]
 name = "vs_burn"
 required-features = ["burn"]
+
+[[example]]
+name = "dispatch"
+required-features = ["dispatch-cmp"]
 
 [profile.release]
 opt-level = 3

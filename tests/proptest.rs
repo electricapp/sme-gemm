@@ -19,7 +19,7 @@
 use half::{bf16, f16};
 use proptest::prelude::*;
 use sme_gemm::{
-    Accuracy, Gemm, Q4_BLOCK, Q4Weights, gemm_bf16, gemm_f16, gemm_f32, gemm_f64, matmul_bf16,
+    Accum, Gemm, Q4_BLOCK, Q4Weights, gemm_bf16, gemm_f16, gemm_f32, gemm_f64, matmul_bf16,
     matmul_f16, matmul_f32, matmul_f32_batched, matmul_f64, matmul_i8, matmul_i8_packed,
     matmul_i16, matmul_q4, prepack_f32, prepack_i8,
 };
@@ -165,8 +165,8 @@ proptest! {
         }
     }
 
-    // f16 Accurate (widening fp32-accumulate): tight ~1e-2 relative (matches
-    // tests/correctness.rs `f16_accurate`).
+    // f16 with f32 accumulate (widening): tight ~1e-2 relative (matches
+    // `f16_f32_accum`).
     // `half` converts f16<->f32 via inline `fcvt` asm whenever the target has
     // fp16 (always on aarch64-apple-darwin), and Miri cannot interpret inline
     // asm -- so native-aarch64 Miri skips the f16 properties. They still run
@@ -174,38 +174,38 @@ proptest! {
     // takes its pure-Rust soft-float path.
     #[test]
     #[cfg_attr(all(miri, target_arch = "aarch64"), ignore)]
-    fn prop_matmul_f16_accurate(
+    fn prop_matmul_f16_f32(
         (m, n, k) in (tail_dim(), tail_dim(), tail_dim()),
     ) {
         let (a, b) = (any_f16(m * k), any_f16(k * n));
         let mut c = vec![f16::ZERO; m * n];
-        matmul_f16(&a, &b, &mut c, m, n, k, Accuracy::Accurate);
+        matmul_f16(&a, &b, &mut c, m, n, k, Accum::F32);
         let af: Vec<f64> = a.iter().map(|x| f64::from(x.to_f32())).collect();
         let bf: Vec<f64> = b.iter().map(|x| f64::from(x.to_f32())).collect();
         let want = oracle_f64_mm(&af, &bf, m, n, k);
         let got: Vec<f64> = c.iter().map(|x| f64::from(x.to_f32())).collect();
         let mr = max_rel_f64(&got, &want);
-        prop_assert!(mr < 2e-2, "f16-accurate {m}x{n}x{k}: max_rel={mr}");
+        prop_assert!(mr < 2e-2, "f16/f32 {m}x{n}x{k}: max_rel={mr}");
     }
 
-    // f16 Fast (non-widening fp16 accumulate on M5): error grows ~sqrt(k), so
-    // the tolerance scales with sqrt(k) off a 3e-2 base (matches `f16_fast`).
-    // See prop_matmul_f16_accurate: `half`'s aarch64 fcvt asm is uninterpretable.
+    // f16 accumulate (non-widening, M5): error grows ~sqrt(k), so the
+    // tolerance scales with sqrt(k) off a 3e-2 base (matches `f16_accum`).
+    // See prop_matmul_f16_f32: `half`'s aarch64 fcvt asm is uninterpretable.
     #[test]
     #[cfg_attr(all(miri, target_arch = "aarch64"), ignore)]
-    fn prop_matmul_f16_fast(
+    fn prop_matmul_f16(
         (m, n, k) in (tail_dim(), tail_dim(), tail_dim()),
     ) {
         let (a, b) = (any_f16(m * k), any_f16(k * n));
         let mut c = vec![f16::ZERO; m * n];
-        matmul_f16(&a, &b, &mut c, m, n, k, Accuracy::Fast);
+        matmul_f16(&a, &b, &mut c, m, n, k, Accum::F16);
         let af: Vec<f64> = a.iter().map(|x| f64::from(x.to_f32())).collect();
         let bf: Vec<f64> = b.iter().map(|x| f64::from(x.to_f32())).collect();
         let want = oracle_f64_mm(&af, &bf, m, n, k);
         let got: Vec<f64> = c.iter().map(|x| f64::from(x.to_f32())).collect();
         let mr = max_rel_f64(&got, &want);
         let tol = half_tol(3e-2, k);
-        prop_assert!(mr < tol, "f16-fast {m}x{n}x{k}: max_rel={mr} tol={tol}");
+        prop_assert!(mr < tol, "f16 {m}x{n}x{k}: max_rel={mr} tol={tol}");
     }
 
     // bf16 (8-bit mantissa, fp32 widening accumulate): output rounding dominates;
@@ -216,7 +216,7 @@ proptest! {
     ) {
         let (a, b) = (any_bf16(m * k), any_bf16(k * n));
         let mut c = vec![bf16::ZERO; m * n];
-        matmul_bf16(&a, &b, &mut c, m, n, k, Accuracy::Accurate);
+        matmul_bf16(&a, &b, &mut c, m, n, k, Accum::F32);
         let af: Vec<f64> = a.iter().map(|x| f64::from(x.to_f32())).collect();
         let bf: Vec<f64> = b.iter().map(|x| f64::from(x.to_f32())).collect();
         let want = oracle_f64_mm(&af, &bf, m, n, k);
@@ -385,7 +385,7 @@ proptest! {
     // Strided gemm_f16: C = alpha*C + beta*(A@B) with non-trivial alpha/beta,
     // checked against the f64 oracle of the same accumulate. f16 storage +
     // accumulation -> sqrt(k)-scaled tol off a 3e-2 base (mirrors gemm_f16_accumulate
-    // and prop_gemm_f32_accumulate). See prop_matmul_f16_accurate: aarch64 Miri
+    // and prop_gemm_f32_accumulate). See prop_matmul_f16_f32: aarch64 Miri
     // can't interpret `half`'s fcvt asm, so skip there.
     #[test]
     #[cfg_attr(all(miri, target_arch = "aarch64"), ignore)]
@@ -398,7 +398,7 @@ proptest! {
         let c_init = any_f16(m * n);
         let (alpha, beta) = (f16::from_f32(alpha), f16::from_f32(beta));
         let mut c = c_init.clone();
-        gemm_f16(m, n, k, &mut c, n, 1, &a, k, 1, &b, n, 1, alpha, beta, Accuracy::Accurate);
+        gemm_f16(m, n, k, &mut c, n, 1, &a, k, 1, &b, n, 1, alpha, beta, Accum::F32);
 
         let af: Vec<f64> = a.iter().map(|x| f64::from(x.to_f32())).collect();
         let bf: Vec<f64> = b.iter().map(|x| f64::from(x.to_f32())).collect();
@@ -426,7 +426,7 @@ proptest! {
         let c_init = any_bf16(m * n);
         let (alpha, beta) = (bf16::from_f32(alpha), bf16::from_f32(beta));
         let mut c = c_init.clone();
-        gemm_bf16(m, n, k, &mut c, n, 1, &a, k, 1, &b, n, 1, alpha, beta, Accuracy::Accurate);
+        gemm_bf16(m, n, k, &mut c, n, 1, &a, k, 1, &b, n, 1, alpha, beta, Accum::F32);
 
         let af: Vec<f64> = a.iter().map(|x| f64::from(x.to_f32())).collect();
         let bf: Vec<f64> = b.iter().map(|x| f64::from(x.to_f32())).collect();

@@ -1,18 +1,43 @@
-//! Element-type machinery: the [`Accuracy`] mode, the sealed [`Element`] trait
+//! Element-type machinery: the [`Accum`] dtype, the sealed [`Element`] trait
 //! and its dtype impls, and the reusable [`Packed`] weight panel.
 
 use half::{bf16, f16};
 
-/// f16 accumulation strategy.
+/// Accumulator dtype for half-precision GEMM.
+///
+/// Storage dtype is the function you called (`matmul_f16`, `matmul_bf16`, …).
+/// This picks the **compute** type:
+///
+/// - [`Accum::F32`] — widening MOPA, M4+. Default.
+/// - [`Accum::F16`] — non-widening `FEAT_SME_F16F16`, M5. f16 kernels only.
+/// - [`Accum::Bf16`] — non-widening `FEAT_SME_B16B16`, M5. bf16 kernels only.
+///
+/// A mismatched 16-bit choice (e.g. [`Accum::Bf16`] on an f16 kernel), or a
+/// missing SME feature, falls back to [`Accum::F32`]. Native 16-bit accumulate
+/// is ~2× the widening rate; error grows ~√K.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Accuracy {
-    /// fp32 accumulation (widening MOPA). Accurate; runs on M4+. Default.
+pub enum Accum {
+    /// f32 accumulate (widening MOPA). M4+. Default.
     #[default]
-    Accurate,
-    /// fp16 accumulation (non-widening MOPA, M5 `FEAT_SME_F16F16`). ~2x faster,
-    /// lower precision -- error grows ~sqrt(K). Falls back to `Accurate` if
-    /// the CPU lacks the extension.
-    Fast,
+    F32,
+    /// f16 accumulate (non-widening `FEAT_SME_F16F16`). M5.
+    F16,
+    /// bf16 accumulate (non-widening `FEAT_SME_B16B16`). M5.
+    Bf16,
+}
+
+impl Accum {
+    /// `true` when this is the non-widening f16 path.
+    #[must_use]
+    pub const fn is_f16(self) -> bool {
+        matches!(self, Self::F16)
+    }
+
+    /// `true` when this is the non-widening bf16 path.
+    #[must_use]
+    pub const fn is_bf16(self) -> bool {
+        matches!(self, Self::Bf16)
+    }
 }
 
 pub(crate) mod sealed {

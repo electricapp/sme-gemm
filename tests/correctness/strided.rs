@@ -2,7 +2,7 @@
 
 use crate::{TAIL_SIZES, check, gemm_oracle};
 use half::{bf16, f16};
-use sme_gemm::{Accuracy, caps, matmul_f32, matmul_i8};
+use sme_gemm::{Accum, caps, matmul_f32, matmul_i8};
 
 #[test]
 fn gemm_f32_accumulate() {
@@ -63,7 +63,7 @@ fn gemm_f16_accumulate() {
         1,
         alpha,
         beta,
-        Accuracy::Accurate,
+        Accum::F32,
     );
 
     let af: Vec<f64> = a.iter().map(|&x| f64::from(x)).collect();
@@ -117,7 +117,7 @@ fn gemm_bf16_accumulate() {
         1,
         alpha,
         beta,
-        Accuracy::Accurate,
+        Accum::F32,
     );
 
     let af: Vec<f64> = a.iter().map(|x| f64::from(x.to_f32())).collect();
@@ -174,10 +174,10 @@ fn gemm_f32_transposed_b() {
     assert!(mr < 1e-4, "gemm_f32 transposed-B {m}x{n}x{k}: max_rel={mr}");
 }
 
-// Transposed B for the 16-bit dtypes, in BOTH accuracy modes -- the four pack
-// paths that read a column-major B. `Fast` takes the non-widening kernels'
-// 8x8-transpose pack, `Accurate` the widening kernels' transpose-and-zip pack
-// into the pair-interleaved layout; each is a distinct routine.
+// Transposed B for the 16-bit dtypes, both accumulators -- the four pack
+// paths that read a column-major B. Native 16-bit takes the non-widening
+// kernels' 8x8-transpose pack, f32-accum the widening kernels' transpose-and-zip
+// pack into the pair-interleaved layout; each is a distinct routine.
 //
 // The shape has to clear SME_MIN_FLOPS (2^18) or the whole thing runs the
 // scalar reference and proves nothing. flash_half exercises transposed B too,
@@ -209,15 +209,15 @@ fn gemm_f16_transposed_b() {
     let a: Vec<f16> = af.iter().map(|&x| f16::from_f32(x)).collect();
     let bt: Vec<f16> = btf.iter().map(|&x| f16::from_f32(x)).collect();
     let br: Vec<f16> = brf.iter().map(|&x| f16::from_f32(x)).collect();
-    for mode in [Accuracy::Accurate, Accuracy::Fast] {
+    for accum in [Accum::F32, Accum::F16] {
         let (mut ct, mut cr) = (vec![f16::ZERO; m * n], vec![f16::ZERO; m * n]);
         let z = f16::ZERO;
         let o = f16::ONE;
-        gemm_f16(m, n, k, &mut ct, n, 1, &a, k, 1, &bt, 1, k, z, o, mode);
-        gemm_f16(m, n, k, &mut cr, n, 1, &a, k, 1, &br, n, 1, z, o, mode);
+        gemm_f16(m, n, k, &mut ct, n, 1, &a, k, 1, &bt, 1, k, z, o, accum);
+        gemm_f16(m, n, k, &mut cr, n, 1, &a, k, 1, &br, n, 1, z, o, accum);
         assert!(
             ct.iter().zip(&cr).all(|(x, y)| x.to_bits() == y.to_bits()),
-            "gemm_f16 transposed-B {mode:?} differs from the row-major layout"
+            "gemm_f16 transposed-B {accum:?} differs from the row-major layout"
         );
     }
 }
@@ -232,15 +232,15 @@ fn gemm_bf16_transposed_b() {
     let a: Vec<bf16> = af.iter().map(|&x| bf16::from_f32(x)).collect();
     let bt: Vec<bf16> = btf.iter().map(|&x| bf16::from_f32(x)).collect();
     let br: Vec<bf16> = brf.iter().map(|&x| bf16::from_f32(x)).collect();
-    for mode in [Accuracy::Accurate, Accuracy::Fast] {
+    for accum in [Accum::F32, Accum::Bf16] {
         let (mut ct, mut cr) = (vec![bf16::ZERO; m * n], vec![bf16::ZERO; m * n]);
         let z = bf16::ZERO;
         let o = bf16::ONE;
-        gemm_bf16(m, n, k, &mut ct, n, 1, &a, k, 1, &bt, 1, k, z, o, mode);
-        gemm_bf16(m, n, k, &mut cr, n, 1, &a, k, 1, &br, n, 1, z, o, mode);
+        gemm_bf16(m, n, k, &mut ct, n, 1, &a, k, 1, &bt, 1, k, z, o, accum);
+        gemm_bf16(m, n, k, &mut cr, n, 1, &a, k, 1, &br, n, 1, z, o, accum);
         assert!(
             ct.iter().zip(&cr).all(|(x, y)| x.to_bits() == y.to_bits()),
-            "gemm_bf16 transposed-B {mode:?} differs from the row-major layout"
+            "gemm_bf16 transposed-B {accum:?} differs from the row-major layout"
         );
     }
 }
@@ -375,11 +375,11 @@ fn sme_tail_shapes_clear_threshold() {
 #[test]
 fn f16_tails() {
     for &(m, n, k) in TAIL_SIZES {
-        // Accurate (f16xf16->f32) is tight; Fast (f16 accum) grows ~sqrt(k).
-        check(m, n, k, Accuracy::Accurate, 2e-2);
+        // f32 accum (f16xf16->f32) is tight; f16 accum grows ~sqrt(k).
+        check(m, n, k, Accum::F32, 2e-2);
         if caps().sme_f16f16 {
             let tol = (3e-2 * (k as f64).sqrt() / 4.0).max(3e-2);
-            check(m, n, k, Accuracy::Fast, tol);
+            check(m, n, k, Accum::F16, tol);
         }
     }
 }

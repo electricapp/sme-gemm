@@ -97,7 +97,7 @@ fn flash_matches_materialized_reference() {
 #[test]
 fn flash_half_matches_materialized_reference() {
     use half::{bf16, f16};
-    use sme_gemm::{Accuracy, flash_attention_bf16_with, flash_attention_f16_with};
+    use sme_gemm::{Accum, flash_attention_bf16_with, flash_attention_f16_with};
 
     let cases = [
         (7usize, 5usize, 3usize, 4usize),
@@ -120,19 +120,7 @@ fn flash_half_matches_materialized_reference() {
 
             let (qh, kh, vh) = (to_half::<f16>(&q), to_half::<f16>(&k), to_half::<f16>(&v));
             let mut o = vec![f16::ZERO; m * dv];
-            flash_attention_f16_with(
-                &qh,
-                &kh,
-                &vh,
-                &mut o,
-                m,
-                n,
-                d,
-                dv,
-                scale,
-                Accuracy::Accurate,
-                p,
-            );
+            flash_attention_f16_with(&qh, &kh, &vh, &mut o, m, n, d, dv, scale, Accum::F32, p);
             let e = half_max_abs(o.iter().map(|x| f64::from(x.to_f32())), &want);
             assert!(
                 e < 5e-3,
@@ -145,19 +133,7 @@ fn flash_half_matches_materialized_reference() {
                 to_half::<bf16>(&v),
             );
             let mut o = vec![bf16::ZERO; m * dv];
-            flash_attention_bf16_with(
-                &qb,
-                &kb,
-                &vb,
-                &mut o,
-                m,
-                n,
-                d,
-                dv,
-                scale,
-                Accuracy::Accurate,
-                p,
-            );
+            flash_attention_bf16_with(&qb, &kb, &vb, &mut o, m, n, d, dv, scale, Accum::F32, p);
             let e = half_max_abs(o.iter().map(|x| f64::from(x.to_f32())), &want);
             assert!(
                 e < 4e-2,
@@ -250,8 +226,8 @@ fn softmax_rows_matches_the_gemm_oracle() {
 fn flash_half_auto_params_match_the_explicit_form() {
     use half::{bf16, f16};
     use sme_gemm::{
-        Accuracy, FlashParams, flash_attention_bf16, flash_attention_bf16_with,
-        flash_attention_f16, flash_attention_f16_with,
+        Accum, FlashParams, flash_attention_bf16, flash_attention_bf16_with, flash_attention_f16,
+        flash_attention_f16_with,
     };
 
     for (m, n, d, dv) in [(33usize, 129usize, 17usize, 9usize), (64, 300, 64, 40)] {
@@ -262,14 +238,15 @@ fn flash_half_auto_params_match_the_explicit_form() {
         let scale = 1.0 / (d as f32).sqrt();
         let p = FlashParams::auto(m, n);
 
-        for mode in [Accuracy::Accurate, Accuracy::Fast] {
+        for accum in [Accum::F32, Accum::F16] {
             let (qh, kh, vh) = (to_half::<f16>(&q), to_half::<f16>(&k), to_half::<f16>(&v));
             let mut got = vec![f16::ZERO; m * dv];
             let mut want = vec![f16::ZERO; m * dv];
-            flash_attention_f16(&qh, &kh, &vh, &mut got, m, n, d, dv, scale, mode);
-            flash_attention_f16_with(&qh, &kh, &vh, &mut want, m, n, d, dv, scale, mode, p);
-            assert_eq!(got, want, "f16 auto vs explicit {m}x{n}x{d}x{dv} {mode:?}");
-
+            flash_attention_f16(&qh, &kh, &vh, &mut got, m, n, d, dv, scale, accum);
+            flash_attention_f16_with(&qh, &kh, &vh, &mut want, m, n, d, dv, scale, accum, p);
+            assert_eq!(got, want, "f16 auto vs explicit {m}x{n}x{d}x{dv} {accum:?}");
+        }
+        for accum in [Accum::F32, Accum::Bf16] {
             let (qb, kb, vb) = (
                 to_half::<bf16>(&q),
                 to_half::<bf16>(&k),
@@ -277,11 +254,11 @@ fn flash_half_auto_params_match_the_explicit_form() {
             );
             let mut gotb = vec![bf16::ZERO; m * dv];
             let mut wantb = vec![bf16::ZERO; m * dv];
-            flash_attention_bf16(&qb, &kb, &vb, &mut gotb, m, n, d, dv, scale, mode);
-            flash_attention_bf16_with(&qb, &kb, &vb, &mut wantb, m, n, d, dv, scale, mode, p);
+            flash_attention_bf16(&qb, &kb, &vb, &mut gotb, m, n, d, dv, scale, accum);
+            flash_attention_bf16_with(&qb, &kb, &vb, &mut wantb, m, n, d, dv, scale, accum, p);
             assert_eq!(
                 gotb, wantb,
-                "bf16 auto vs explicit {m}x{n}x{d}x{dv} {mode:?}"
+                "bf16 auto vs explicit {m}x{n}x{d}x{dv} {accum:?}"
             );
         }
     }

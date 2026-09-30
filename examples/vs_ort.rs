@@ -7,11 +7,10 @@
 use std::time::Instant;
 
 use half::f16;
-use ort::ep::{CPUExecutionProvider, CoreMLExecutionProvider, XNNPACKExecutionProvider};
-use ort::execution_providers::ExecutionProviderDispatch;
+use ort::ep::{CPU, CoreML, ExecutionProviderDispatch, XNNPACK};
 use ort::session::Session;
 use ort::value::Tensor;
-use sme_gemm::{Accuracy, matmul_f16, matmul_f32};
+use sme_gemm::{Accum, matmul_f16, matmul_f32};
 
 /// Best-of-N across every backend, INTERLEAVED: one timed round of each per
 /// pass. Run to completion in turn instead, whichever goes first pays the clock
@@ -58,9 +57,9 @@ fn main() {
 
     // f32 ---------------------------------------------------------------------
     let model = format!("{dir}/models/gemm_f32.onnx");
-    let mut cpu = session(&model, vec![CPUExecutionProvider::default().build()]);
-    let mut xnn = session(&model, vec![XNNPACKExecutionProvider::default().build()]);
-    let mut coreml = session(&model, vec![CoreMLExecutionProvider::default().build()]);
+    let mut cpu = session(&model, vec![CPU::default().build()]);
+    let mut xnn = session(&model, vec![XNNPACK::default().build()]);
+    let mut coreml = session(&model, vec![CoreML::default().build()]);
     println!("== f32: sme-gemm vs ONNX Runtime (TF/s) ==");
     println!(
         "  {:>16}  {:>7}  {:>7}  {:>7}  {:>7}",
@@ -96,8 +95,8 @@ fn main() {
 
     // f16 ---------------------------------------------------------------------
     let model = format!("{dir}/models/gemm_f16.onnx");
-    let mut cpu = session(&model, vec![CPUExecutionProvider::default().build()]);
-    let mut coreml = session(&model, vec![CoreMLExecutionProvider::default().build()]);
+    let mut cpu = session(&model, vec![CPU::default().build()]);
+    let mut coreml = session(&model, vec![CoreML::default().build()]);
     println!("\n== f16: sme-gemm vs ONNX Runtime (TF/s) ==");
     println!(
         "  {:>16}  {:>7}  {:>7}  {:>7}",
@@ -113,7 +112,7 @@ fn main() {
         let a = Tensor::from_array(([m, k], av.clone())).expect("ort call failed");
         let b = Tensor::from_array(([k, n], bv.clone())).expect("ort call failed");
         let mut f_sme = || {
-            matmul_f16(&av, &bv, &mut c, m, n, k, Accuracy::Fast);
+            matmul_f16(&av, &bv, &mut c, m, n, k, Accum::F16);
         };
         let mut f_cpu = || {
             cpu.run(ort::inputs!["A" => &a, "B" => &b])

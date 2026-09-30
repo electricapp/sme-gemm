@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use half::f16;
-use sme_gemm::{Accuracy, Gemm, matmul_f16, matmul_f32, prepack_f16};
+use sme_gemm::{Accum, Gemm, matmul_f16, matmul_f32, prepack_f16};
 
 // Square shapes from examples/bench.rs plus a skinny and a shallow-K case.
 const SHAPES: &[(usize, usize, usize)] = &[
@@ -54,8 +54,8 @@ fn bench_f32(c: &mut Criterion) {
     g.finish();
 }
 
-fn bench_f16_fast(c: &mut Criterion) {
-    let mut g = c.benchmark_group("matmul_f16_fast");
+fn bench_f16(c: &mut Criterion) {
+    let mut g = c.benchmark_group("matmul_f16");
     g.sample_size(20).warm_up_time(Duration::from_millis(500));
     for &(m, n, k) in SHAPES {
         let a = vec![f16::from_f32(0.01); m * k];
@@ -66,7 +66,7 @@ fn bench_f16_fast(c: &mut Criterion) {
             BenchmarkId::from_parameter(label(m, n, k)),
             &(m, n, k),
             |bn, &(m, n, k)| {
-                bn.iter(|| matmul_f16(&a, &b, &mut out, m, n, k, Accuracy::Fast));
+                bn.iter(|| matmul_f16(&a, &b, &mut out, m, n, k, Accum::F16));
             },
         );
     }
@@ -99,5 +99,5 @@ fn bench_epilogue(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_f32, bench_f16_fast, bench_epilogue);
+criterion_group!(benches, bench_f32, bench_f16, bench_epilogue);
 criterion_main!(benches);

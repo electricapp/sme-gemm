@@ -1,31 +1,18 @@
 # sme-gemm
 
-Apple-Silicon-tuned **SME** (Scalable Matrix Extension) GEMM kernels for Rust.
+Apple-Silicon **SME** GEMM for Rust. Hand-written against `arm_sme.h`, SVL=512,
+dispatched across both P- and E-cluster SME units via GCD.
 
-Hand-written against `arm_sme.h`, tuned for Apple's per-cluster shared SME unit
-(streaming-mode, SVL=512), dispatched across both the P- and E-cluster SME units
-via GCD.
+## SME on Apple Silicon
 
-## SVE, SME, streaming mode
+SVE is length-agnostic SIMD. SME adds **ZA** (a 2-D accumulator) and `*MOPA`
+outer products. Compute runs only in [streaming mode][streaming] (`SMSTART` /
+`SMSTOP`); SVL is 512 bits on M4/M5. The transition is fixed-cost, so small
+problems skip it.
 
-[SVE][sve] is Arm's vector-length-agnostic SIMD: one binary runs at any hardware
-vector length, with predication in place of scalar tail loops. [SME][sme] builds
-on it with a two-dimensional accumulator, **ZA**, and outer-product instructions
-(`*MOPA`) that feed it. The C surface for both is [ACLE][acle]'s `arm_sve.h` and
-`arm_sme.h`; the normative definition is the [architecture supplement][spec].
-
-SME's compute instructions execute only in [streaming mode][streaming], entered
-and left with `SMSTART` / `SMSTOP`. Inside it the SVE registers take the
-_streaming_ vector length **SVL** (512 bits on Apple M4 and M5) and ZA is live;
-outside it ZA does not exist and part of the SVE and NEON instruction space is
-unavailable. The transition costs fixed time, so a kernel does as much work as
-it can per region, and small problems are routed around it.
-
-ZA is a 64×64-byte array (4 KB at SVL=512), addressed as tiles whose shape
-follows the element size: one 64×64 i8 tile, two 32×32 f16/bf16/i16, four 16×16
-f32/i32, eight 8×8 f64/i64. Apple gives each CPU _cluster_ one SME unit shared
-by its cores, rather than one per core, so the parallelism on offer is two
-units:
+ZA is 64×64 bytes (4 KB). Tile shape follows the element: 64×64 i8, two 32×32
+f16/bf16/i16, four 16×16 f32/i32, eight 8×8 f64/i64. Apple shares **one SME unit
+per cluster**, not per core:
 
 ```text
         P-cluster                       E-cluster            (Apple M5)
@@ -39,9 +26,9 @@ units:
        └─────────┘                    └─────────┘
 ```
 
-A MOPA reads two streaming-SVE vectors, forms their outer product, and
-accumulates it into a ZA tile — 1024 multiply-accumulates in one instruction for
-f16:
+A MOPA is a rank-1 update — 1024 MACs/instr for f16. Widening f16→f32 takes two
+K-steps into a 16×16 f32 tile (512 MACs, ~½ the rate). i8→i32 takes four (1024,
+matching f16).
 
 ```text
      Zm →   b0   b1   b2   ..  b31      one streaming-SVE vector
@@ -57,9 +44,7 @@ f16:
   GEMM tile:  for k in 0..K:  ZA += A[:,k] ⊗ B[k,:] ;  then store ZA → C
 ```
 
-Widening forms take more of K per instruction into a wider tile: f16→f32 takes
-two K-steps into a 16×16 f32 tile (512 MACs, hence about half the rate of the
-f16→f16 form), i8→i32 takes four (1024, matching f16).
+[sve] · [sme] · [streaming] · [acle] · [spec]
 
 [sve]: https://developer.arm.com/documentation/102476/latest/
 [sme]: https://developer.arm.com/documentation/109246/0101/
@@ -70,143 +55,152 @@ f16→f16 form), i8→i32 takes four (1024, matching f16).
 
 ## Kernels
 
-| dtype          | path                                  | output | min CPU |
-| -------------- | ------------------------------------- | ------ | ------- |
-| f16            | widening FMOPA / non-widening (Fast)  | f16    | M4 / M5 |
-| bf16           | widening BFMOPA / non-widening (Fast) | bf16   | M4 / M5 |
-| f32            | FMOPA single-precision                | f32    | M4      |
-| **f64**        | FMOPA double-precision                | f64    | M5      |
-| i8→i32         | SMOPA                                 | i32    | M4      |
-| **i16→i64**    | SMOPA                                 | i64    | M5      |
-| **Q4 weights** | 4-bit block-quant → f16 packed        | f16    | M5      |
+| dtype       | accumulate                         | output    | min CPU |
+| ----------- | ---------------------------------- | --------- | ------- |
+| f16         | f32 (FMOPA) / f16 (`F16F16`)       | f16       | M4 / M5 |
+| bf16        | f32 (BFMOPA) / bf16 (`B16B16`)     | bf16      | M4 / M5 |
+| f32         | f32                                | f32       | M4      |
+| **f64**     | f64                                | f64       | M5      |
+| i8→i32      | i32 (SMOPA)                        | i32       | M4      |
+| **i16→i64** | i64 (SMOPA)                        | i64       | M5      |
+| **Q4**      | 4-bit block-quant → f16 or bf16    | f16/bf16  | M5      |
 
-- Fused arbitrary epilogue — an in-register op-graph evaluated at the store, any
-  composition, zero extra passes. e.g.
-  `Gemm::new(&a, &w, m).mul_col(&s).add_col(&b).silu().clamp(0.,6.).run(&mut c)`.
-  - elementwise `add`/`sub`/`mul`/`div`/`max`/`min` by scalar, per-row, per-col,
-    or full M×N tensor.
-  - activations: relu, relu6, leaky_relu, gelu, gelu_exact, silu, sigmoid, tanh,
-    softplus, mish, elu, selu, hardswish, hardsigmoid, softsign.
-  - unary math: abs, neg, sign, square, sqrt, rsqrt, recip, exp, log; clamp.
-  - Covers f16/bf16/f32/f64 and i8/i16→f32 dequant — full op parity across
-    dtypes (bf16 evaluates the graph in f32, then rounds back, so it has no
-    divide/transcendental restriction). A leading per-column bias folds into the
-    accumulator (free). `epilogue_map` is the non-fused escape hatch for
-    arbitrary closures.
-  - `.beta(b)` scales the product (`D = act(b·(A@B) + bias)`);
-    `.col_major_output()` stores `C` column-major natively (no transpose pass).
-- Strided / BLAS-style GEMM — `gemm_{f16,bf16,f32,f64,i8,i16}` compute
-  `C = alpha·C + beta·(A @ B)` with arbitrary per-matrix row/col strides (in
-  elements). Strides encode transpose (swap row/col), column-major operands, and
-  accumulate-into-`C` (`alpha != 0`) — a single-call analog of `cblas_*gemm`.
-- Accuracy modes (f16) — `Accuracy::Accurate` (fp32 accumulate, M4+, default) vs
-  `Accuracy::Fast` (fp16 accumulate, M5 `FEAT_SME_F16F16`, ~2× faster, error
-  grows ~√K; falls back to `Accurate` without the extension).
-- Quantized i8/i16 → f32 dequant — the `Dequant` builder dequantizes in-register
-  at the store: per-tensor `Dequant::new(scale)` or per-output-channel
-  `.scale_per_n(&scales)`, then any epilogue op-graph on top
-  (`matmul_i8_packed_dequant` / `matmul_i16_dequant`).
-- Batched GEMM (f16/bf16/f32/f64/i8/i16) — many small `C_i = A_i @ B_i` in one
-  streaming session, with the same fused epilogue (`matmul_f16_batched` /
-  `_ep`).
-- Pre-packed weights — `prepack_*` once, reuse across calls.
-- candle backend — optional `candle` feature: a `CustomOp2` for CPU f32/f16/bf16
-  tensors.
-- burn adapter — optional `burn` feature: `sme_matmul` over `Tensor<B, 2>` for
-  CPU f32/f16 tensors.
-
-Falls back to a scalar reference on non-Apple targets.
+- **`Accum`** picks the compute type on half GEMMs: `Accum::F32` (widening, M4+,
+  default), `Accum::F16` (`FEAT_SME_F16F16`, M5), `Accum::Bf16`
+  (`FEAT_SME_B16B16`, M5). Missing the feature, or a mismatched 16-bit choice,
+  falls back to `F32`. Native 16-bit is ~2× the widening rate; error grows ~√K.
+- **Fused epilogue** — in-register op-graph at the store, any composition:
+  `Gemm::new(&a, &w, m).mul_col(&s).add_col(&b).silu().clamp(0., 6.).run(&mut c)`.
+  Elementwise `add`/`sub`/`mul`/`div`/`max`/`min` (scalar, per-row, per-col, or
+  M×N); activations relu, relu6, leaky_relu, gelu, gelu_exact, silu, sigmoid,
+  tanh, softplus, mish, elu, selu, hardswish, hardsigmoid, softsign; unary abs,
+  neg, sign, square, sqrt, rsqrt, recip, exp, log; clamp. Full op parity across
+  f16/bf16/f32/f64 and i8/i16→f32 dequant (bf16 runs the graph in f32, then
+  rounds). A leading per-column bias folds into the accumulator. `.beta(b)`
+  scales the product; `.col_major_output()` stores C column-major. `epilogue_map`
+  is the non-fused escape hatch.
+- **Strided GEMM** — `gemm_{f16,bf16,f32,f64,i8,i16}`: `C = αC + β(A @ B)` with
+  per-matrix row/col strides. Strides encode transpose, column-major, and
+  accumulate-into-C.
+- **i8/i16 → f32 dequant** — `Dequant::new(scale)` or `.scale_per_n(&scales)`,
+  then any epilogue (`matmul_i8_packed_dequant` / `matmul_i16_dequant`).
+- **Batched** — many small `C_i = A_i @ B_i` in one streaming session
+  (`matmul_*_batched` / `_ep`).
+- **Pre-packed weights** — `prepack_*` once, reuse.
+- **candle** / **burn** adapters (optional features).
+- Scalar reference fallback off Apple.
 
 ## Benchmarks (Apple M5, best-of-N)
 
-Throughput in TF/s (10¹² FLOP/s); integer rows are TOPS, same `2·M·N·K` op count
-throughout. Every number comes from an example in `examples/`. Cross-backend
-comparisons interleave the backends, one timed round each per pass, so neither
-side is measured on the heat or the clock ramp left by the other.
+TF/s (10¹² FLOP/s); integer rows are TOPS. Same `2·M·N·K` throughout. Every
+number is from `examples/` on this machine. Cross-backend runs interleave, one
+timed round each per pass.
 
-**Per dtype** (`examples/bench`), pre-packed B except the `Accurate` rows, which
-have no packed entry point. `Fast` is the M5 non-widening MOPA, `Accurate` the
-widening one — half the MACs per instruction, hence half the rate:
+**sme-gemm** (`examples/bench`). Pre-packed B except `/f32`, which has no packed
+entry point. Native 16-bit is the non-widening MOPA; `/f32` is widening (~½ the
+MACs/instr):
 
-| dtype           | 512³ | 2048³ | 16384×512×512 | 1×4096×4096 ¹ |
-| --------------- | ---- | ----- | ------------- | ------------- |
-| f16 `Fast`      | 3.8  | 4.9   | 4.8           | 0.10          |
-| bf16 `Fast`     | 3.9  | 4.9   | 4.8           | 0.10          |
-| f16 `Accurate`  | 1.8  | 2.3   | 2.4           | — ²           |
-| bf16 `Accurate` | 1.9  | 2.3   | 2.4           | — ²           |
-| f32             | 2.0  | 2.3   | 2.3           | 0.06          |
-| f64             | 0.58 | 0.59  | 0.61          | 0.03          |
-| i8→i32 (TOPS)   | 3.8  | 5.0   | 4.9           | 0.14          |
-| i16→i64 (TOPS)  | 2.1  | 2.5   | 2.3           | 0.12          |
-| Q4→f16          | 2.5  | 4.2   | 3.1           | 0.06          |
-| Q4→bf16         | 2.6  | 4.2   | 3.3           | 0.04          |
+| dtype    | 256³ | 512³ | 1024³ | 2048³ | 4096³ | 4096×512×512 | 16384×512×512 | 1×4096×4096 ¹ |
+| -------- | ---- | ---- | ----- | ----- | ----- | ------------ | ------------- | ------------- |
+| f16      | 2.51 | 4.10 | 4.76  | 4.93  | 4.77  | 4.78         | 4.83          | 0.10          |
+| bf16     | 2.46 | 3.20 | 4.75  | 4.94  | 4.75  | 4.77         | 4.82          | 0.10          |
+| f16/f32  | 1.34 | 1.83 | 2.17  | 2.32  | 2.34  | 2.33         | 2.39          | — ²           |
+| bf16/f32 | 1.38 | 1.84 | 2.19  | 2.32  | 2.30  | 2.34         | 2.39          | — ²           |
+| f32      | 1.36 | 1.93 | 2.36  | 2.33  | 2.31  | 2.34         | 2.33          | 0.06          |
+| f64      | 0.41 | 0.58 | 0.60  | 0.56  | 0.58  | 0.61         | 0.61          | 0.03          |
+| i8→i32   | 2.42 | 3.41 | 4.75  | 4.98  | 4.99  | 4.66         | 4.88          | 0.14          |
+| i16→i64  | 1.02 | 2.06 | 2.41  | 2.48  | 2.06  | 2.38         | 2.32          | 0.12          |
+| Q4→f16   | 1.77 | 2.78 | 4.07  | 4.19  | 4.45  | 3.58         | 3.38          | 0.06          |
+| Q4→bf16  | 1.70 | 2.73 | 3.95  | 4.19  | 4.45  | 3.68         | 3.35          | 0.05          |
 
-**vs. other backends — 2048³** (`examples/vs_{accelerate,ort,candle,burn}`).
-These are full strided GEMMs on both sides, so B is packed per call — hence f16
-at 4.2 here against 4.9 pre-packed above:
+**vs. other backends**, unpacked strided GEMM (`examples/vs_{accelerate,candle,burn}`,
+`inference_value`). Accel has no f16/`cblas`; † is upcast + `sgemm` + downcast.
+f16 here is ~4.3 at 2048³ against 4.9 pre-packed above. Accelerate leads at 256³
+(see dispatch table: the call is ~20 µs, so streaming entry is a real slice) and
+at 2048³ f32 (B just outgrew the skip-packing footprint):
 
-| backend                     | f32     | f16     |
-| --------------------------- | ------- | ------- |
-| **sme-gemm** (this crate)   | **2.1** | **4.2** |
-| Apple Accelerate (`cblas`)  | 2.2     | — ³     |
-| ONNX Runtime · MLAS (CPU)   | 2.0     | 1.8 ³   |
-| ONNX Runtime · XNNPACK      | 2.0     | — ³     |
-| ONNX Runtime · CoreML       | 2.0     | 1.8 ³   |
-| candle (`gemm` crate)       | 0.6     | 1.4     |
-| burn (`NdArray`, pure-Rust) | 0.1     | — ³     |
+| shape            | sme f32 | accel | candle | burn | sme f16 | accel † | candle | sme f64 | accel |
+| ---------------- | ------- | ----- | ------ | ---- | ------- | ------- | ------ | ------- | ----- |
+| 256³             | 1.50    | 1.67  | 0.24   | 0.11 | 1.21    | —       | 0.31   | 0.46    | 0.44  |
+| 512³             | 1.97    | 1.61  | 0.39   | 0.11 | 1.99    | 0.78    | 0.75   | 0.58    | 0.46  |
+| 1024³            | 2.34    | 2.03  | 0.42   | 0.12 | 3.83    | 1.40    | 0.83   | 0.55    | 0.52  |
+| 2048³            | 2.04    | 2.14  | 0.42   | 0.12 | 4.32    | 1.70    | 0.84   | 0.55    | 0.52  |
+| 4096³            | 2.14    | 2.07  | 0.40   | —    | 4.22    | 1.83    | 0.82   | 0.55    | 0.52  |
+| 4096×512×512     | 2.29    | 1.94  | 0.39   | 0.11 | 3.89    | —       | 0.80   | 0.61    | 0.52  |
+| 16384×512×512    | 2.30    | 2.00  | 0.40   | —    | 4.12    | —       | 0.81   | 0.61    | 0.52  |
+| 4096×11008×4096  | —       | —     | —      | —    | 3.32    | 1.89    | —      | —       | —     |
 
-**vs. Accelerate across shapes** (`examples/vs_accelerate`, ratio > 1 = sme-gemm
-faster). Accelerate leads at 256³, where a call is a few tens of microseconds
-and streaming-mode entry plus the cross-cluster dispatch are most of it, and at
-2048³, where B has just outgrown the footprint that lets the kernel skip packing
-it:
+f16 sme at 256³ / 4096×512 / 16384×512 is the candle adapter (no accel† run
+there); the other f16 sme cells are `inference_value`.
 
-| shape (both dtypes) | f32       | f64       |
-| ------------------- | --------- | --------- |
-| 256×256×256         | 0.90×     | 0.99×     |
-| 512×512×512         | 1.19×     | **1.26×** |
-| 1024×1024×1024      | 1.13×     | 1.09×     |
-| 2048×2048×2048      | 0.96×     | 1.06×     |
-| 4096×4096×4096      | 1.05×     | 1.01×     |
-| 4096×512×512        | **1.20×** | 1.17×     |
-| 16384×512×512       | 1.15×     | 1.17×     |
+**Dispatch overhead** (`examples/dispatch --features dispatch-cmp`), µs/call, f32.
+Submit + wait; compile, Metal buffer alloc, and SME `prepack_f32` are outside the
+timer. P-core is Accelerate `cblas_sgemm` at `USER_INTERACTIVE` (may use AMX).
+GPU is MPS, shared storage, timed through `waitUntilCompleted`. ANE is MLCompute
+MatMul on `aneDevice` — the MatMul layer stayed on ANE for every shape here:
 
-The f16 margin on skinny shapes is wider, since no other backend here has a
-native f16 kernel: 4.3 at 4096×512×512 against ORT's 1.2.
+|                  | 8³   | 16³  | 32³  | 64³  | 128³ | 256³ | 1×64×64 | 1×256×256 | 1×1024×1024 | 1×4096×4096 |
+| ---------------- | ---- | ---- | ---- | ---- | ---- | ---- | ------- | --------- | ----------- | ----------- |
+| P-core (cblas)   | 0.07 | 0.20 | 0.23 | 0.51 | 3.2  | 20.5 | 0.05    | 0.37      | 4.8         | 836         |
+| SME (packed)     | 0.45 | 0.38 | 0.42 | 1.5  | 7.9  | 24.9 | 1.2     | 3.6       | 36.9        | 634         |
+| GPU (MPS)        | 187  | 188  | 200  | 158  | 156  | 294  | 188     | 208       | 187         | 805         |
+| ANE (MLC)        | 70   | 79   | 70   | 61   | 64   | 73   | 72      | 62        | 164         | 1981        |
 
-**Flash attention** (`examples/attention`, `m×n×d`, ms): 4096×4096×64 runs 2.8
-(f16) / 3.2 (bf16) / 4.6 (f32). Against materializing `softmax(QK^T)V` it is
-1.08× at 4096², 1.20× at 8192², and 0.93–1.06× below that, where the score
-matrix still fits cache and the advantage is the `O(m·d + n·d + n·dv)` footprint
-rather than speed.
+CPU/SME dispatch is sub-µs until the math shows up (~128³). GPU's floor is
+~180 µs of command-buffer + `waitUntilCompleted` (256³ jittered up). ANE's floor
+is ~60–80 µs. Decode (`1×4096×4096`, resident B) is bandwidth: packed SME beats
+both Accelerate and a round-trip MPS GEMM.
 
-**Fused epilogue** (`examples/epilogue_bench`): a bias adds +0%, bias+ReLU +4%
-to +10% — rising to +30% only at shallow `K` (4096×4096×128), where the store is
-most of the work. Doing the same bias+ReLU as a separate pass over the output
-instead costs 4–12× the bare GEMM.
+**Flash attention** (`examples/attention`, `m×n×d`). vs materialized is a
+footprint win (`O(m·d + n·d + n·dv)`), not a speed win, until 4096²:
 
-**Batched** (`examples/batched_bench`): 1.8–2.1× over a loop of single GEMMs for
-per-item shapes at the flop floor, which is where the per-call streaming
-entry/exit is worth amortizing.
+|                    | 512²×64 | 1024²×64 | 2048²×64 | 4096²×64 | 1024²×128 | 4096²×128 | 8192²×64 | 1×4096×128 |
+| ------------------ | ------- | -------- | -------- | -------- | --------- | --------- | -------- | ---------- |
+| f32 ms             | 0.18    | 0.41     | 1.30     | 4.66     | 0.48      | 6.54      | 18.6     | 0.10       |
+| matzd ms           | 0.17    | 0.37     | 1.17     | 4.96     | 0.47      | 6.52      | 22.7     | 0.10       |
+| vs matzd           | 0.96×   | 0.89×    | 0.90×    | 1.06×    | 0.97×     | 1.00×     | 1.22×    | 1.00×      |
+| f16 ms             | 0.14    | 0.29     | 0.82     | 2.82     | 0.35      | 3.89      | 11.9     | 0.12       |
+| bf16 ms            | 0.15    | 0.33     | 0.82     | 3.12     | 0.38      | 3.95      | 13.0     | 0.13       |
+| f16 TF/s           | 0.47    | 0.94     | 1.30     | 1.52     | 1.54      | 2.21      | 1.44     | 0.02       |
 
-**Q4** (`examples/q4_bench`): the 4-bit-resident path is within ~7% of eagerly
-dequantizing to f16 at `m ≥ 128`, and ~1.6× slower at `m = 1`, since the
-on-the-fly dequant costs `O(n·k)` regardless of `m` and small-`m` calls have
-little MOPA work to overlap it with. It trades throughput for a 4× smaller
-resident weight set.
+|                          | 4096×4096×512 | 4096×4096×128 | 16384×512×512 | 8192×8192×256 |
+| ------------------------ | ------------- | ------------- | ------------- | ------------- |
+| epilogue gemm ms         | 3.46          | 0.96          | 1.79          | 7.03          |
+| +bias                    | +0%           | +2%           | +0%           | +0%           |
+| +bias+relu               | +5%           | +27%          | +5%           | +8%           |
+| separate bias+relu ms    | 14.4          | 12.0          | 7.34          | 51.1          |
 
-- ¹ The decode shape: one row against a resident weight set, so it is
-  bandwidth-bound rather than compute-bound. f16 there moves its 32 MB of
-  weights at ~100 GB/s of the machine's ~150 GB/s, which the TF/s column
-  understates.
-- ² No pre-packed entry point, so the call would re-pack the whole weight set
-  and report packing cost rather than kernel throughput.
-- ³ No native f16 GEMM; f16 inputs run through f32.
+|                  | m=1 ×4096² | m=16 | m=128 | m=256 | 1024³ |
+| ---------------- | ---------- | ---- | ----- | ----- | ----- |
+| q4-resident ms   | 0.62       | 0.53 | 1.09  | 1.96  | 0.53  |
+| eager-f16 ms     | 0.36       | 0.35 | 1.06  | 2.01  | 0.46  |
 
-ORT's three execution providers land within 1% of each other on this graph,
-consistent with the single `MatMul` node staying on CPU rather than being
-offloaded to XNNPACK or the ANE. Per-shape numbers and methodology:
-`examples/{vs_accelerate, vs_ort, vs_candle, vs_burn, inference_value}`.
+Q4 trades throughput for a 4× smaller resident weight set. On-the-fly dequant is
+`O(n·k)`, so `m=1` is ~1.7× eager; from `m=128` they match.
+
+|                    | 16³×256 | 32³×128 | 64³×64 | 32×128×64 ×64 | 96³×32 |
+| ------------------ | ------- | ------- | ------ | ------------- | ------ |
+| batched f16 µs     | 42      | 27      | 45     | 56            | 62     |
+| loop of GEMMs µs   | 180 *   | 86 *    | 93     | 106           | 102    |
+
+`*`: loop side is under the 2¹⁸ flop floor (scalar reference), so that speedup is
+the floor, not streaming-entry amortization.
+
+|                      | 128×128×128 | 256×256×128 | 1024³ | 2048×2048×512 | 4096×512×512 |
+| -------------------- | ----------- | ----------- | ----- | ------------- | ------------ |
+| i8→f32 dequant TOPS  | 0.08        | 0.16        | 1.87  | 1.38          | 1.36         |
+| i16→f32 dequant TOPS | 0.10        | 0.17        | 1.27  | 0.99          | 1.02         |
+
+Fused i8/i16→f32 dequant + bias + gelu (`examples/dequant_bench`).
+
+- ¹ Decode: one row vs a resident weight set, bandwidth-bound. f16 moves 32 MB
+  at ~100 GB/s of ~150 GB/s; the TF/s column understates that.
+- ² No pre-packed entry point — the call would re-pack the whole weight set.
+- † No native f16 GEMM; f16 inputs run through f32.
+
+`examples/vs_ort` omitted: no `coreml+xnnpack` `ort` distro for this target.
+A prior run had the three ORT EPs within 1% at 2048³ (~2.0 f32 / 1.8 f16) — the
+`MatMul` node stays on CPU.
 
 ## Usage
 
@@ -214,103 +208,50 @@ offloaded to XNNPACK or the ANE. Per-shape numbers and methodology:
 use half::f16;
 use sme_gemm::{
     matmul_f16, matmul_i8, matmul_i8_packed_dequant, gemm_f32,
-    Accuracy, Dequant, Gemm, prepack_f16, prepack_i8,
+    Accum, Dequant, Gemm, prepack_f16, prepack_i8,
 };
 
-// row-major C = A @ B
 let (m, n, k) = (256, 256, 256);
 let a = vec![f16::from_f32(0.1); m * k];
 let b = vec![f16::from_f32(0.2); k * n];
 let mut c = vec![f16::ZERO; m * n];
-matmul_f16(&a, &b, &mut c, m, n, k, Accuracy::Fast); // fp16 accumulate, ~2x, M5
+matmul_f16(&a, &b, &mut c, m, n, k, Accum::F16); // f16 accumulate, M5
+// matmul_f16(..., Accum::F32);                 // widening f32 accumulate, M4+
 
-// pre-packed weights + fused bias/activation epilogue
 let w = prepack_f16(&b, n, k);
 let bias = vec![f16::ZERO; n];
 Gemm::new(&a, &w, m).add_col(&bias).gelu().run(&mut c);
 
-// quantized i8 x i8 -> i32 (raw), or fused dequant -> f32
 let (ai, bi) = (vec![1i8; m * k], vec![2i8; k * n]);
 let mut ci = vec![0i32; m * n];
 matmul_i8(&ai, &bi, &mut ci, m, n, k);
 
-// i8 weights, dequant -> f32 in-register (per-tensor scale) + relu
-// (or .scale_per_n(&scales) for a per-output-channel scale vector)
 let qw = prepack_i8(&bi, n, k);
 let mut cf = vec![0f32; m * n];
 matmul_i8_packed_dequant(&ai, &qw, &mut cf, m, &Dequant::new(0.02).relu());
 
-// strided GEMM: C = alpha*C + beta*(Aᵀ @ B), BLAS-style (alpha=1 accumulates)
-let af = vec![0.1f32; k * m]; // k x m, read transposed as A (m x k)
+// C = αC + β(Aᵀ @ B)
+let af = vec![0.1f32; k * m];
 let bf = vec![0.2f32; k * n];
 gemm_f32(m, n, k, &mut cf, /*c_row*/ n, /*c_col*/ 1,
-    &af, /*a_row*/ 1, /*a_col*/ m,        // swap A strides => transpose
+    &af, /*a_row*/ 1, /*a_col*/ m,
     &bf, /*b_row*/ n, /*b_col*/ 1, /*alpha*/ 1.0, /*beta*/ 1.0);
 ```
 
-Other entry points: `matmul_{bf16,f32,f64,i16}`, the strided
-`gemm_{f16,bf16,f32,f64,i8,i16}` (alpha/beta/transpose/col-major),
-`matmul_*_batched`, `matmul_i16_dequant`, `dequant_q4` / `matmul_q4` (4-bit
-resident), and the optional `sme_gemm::candle::sme_matmul`. Runtime
-capabilities: `sme_gemm::caps()`.
+Also: `matmul_{bf16,f32,f64,i16}`, `gemm_*`, `matmul_*_batched`,
+`matmul_i16_dequant`, `dequant_q4` / `matmul_q4`, optional
+`sme_gemm::candle::sme_matmul`. Caps: `sme_gemm::caps()`.
 
-## Design notes
+## Design
 
-- **Per-cluster shared unit, multi-cluster dispatch.** SME is one matrix unit
-  per CPU cluster, not per-core. The hot paths `dispatch_apply` their M-tiles
-  across _both_ cluster SME units; small problems use a low-overhead serial /
-  direct-load path instead.
-- **Streaming mode, SVL=512.** Compiled `-mcpu=apple-m4`; the M5 extensions
+- **One SME unit per cluster.** Hot paths `dispatch_apply` M-tiles across both
+  cluster units; small problems take a serial / direct-load path.
+- **Streaming mode, SVL=512.** Compiled `-mcpu=apple-m4`. M5 features
   (`+sme-f16f16`, `+sme-b16b16`, `+sme-f64f64`, `+sme-i16i64`) are separate TUs
-  gated behind a runtime probe, so building them keeps the M4 floor.
-- **No stable Rust SME intrinsics exist**, so kernels are C (`cc` +
-  `arm_sme.h`).
+  behind a runtime probe, so the M4 floor stays.
+- **No stable Rust SME intrinsics** — kernels are C (`cc` + `arm_sme.h`).
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design: the SME execution
-model, TU/feature gating, module layout, the fused op-graph epilogue, and the
-correctness/fallback contract.
-
-## Verification
-
-Beyond `cargo test` (independent-oracle correctness suite, differential
-proptests, footprint validation, concurrent-caller stress for the
-`dispatch_apply` paths):
-
-```sh
-# Miri: UB-checks the pure-Rust path (stride/pointer glue, packing, reference).
-# The SME kernels are FFI and never run under the interpreter. On aarch64 the
-# f16 properties are skipped (half's fcvt inline asm); CI runs them on linux.
-cargo +nightly miri test --test proptest --test validation
-
-# The in-crate unit tests are NOT gated that way, so on aarch64 they need half
-# pushed onto its software conversion path or Miri aborts on the fcvt asm:
-RUSTFLAGS="-C target-feature=-fp16" cargo +nightly miri test --lib
-
-# Coverage-guided differential fuzzing against naive oracles, on the REAL SME
-# kernels when run on M4+ (i8 is bit-exact; f32 uses a condition-aware bound
-# and also feeds NaN/Inf/subnormal bit patterns as a crash detector):
-cargo +nightly fuzz run diff_i8  -- -max_total_time=300
-cargo +nightly fuzz run diff_f32 -- -max_total_time=300
-
-# Overnight proptest soak (more cases through every dtype property):
-PROPTEST_CASES=20000 cargo test --release --test proptest
-
-# Guard pages (also part of plain `cargo test`): every kernel operand sits
-# flush against a PROT_NONE page in both directions, so an unpredicated SME
-# load/store even one element past a buffer edge faults loudly instead of
-# corrupting the heap -- the OOB class ASan cannot see through intrinsics.
-cargo test --release --test guard_page
-
-# AddressSanitizer over the C kernels (experimental knob; verified to catch
-# heap OOB inside __arm_locally_streaming functions on Apple clang 17).
-# Slow; do not combine with `cargo fuzz` (conflicting ASan runtimes).
-SME_GEMM_C_ASAN=1 cargo test --release
-```
-
-There is deliberately no loom setup: the crate's only concurrency is libdispatch
-inside the C kernels plus per-thread scratch, which Rust-side model checkers
-cannot instrument; `tests/concurrency.rs` stress-checks those paths for
-bit-identical results under concurrent callers instead.
+Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## License
 

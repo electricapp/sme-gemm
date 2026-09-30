@@ -6,7 +6,7 @@
 
 use half::{bf16, f16};
 use sme_gemm::{
-    Accuracy, Gemm, gemm_bf16, gemm_f16, gemm_f32, gemm_f64, gemm_i8, gemm_i16, matmul_f16_packed,
+    Accum, Gemm, gemm_bf16, gemm_f16, gemm_f32, gemm_f64, gemm_i8, gemm_i16, matmul_f16_packed,
     matmul_f32, matmul_i8_packed, prepack_bf16, prepack_f16, prepack_i8,
 };
 
@@ -51,7 +51,7 @@ fn f16_short_a_panics() {
         1,
         f16::ZERO,
         f16::ONE,
-        Accuracy::Accurate,
+        Accum::F32,
     );
 }
 
@@ -76,7 +76,7 @@ fn bf16_short_b_panics() {
         1,
         bf16::ZERO,
         bf16::from_f32(1.0),
-        Accuracy::Accurate,
+        Accum::F32,
     );
 }
 

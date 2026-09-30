@@ -7,7 +7,7 @@
 #![cfg(not(miri))]
 
 use half::f16;
-use sme_gemm::{Accuracy, matmul_f16};
+use sme_gemm::{Accum, matmul_f16};
 
 /// Test-local activation discriminator (the library's `Activation` enum is
 /// internal; the public API exposes the named `.relu()/.gelu()/.silu()`
@@ -67,14 +67,14 @@ fn max_rel(got: &[f16], want: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-fn check(m: usize, n: usize, k: usize, mode: Accuracy, tol: f64) {
+fn check(m: usize, n: usize, k: usize, acc: Accum, tol: f64) {
     let mut s = 0x1234_5678_9abc_def0 ^ ((m * 131 + n * 17 + k) as u64);
     let a = fill(&mut s, m * k);
     let b = fill(&mut s, k * n);
     let mut c = vec![f16::ZERO; m * n];
-    matmul_f16(&a, &b, &mut c, m, n, k, mode);
+    matmul_f16(&a, &b, &mut c, m, n, k, acc);
     let mr = max_rel(&c, &oracle(&a, &b, m, n, k));
-    assert!(mr < tol, "{m}x{n}x{k} {mode:?}: max_rel={mr} >= {tol}");
+    assert!(mr < tol, "{m}x{n}x{k} {acc:?}: max_rel={mr} >= {tol}");
 }
 
 const SIZES: &[(usize, usize, usize)] = &[

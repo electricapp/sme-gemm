@@ -3,7 +3,7 @@
 
 use half::f16;
 
-use crate::element::{Accuracy, Packed};
+use crate::element::{Accum, Packed};
 use crate::epilogue::Epilogue;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::exec::unpack_b16_sme;
@@ -18,7 +18,7 @@ use crate::probe::caps;
 use crate::reference;
 
 /// Fallback GEMM for the packed / batched-epilogue paths: [`gemm_f16`] at
-/// [`Accuracy::Accurate`], i.e. the WIDENING kernel, not the scalar reference.
+/// [`Accum::F32`], i.e. the WIDENING kernel, not the scalar reference.
 /// Without `FEAT_SME_F16F16` (an M4) `prepack_f16` stores a plain row-major copy
 /// -- exactly what the widening driver takes -- so routing here instead of to
 /// scalar is free. Off-SME / below the worth-it floor `gemm_f16` falls through to
@@ -59,7 +59,7 @@ fn fallback_gemm_f16(
         b_cs,
         alpha,
         beta,
-        Accuracy::Accurate,
+        Accum::F32,
     );
 }
 
@@ -81,20 +81,12 @@ batched_ep_impl!(
 );
 
 /// Row-major `C = A @ B`, f16. `a` is `m x k`, `b` is `k x n`, `c` is `m x n`,
-/// all row-major and contiguous. `mode` selects fp32 (accurate) vs fp16 (fast)
-/// accumulation.
+/// all row-major and contiguous. `accum` is [`Accum::F32`] (widening, M4+) or
+/// [`Accum::F16`] (`FEAT_SME_F16F16`, M5).
 ///
 /// # Panics
 /// Panics if the slice lengths are inconsistent with `m`, `n`, `k`.
-pub fn matmul_f16(
-    a: &[f16],
-    b: &[f16],
-    c: &mut [f16],
-    m: usize,
-    n: usize,
-    k: usize,
-    mode: Accuracy,
-) {
+pub fn matmul_f16(a: &[f16], b: &[f16], c: &mut [f16], m: usize, n: usize, k: usize, accum: Accum) {
     assert_eq!(a.len(), checked_dim2(m, k), "a is m*k");
     assert_eq!(b.len(), checked_dim2(k, n), "b is k*n");
     assert_eq!(c.len(), checked_dim2(m, n), "c is m*n");
@@ -114,11 +106,12 @@ pub fn matmul_f16(
         /*b_col*/ 1,
         f16::from_f32(0.0),
         f16::from_f32(1.0),
-        mode,
+        accum,
     );
 }
 
-/// Strided f16 GEMM: `C = alpha*C + beta*(A @ B)`.
+/// Strided f16 GEMM: `C = alpha*C + beta*(A @ B)`. `accum` is [`Accum::F32`]
+/// (widening) or [`Accum::F16`] (native, M5).
 ///
 /// Strides are in elements. `C[i,j] = c[i*c_row_stride + j*c_col_stride]`, and
 /// analogously for A (`m x k`) and B (`k x n`). When `alpha == 0` C is treated
@@ -145,7 +138,7 @@ pub fn gemm_f16(
     b_col_stride: usize,
     alpha: f16,
     beta: f16,
-    mode: Accuracy,
+    accum: Accum,
 ) {
     if m == 0 || n == 0 {
         return;
@@ -157,7 +150,7 @@ pub fn gemm_f16(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if sme_worth_it(m, n, k) {
-        let f16f16 = mode == Accuracy::Fast && caps().sme_f16f16;
+        let f16f16 = accum.is_f16() && caps().sme_f16f16;
         // SAFETY: strides/lengths describe in-bounds m x k / k x n / m x n
         // regions; the kernels read/write only within them. f16 is a
         // transparent u16; scalars cross as bit patterns.
@@ -210,8 +203,8 @@ pub fn gemm_f16(
     );
 }
 
-/// Pack row-major f16 weights `b` (`k x n`) for the `Fast` path. Reuse the
-/// result across many [`matmul_f16_packed`] calls to skip re-packing per GEMM.
+/// Pack row-major f16 weights `b` (`k x n`) for the f16-accumulate path. Reuse
+/// the result across many [`matmul_f16_packed`] calls to skip re-packing per GEMM.
 ///
 /// # Panics
 /// Panics if `b.len() != k * n`.
@@ -253,7 +246,7 @@ pub fn prepack_f16(b: &[f16], n: usize, k: usize) -> Packed<f16> {
     }
 }
 
-/// Row-major `C = A @ B` (f16 `Fast`) with B pre-packed. `a` is `m x k`
+/// Row-major `C = A @ B` (f16 accumulate) with B pre-packed. `a` is `m x k`
 /// row-major, `c` is `m x n` row-major. Only A is packed per call.
 ///
 /// # Panics
@@ -341,7 +334,7 @@ pub fn matmul_f16_packed(a: &[f16], packed: &Packed<f16>, c: &mut [f16], m: usiz
     );
 }
 
-/// Batched f16 (`Fast`) GEMM: `count` independent row-major `C_i = A_i @ B_i`,
+/// Batched f16 (f16 accumulate) GEMM: `count` independent row-major `C_i = A_i @ B_i`,
 /// all the same `m x n x k` shape, run in a single SME streaming session.
 ///
 /// For small per-item GEMMs the streaming entry/exit dominates, so amortizing
@@ -395,7 +388,7 @@ pub fn matmul_f16_batched(a: &[f16], b: &[f16], c: &mut [f16], m: usize, n: usiz
     reference::batched_gemm_f16(a, b, c, m, n, k);
 }
 
-/// Batched f16 (`Fast`) GEMM with a fused op-graph epilogue applied to EACH
+/// Batched f16 (f16 accumulate) GEMM with a fused op-graph epilogue applied to EACH
 /// item: `C_i = ep(A_i @ B_i)`, `count` independent row-major GEMMs (same `m x
 /// n x k`) in a single streaming session.
 ///
@@ -429,7 +422,7 @@ pub fn matmul_f16_batched_ep(
 // `prepack_f16` only yields `sme == false` on an M4 (or off Apple), so the
 // public API can't reach the fallback arm here -- which is why routing it to the
 // widening kernel was deferred as untestable. Build the panel directly instead:
-// `gemm_f16(Accurate)` runs the same widening driver on M5 as on M4.
+// `gemm_f16(Accum::F32)` runs the same widening driver on M5 as on M4.
 // The panel-size helpers must SATURATE, not wrap: they size the caller's buffer
 // while `packb` writes the full panel regardless. FFI symbols, so in-crate.
 // `not(miri)` because these call the C symbols directly and Miri cannot execute
@@ -467,7 +460,7 @@ mod packed_size_tests {
 #[cfg(test)]
 mod fallback_tests {
     use super::{fallback_gemm_f16, matmul_f16, matmul_f16_packed};
-    use crate::element::{Accuracy, Packed};
+    use crate::element::Packed;
     use crate::exec::Gemm;
     use half::f16;
 
@@ -504,7 +497,7 @@ mod fallback_tests {
             matmul_f16_packed(&a, &rowmajor_panel(&b, n, k), &mut got, m);
 
             let mut want = vec![f16::ZERO; m * n];
-            matmul_f16(&a, &b, &mut want, m, n, k, Accuracy::Accurate);
+            matmul_f16(&a, &b, &mut want, m, n, k, crate::element::Accum::F32);
             assert_eq!(got, want, "sme==false packed panel diverges at {m}x{n}x{k}");
         }
     }

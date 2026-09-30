@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use half::f16;
-use sme_gemm::{Accuracy, Dequant, matmul_f16, matmul_i8_packed_dequant, prepack_i8};
+use sme_gemm::{Accum, Dequant, matmul_f16, matmul_i8_packed_dequant, prepack_i8};
 
 const ROW_MAJOR: i32 = 101;
 const NO_TRANS: i32 = 111;
@@ -71,7 +71,7 @@ fn main() {
         let flop = 2.0 * (m * n * k) as f64;
 
         let s_sme = best(big, || {
-            matmul_f16(&a16, &b16, &mut c16, m, n, k, Accuracy::Fast);
+            matmul_f16(&a16, &b16, &mut c16, m, n, k, Accum::F16);
         });
 
         // B converted once; A and C converted per call around the sgemm.

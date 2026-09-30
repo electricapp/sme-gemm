@@ -342,8 +342,8 @@ the matching flag before dispatching to an M5 kernel.
 
 `lib.rs` is a thin re-export root: crate docs and `pub use`.
 
-- **`element.rs`** — the `Accuracy` mode (Accurate = fp32-accumulate widening
-  MOPA on M4+; Fast = fp16-accumulate on M5 `FEAT_SME_F16F16`), the sealed
+- **`element.rs`** — `Accum` (F32 = widening MOPA, M4+; F16 / Bf16 = native
+  16-bit accumulate on M5 `FEAT_SME_F16F16` / `FEAT_SME_B16B16`), the sealed
   `Element` trait and its dtype impls, and the reusable `Packed<T>` weight
   panel.
 - **`epilogue/`** — the fused-epilogue builder API. `mod.rs` holds the shared

@@ -3,26 +3,26 @@
 use crate::{SIZES, check, fill, max_rel, oracle};
 use half::{bf16, f16};
 use sme_gemm::{
-    Accuracy, caps, matmul_bf16, matmul_bf16_packed, matmul_f16_packed, matmul_f32, matmul_i8,
+    Accum, caps, matmul_bf16, matmul_bf16_packed, matmul_f16_packed, matmul_f32, matmul_i8,
     prepack_bf16, prepack_f16,
 };
 
 #[test]
-fn f16_accurate() {
+fn f16_f32_accum() {
     for &(m, n, k) in SIZES {
-        check(m, n, k, Accuracy::Accurate, 2e-2);
+        check(m, n, k, Accum::F32, 2e-2);
     }
 }
 
 #[test]
-fn f16_fast() {
+fn f16_accum() {
     // fp16 accumulation: error grows ~sqrt(k); only runs the SME path if M5.
     if !caps().sme_f16f16 {
         return;
     }
     for &(m, n, k) in SIZES {
         let tol = (3e-2 * (k as f64).sqrt() / 4.0).max(3e-2);
-        check(m, n, k, Accuracy::Fast, tol);
+        check(m, n, k, Accum::F16, tol);
     }
 }
 
@@ -97,7 +97,7 @@ fn bf16_widening() {
             })
             .collect();
         let mut c = vec![bf16::ZERO; m * n];
-        matmul_bf16(&a, &b, &mut c, m, n, k, Accuracy::Accurate);
+        matmul_bf16(&a, &b, &mut c, m, n, k, Accum::F32);
         let mut want = vec![0.0f64; m * n];
         for i in 0..m {
             for j in 0..n {
@@ -187,7 +187,7 @@ fn f16_prepacked() {
 }
 
 #[test]
-fn bf16_fast_prepacked() {
+fn bf16_prepacked() {
     // Non-widening B16B16: bf16 accumulate, error grows ~sqrt(k); coarse tol
     // (bf16 8-bit mantissa). Only runs the SME path on M5.
     if !caps().sme_b16b16 {

@@ -3,7 +3,7 @@
 
 use half::bf16;
 
-use crate::element::{Accuracy, Packed};
+use crate::element::{Accum, Packed};
 use crate::epilogue::Epilogue;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::exec::unpack_b16_sme;
@@ -17,7 +17,7 @@ use crate::ffi::{
 use crate::probe::caps;
 use crate::reference;
 
-/// Batched bf16 (`Fast`/B16B16) GEMM with a fused op-graph epilogue applied to
+/// Batched bf16 (bf16 accumulate / B16B16) GEMM with a fused op-graph epilogue applied to
 /// EACH item: `C_i = ep(A_i @ B_i)`.
 ///
 /// As [`matmul_f16_batched_ep`], bf16. The GEMM accumulates in bf16 (B16B16
@@ -44,7 +44,7 @@ pub fn matmul_bf16_batched_ep(
     bf16_batched_ep_impl(a, b, c, count, m, n, k, ep);
 }
 
-/// bf16 mirror of `fallback_gemm_f16`: [`gemm_bf16`] at [`Accuracy::Accurate`]
+/// bf16 mirror of `fallback_gemm_f16`: [`gemm_bf16`] at [`Accum::F32`]
 /// (the widening BFMOPA kernel) instead of the scalar reference.
 #[allow(clippy::too_many_arguments)]
 fn fallback_gemm_bf16(
@@ -78,7 +78,7 @@ fn fallback_gemm_bf16(
         b_cs,
         alpha,
         beta,
-        Accuracy::Accurate,
+        Accum::F32,
     );
 }
 
@@ -91,8 +91,8 @@ batched_ep_impl!(
     |_: &Epilogue<'_, bf16>| {}
 );
 
-/// Row-major `C = A @ B`, bf16. `mode` selects fp32 (accurate, widening BFMOPA,
-/// M4+) vs bf16 (fast, non-widening B16B16, M5) accumulation. See [`matmul_f16`].
+/// Row-major `C = A @ B`, bf16. `accum` is [`Accum::F32`] (widening BFMOPA,
+/// M4+) or [`Accum::Bf16`] (`FEAT_SME_B16B16`, M5). See [`matmul_f16`].
 ///
 /// [`matmul_f16`]: crate::matmul_f16
 ///
@@ -105,7 +105,7 @@ pub fn matmul_bf16(
     m: usize,
     n: usize,
     k: usize,
-    mode: Accuracy,
+    accum: Accum,
 ) {
     assert_eq!(a.len(), checked_dim2(m, k), "a is m*k");
     assert_eq!(b.len(), checked_dim2(k, n), "b is k*n");
@@ -125,12 +125,12 @@ pub fn matmul_bf16(
         1,
         bf16::from_f32(0.0),
         bf16::from_f32(1.0),
-        mode,
+        accum,
     );
 }
 
-/// Strided bf16 GEMM: `C = alpha*C + beta*(A @ B)`. `mode` selects fp32
-/// (accurate) vs bf16 (fast) accumulation. See [`gemm_f16`].
+/// Strided bf16 GEMM: `C = alpha*C + beta*(A @ B)`. `accum` is [`Accum::F32`]
+/// or [`Accum::Bf16`]. See [`gemm_f16`].
 ///
 /// [`gemm_f16`]: crate::gemm_f16
 ///
@@ -152,7 +152,7 @@ pub fn gemm_bf16(
     b_col_stride: usize,
     alpha: bf16,
     beta: bf16,
-    mode: Accuracy,
+    accum: Accum,
 ) {
     if m == 0 || n == 0 {
         return;
@@ -164,7 +164,7 @@ pub fn gemm_bf16(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if sme_worth_it(m, n, k) {
-        let b16b16 = mode == Accuracy::Fast && caps().sme_b16b16;
+        let b16b16 = accum.is_bf16() && caps().sme_b16b16;
         // SAFETY: see `gemm_f16`. bf16 is a transparent u16.
         let rc = unsafe {
             if b16b16 {
@@ -230,7 +230,7 @@ pub fn gemm_bf16(
     );
 }
 
-/// Pack row-major bf16 weights `b` (`k x n`) for the `Fast` (B16B16) path.
+/// Pack row-major bf16 weights `b` (`k x n`) for the bf16-accumulate (B16B16) path.
 /// Reuse across many [`matmul_bf16_packed`] calls.
 ///
 /// # Panics
@@ -273,7 +273,7 @@ pub fn prepack_bf16(b: &[bf16], n: usize, k: usize) -> Packed<bf16> {
     }
 }
 
-/// Row-major `C = A @ B` (bf16 `Fast`) with B pre-packed. `a` is `m x k`
+/// Row-major `C = A @ B` (bf16 accumulate) with B pre-packed. `a` is `m x k`
 /// row-major, `c` is `m x n` row-major. Only A is packed per call.
 ///
 /// # Panics
@@ -372,7 +372,7 @@ packed_ep_impl!(
     |_: &Epilogue<'_, bf16>| {}
 );
 
-/// Batched bf16 (`Fast`/B16B16) GEMM: `count` independent row-major
+/// Batched bf16 (bf16 accumulate / B16B16) GEMM: `count` independent row-major
 /// `C_i = A_i @ B_i`, one streaming session. See [`matmul_f16_batched`].
 ///
 /// [`matmul_f16_batched`]: crate::matmul_f16_batched

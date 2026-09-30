@@ -1,14 +1,14 @@
 //! Flash attention vs. the materialized `softmax(QK^T)V` path, and the f16/bf16
 //! variants against the f32 one. Interleaved A/B, median of per-round bests.
-//! The half columns use `Accuracy::Fast` (the M5 non-widening MOPA); with
-//! `Accuracy::Accurate` they land within ~10% of the f32 path instead.
+//! Half columns use native 16-bit accumulate (`Accum::F16` / `Accum::Bf16`);
+//! with `Accum::F32` they land within ~10% of the f32 path instead.
 //!   cargo run --release --example attention
 
 use std::time::Instant;
 
 use half::{bf16, f16};
 use sme_gemm::{
-    Accuracy, FlashParams, flash_attention_bf16_with, flash_attention_f16_with,
+    Accum, FlashParams, flash_attention_bf16_with, flash_attention_f16_with,
     flash_attention_f32_with, gemm_f32, softmax_rows,
 };
 
@@ -99,7 +99,7 @@ fn main() {
         let (qb, kb, vb) = (bhalf(&q), bhalf(&k), bhalf(&v));
         let mut oh = vec![f16::ZERO; m * dv];
         let mut ob = vec![bf16::ZERO; m * dv];
-        let acc = Accuracy::Fast;
+        let (acc16, accb) = (Accum::F16, Accum::Bf16);
 
         let (mut fs, mut ms, mut hs, mut bs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for _ in 0..rounds {
@@ -110,10 +110,10 @@ fn main() {
                 materialized(&q, &k, &v, &mut om, &mut s, m, n, d, dv, scale);
             }));
             hs.push(best(reps, || {
-                flash_attention_f16_with(&qh, &kh, &vh, &mut oh, m, n, d, dv, scale, acc, p);
+                flash_attention_f16_with(&qh, &kh, &vh, &mut oh, m, n, d, dv, scale, acc16, p);
             }));
             bs.push(best(reps, || {
-                flash_attention_bf16_with(&qb, &kb, &vb, &mut ob, m, n, d, dv, scale, acc, p);
+                flash_attention_bf16_with(&qb, &kb, &vb, &mut ob, m, n, d, dv, scale, accb, p);
             }));
         }
         let (tf, tm, th, tb) = (median(fs), median(ms), median(hs), median(bs));

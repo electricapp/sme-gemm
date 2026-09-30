@@ -17,7 +17,7 @@
 
 use half::{bf16, f16};
 use sme_gemm::{
-    Accuracy, Dequant, caps, gemm_f32, matmul_bf16, matmul_f16, matmul_f32, matmul_f64, matmul_i8,
+    Accum, Dequant, caps, gemm_f32, matmul_bf16, matmul_f16, matmul_f32, matmul_f64, matmul_i8,
     matmul_i8_packed, matmul_i8_packed_dequant, matmul_i16, prepack_i8,
 };
 
@@ -167,8 +167,8 @@ fn f64_guarded() {
 }
 
 #[test]
-fn f16_guarded_both_accuracies() {
-    for acc in [Accuracy::Accurate, Accuracy::Fast] {
+fn f16_guarded_both_accums() {
+    for acc in [Accum::F32, Accum::F16] {
         run_guarded(f16::from_f32(1.5), f16::ZERO, |a, b, c, m, n, k| {
             matmul_f16(a, b, c, m, n, k, acc);
         });
@@ -176,8 +176,8 @@ fn f16_guarded_both_accuracies() {
 }
 
 #[test]
-fn bf16_guarded_both_accuracies() {
-    for acc in [Accuracy::Accurate, Accuracy::Fast] {
+fn bf16_guarded_both_accums() {
+    for acc in [Accum::F32, Accum::Bf16] {
         run_guarded(bf16::from_f32(1.5), bf16::ZERO, |a, b, c, m, n, k| {
             matmul_bf16(a, b, c, m, n, k, acc);
         });

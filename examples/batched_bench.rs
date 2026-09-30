@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use half::f16;
-use sme_gemm::{Accuracy, matmul_f16, matmul_f16_batched};
+use sme_gemm::{Accum, matmul_f16, matmul_f16_batched};
 
 /// Best-of-N for both variants, INTERLEAVED: one timed round of each per pass,
 /// so neither is measured on the heat the other left behind.
@@ -65,7 +65,7 @@ fn main() {
                     m,
                     n,
                     k,
-                    Accuracy::Fast,
+                    Accum::F16,
                 );
             }
         };

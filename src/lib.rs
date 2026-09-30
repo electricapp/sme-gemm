@@ -6,8 +6,9 @@
 //! against `arm_sme.h` and tuned for Apple's *per-cluster shared* SME unit
 //! (single-threaded, streaming-mode, SVL=512), not the server-SME model.
 //!
-//! Supported element types (more landing): f16 (widening fp32-accumulate, and
-//! a non-widening fp16 fast path on M5), bf16, f32, i8->i32.
+//! Supported element types: f16 (f32 or f16 accumulate), bf16 (f32 or bf16
+//! accumulate), f32, f64, i8->i32, i16->i64. Native 16-bit accumulate needs
+//! M5 (`FEAT_SME_F16F16` / `FEAT_SME_B16B16`).
 //!
 //! On non-Apple targets every entry point transparently falls back to a
 //! portable scalar reference, so the crate builds and runs everywhere.
@@ -38,7 +39,7 @@ mod kernels;
 
 pub use probe::{Caps, caps, has_sme};
 
-pub use element::{Accuracy, Element, Packed};
+pub use element::{Accum, Element, Packed};
 pub use epilogue::{Dequant, Epilogue};
 pub use exec::{
     Gemm, MapElem, PackedEpilogue, PackedQuant, RowReduce, epilogue_map, softmax_gemm_f32,

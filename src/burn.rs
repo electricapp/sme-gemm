@@ -44,7 +44,7 @@ pub fn sme_matmul<B: Backend>(a: Tensor<B, 2>, b: Tensor<B, 2>) -> Tensor<B, 2> 
             let av = da.as_slice::<f16>().expect("f16 host data");
             let bv = db.as_slice::<f16>().expect("f16 host data");
             let mut c = vec![f16::ZERO; m * n];
-            crate::matmul_f16(av, bv, &mut c, m, n, k, crate::Accuracy::Fast);
+            crate::matmul_f16(av, bv, &mut c, m, n, k, crate::Accum::F16);
             Tensor::from_data(TensorData::new(c, [m, n]), &device)
         }
         _ => {

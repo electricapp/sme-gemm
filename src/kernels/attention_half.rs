@@ -10,7 +10,7 @@ use std::cell::Cell;
 
 use half::{bf16, f16};
 
-use crate::element::Accuracy;
+use crate::element::Accum;
 use crate::exec::{checked_dim2, checked_dims};
 use crate::kernels::attention::{FlashParams, give, take};
 
@@ -174,9 +174,9 @@ macro_rules! flash_half {
             d: usize,
             dv: usize,
             scale: f32,
-            mode: Accuracy,
+            accum: Accum,
         ) {
-            $with(q, k, v, o, m, n, d, dv, scale, mode, FlashParams::auto(m, n));
+            $with(q, k, v, o, m, n, d, dv, scale, accum, FlashParams::auto(m, n));
         }
 
         #[doc = concat!("[`", stringify!($name), "`] with explicit tile sizes.")]
@@ -195,7 +195,7 @@ macro_rules! flash_half {
             d: usize,
             dv: usize,
             scale: f32,
-            mode: Accuracy,
+            accum: Accum,
             p: FlashParams,
         ) {
             assert_eq!(q.len(), checked_dim2(m, d), "q is m*d");
@@ -242,7 +242,7 @@ macro_rules! flash_half {
                     // S = Qb @ Kj^T -- Kj^T is the (d x bj) transposed view of
                     // the row-major (bj x d) key block: row stride 1, col d.
                     $gemm(
-                        mi, bj, d, &mut s, bn, 1, qb, d, 1, &k[j0 * d..], 1, d, zero, one, mode,
+                        mi, bj, d, &mut s, bn, 1, qb, d, 1, &k[j0 * d..], 1, d, zero, one, accum,
                     );
                     $block(
                         &mut s,
@@ -256,7 +256,7 @@ macro_rules! flash_half {
                     );
                     $gemm(
                         mi, dv, bj, &mut prod, dv, 1, &s, bn, 1, &v[j0 * dv..], dv, 1, zero, one,
-                        mode,
+                        accum,
                     );
                     $accum(&mut acc, &prod, mi, dv, &corr);
                 }
@@ -273,9 +273,9 @@ flash_half! {
     /// `O = softmax(scale * Q @ K^T) @ V` in f16, a key block at a time.
     ///
     /// `q` is `m x d`, `k` is `n x d`, `v` is `n x dv`, `o` is `m x dv`, all
-    /// row-major. `mode` selects the GEMM accumulator: [`Accuracy::Accurate`]
-    /// widens to f32 (the right choice for attention logits),
-    /// [`Accuracy::Fast`] uses the M5 non-widening f16 MOPA.
+    /// row-major. `accum` is the GEMM accumulator: [`Accum::F32`] widens to f32
+    /// (the right choice for attention logits), [`Accum::F16`] uses the M5
+    /// non-widening f16 MOPA.
     ///
     /// Scores and probabilities are stored in f16, so expect f16-attention
     /// accuracy (~1e-3 relative), not the f32 path's ~1e-6.

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use half::{bf16, f16};
 use sme_gemm::{
-    Accuracy, Caps, Gemm, Q4Weights, caps, matmul_bf16, matmul_bf16_packed, matmul_f16,
+    Accum, Caps, Gemm, Q4Weights, caps, matmul_bf16, matmul_bf16_packed, matmul_f16,
     matmul_f16_packed, matmul_f32_packed, matmul_i8_packed, matmul_i16_packed, matmul_q4,
     matmul_q4_bf16, prepack_bf16, prepack_f16, prepack_f32, prepack_f64, prepack_i8, prepack_i16,
 };
@@ -25,8 +25,12 @@ fn q4_operands(n: usize, k: usize) -> (Vec<u8>, Vec<f16>) {
 }
 
 const SIZES: &[(usize, usize, usize)] = &[
+    (256, 256, 256),
     (512, 512, 512),
+    (1024, 1024, 1024),
     (2048, 2048, 2048),
+    (4096, 4096, 4096),
+    (4096, 512, 512),
     (16384, 512, 512),
     (1, 4096, 4096),
 ];
@@ -53,16 +57,16 @@ fn row(name: &str, mut f: impl FnMut(usize, usize, usize) -> Option<f64>) {
     print!("{name:<16}");
     for &(m, n, k) in SIZES {
         match f(m, n, k) {
-            Some(v) => print!(" {v:>9.2}"),
-            None => print!(" {:>9}", "--"),
+            Some(v) => print!(" {v:>13.2}"),
+            None => print!(" {:>13}", "--"),
         }
     }
     println!();
 }
 
 /// Bring the clocks up before the first timed row. Without it whichever row is
-/// measured first reads ~25% low (f16 and bf16 `Fast` run the same MOPA, and
-/// disagreed by that much purely by position).
+/// measured first reads ~25% low (f16 and bf16 native MOPA run the same pipe,
+/// and disagreed by that much purely by position).
 fn warmup() {
     let (n, k) = (1024, 1024);
     let a = vec![f16::from_f32(0.01); n * k];
@@ -79,21 +83,21 @@ fn main() {
     warmup();
     print!("{:<16}", "dtype");
     for &(m, n, k) in SIZES {
-        print!(" {:>9}", format!("{m}x{n}x{k}"));
+        print!(" {:>13}", format!("{m}x{n}x{k}"));
     }
     println!();
 
     float_rows(c);
     int_rows(c);
     println!("\nTF/s (integer rows are TOPS), same 2*M*N*K op count throughout.");
-    println!("Fast = M5 non-widening MOPA; Accurate = widening fp32 accumulate.");
+    println!("f16/bf16 = native 16-bit MOPA (M5); f16/f32 and bf16/f32 = widening.");
     println!("1x4096x4096 is the decode shape -- one row against a resident weight");
     println!("set, so it is bandwidth-bound and only pre-packed paths can run it.");
 }
 
 /// The floating-point dtype rows.
 fn float_rows(c: Caps) {
-    row("f16 Fast", |m, n, k| {
+    row("f16", |m, n, k| {
         if !c.sme_f16f16 {
             return None;
         }
@@ -102,7 +106,7 @@ fn float_rows(c: Caps) {
         let (p, mut cc) = (prepack_f16(&b, n, k), vec![f16::ZERO; m * n]);
         Some(best(m, n, k, || matmul_f16_packed(&a, &p, &mut cc, m)))
     });
-    row("bf16 Fast", |m, n, k| {
+    row("bf16", |m, n, k| {
         if !c.sme_b16b16 {
             return None;
         }
@@ -111,7 +115,7 @@ fn float_rows(c: Caps) {
         let (p, mut cc) = (prepack_bf16(&b, n, k), vec![bf16::ZERO; m * n]);
         Some(best(m, n, k, || matmul_bf16_packed(&a, &p, &mut cc, m)))
     });
-    row("f16 Accurate", |m, n, k| {
+    row("f16/f32", |m, n, k| {
         if !c.sme || m == 1 {
             return None;
         }
@@ -119,10 +123,10 @@ fn float_rows(c: Caps) {
         let b = vec![f16::from_f32(0.02); k * n];
         let mut cc = vec![f16::ZERO; m * n];
         Some(best(m, n, k, || {
-            matmul_f16(&a, &b, &mut cc, m, n, k, Accuracy::Accurate);
+            matmul_f16(&a, &b, &mut cc, m, n, k, Accum::F32);
         }))
     });
-    row("bf16 Accurate", |m, n, k| {
+    row("bf16/f32", |m, n, k| {
         if !c.sme || m == 1 {
             return None;
         }
@@ -130,7 +134,7 @@ fn float_rows(c: Caps) {
         let b = vec![bf16::from_f32(0.02); k * n];
         let mut cc = vec![bf16::ZERO; m * n];
         Some(best(m, n, k, || {
-            matmul_bf16(&a, &b, &mut cc, m, n, k, Accuracy::Accurate);
+            matmul_bf16(&a, &b, &mut cc, m, n, k, Accum::F32);
         }))
     });
     row("f32", |m, n, k| {

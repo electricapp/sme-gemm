@@ -4,7 +4,7 @@
 use candle_core::{CpuStorage, CustomOp2, Error, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
 
-use crate::{Accuracy, matmul_bf16, matmul_f16, matmul_f32};
+use crate::{Accum, matmul_bf16, matmul_f16, matmul_f32};
 
 /// A candle [`CustomOp2`] computing `A @ B` (2D, contiguous) on the SME kernels.
 #[derive(Debug, Clone, Copy)]
@@ -47,14 +47,14 @@ impl CustomOp2 for SmeMatmul {
                 let a = a.get(o1..o1 + m * k).ok_or_else(short)?;
                 let b = b.get(o2..o2 + k * n).ok_or_else(short)?;
                 let mut c = vec![f16::ZERO; m * n];
-                matmul_f16(a, b, &mut c, m, n, k, Accuracy::Fast);
+                matmul_f16(a, b, &mut c, m, n, k, Accum::F16);
                 Ok((CpuStorage::F16(c), shape))
             }
             (CpuStorage::BF16(a), CpuStorage::BF16(b)) => {
                 let a = a.get(o1..o1 + m * k).ok_or_else(short)?;
                 let b = b.get(o2..o2 + k * n).ok_or_else(short)?;
                 let mut c = vec![bf16::ZERO; m * n];
-                matmul_bf16(a, b, &mut c, m, n, k, Accuracy::Fast);
+                matmul_bf16(a, b, &mut c, m, n, k, Accum::Bf16);
                 Ok((CpuStorage::BF16(c), shape))
             }
             _ => Err(Error::Msg(

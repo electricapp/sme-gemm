@@ -5,7 +5,7 @@ use crate::{
     oracle_f64,
 };
 use half::f16;
-use sme_gemm::{Accuracy, epilogue_map, matmul_f16, matmul_f32};
+use sme_gemm::{Accum, epilogue_map, matmul_f16, matmul_f32};
 
 // f32 op-graph: mul_col(scale) -> add_col(bias) -> gelu(), validated against the
 // f64 oracle evaluating the same node sequence. gelu is the trailing activation.
@@ -290,7 +290,7 @@ fn epilogue_map_f16() {
         .collect();
 
     let mut c = vec![f16::ZERO; m * n];
-    matmul_f16(&a, &b, &mut c, m, n, k, Accuracy::Accurate);
+    matmul_f16(&a, &b, &mut c, m, n, k, Accum::F32);
     epilogue_map(&mut c, m, n, map);
 
     let mr = max_rel(&c, &want);

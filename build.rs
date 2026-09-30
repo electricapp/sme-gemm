@@ -11,6 +11,9 @@ fn main() {
     let target = |var: &str| std::env::var(var).unwrap_or_default();
     if target("CARGO_CFG_TARGET_OS") == "macos" && target("CARGO_CFG_TARGET_ARCH") == "aarch64" {
         compile_sme_kernels();
+        if std::env::var_os("CARGO_FEATURE_DISPATCH_CMP").is_some() {
+            compile_dispatch_cmp();
+        }
     }
 }
 
@@ -147,6 +150,24 @@ fn compile_sme_kernels() {
     feat_tu("gemm_i16i64.c", "sme_gemm_i16i64", &["+sme-i16i64"]);
 
     link_compiler_rt(c_asan);
+}
+
+/// Metal MPS + `MLCompute` ANE backends for `examples/dispatch`. Feature-gated so
+/// the default rlib does not link those frameworks.
+fn compile_dispatch_cmp() {
+    println!("cargo:rerun-if-changed=csrc/dispatch_cmp.m");
+    println!("cargo:rerun-if-changed=csrc/dispatch_cmp.h");
+    cc::Build::new()
+        .file("csrc/dispatch_cmp.m")
+        .include("csrc")
+        .flag("-fobjc-arc")
+        .flag("-Wno-deprecated-declarations")
+        .opt_level(3)
+        .compile("sme_gemm_dispatch_cmp");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
+    println!("cargo:rustc-link-lib=framework=MLCompute");
 }
 
 // Every TU is built `-mcpu=apple-m4`, which is what enables SME in the first
