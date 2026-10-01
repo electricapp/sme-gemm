@@ -129,7 +129,7 @@ fn q4_blocks_and_affine_match_eager_dequant() {
     if !caps().sme_f16f16 {
         return;
     }
-    for &(m, n, k) in &[(64usize, 96usize, 128usize), (65, 33, 256)] {
+    for &(m, n, k) in &[(64usize, 96usize, 128usize), (65, 33, 256), (800, 520, 512)] {
         for &block in &[16usize, 32, 64] {
             for affine in [false, true] {
                 let p = if affine {
@@ -197,7 +197,7 @@ fn q4_bf16_matches_eager_dequant() {
     if !caps().sme_b16b16 {
         return;
     }
-    for &(m, n, k) in &[(64usize, 96usize, 128usize), (65, 33, 256)] {
+    for &(m, n, k) in &[(64usize, 96usize, 128usize), (65, 33, 256), (800, 520, 512)] {
         for &block in &[16usize, 32, 64] {
             for affine in [false, true] {
                 let p = if affine {
@@ -341,7 +341,7 @@ fn q4_fused_epilogue_matches_oracle() {
     if !caps().sme_f16f16 {
         return;
     }
-    for &(m, n, k) in &[(64usize, 96usize, 128usize), (65, 33, 256)] {
+    for &(m, n, k) in &[(64usize, 96usize, 128usize), (65, 33, 256), (800, 520, 512)] {
         for affine in [false, true] {
             let p = if affine {
                 Q4Params::new(32).affine()

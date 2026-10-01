@@ -162,6 +162,101 @@ static size_t f32_nc_blk(size_t k, size_t n_tiles) {
     return (n_tiles + blocks - 1) / blocks;
 }
 
+// m <= 4: SME2 multi-vector FMLA into ZA vector groups instead of MOPA; see
+// run_gemv in gemm_f16f16.c. 16-column bands, two per 32-wide tile; `abc` is
+// [rows][k][16] broadcast A.
+#define GEMV_MAXR 2 // f32 MOPA issues ~2x the FMLA rate, so the crossover is lower
+__arm_locally_streaming __arm_new("za") static void run_gemv(float *dst, long dst_rs,
+                                                             const float *abc, size_t rows,
+                                                             const float *b_pack, size_t n,
+                                                             size_t k, size_t nt_lo, size_t nt_hi,
+                                                             float alpha, float beta, int read_dst,
+                                                             const ep_desc_f32 *ep) {
+    svbool_t p32 = svptrue_b32();
+    svcount_t pn = svptrue_c32();
+    const svfloat32_t va = svdup_n_f32(alpha);
+    const svfloat32_t vb = svdup_n_f32(beta);
+    int has_ep = ep && ep->n_nodes > 0;
+    int pure = (beta == 1.0f && !read_dst && !has_ep);
+    const EpNode *nodes = has_ep ? ep->nodes : NULL;
+    uint32_t n_nodes = has_ep ? ep->n_nodes : 0;
+    size_t per_band = ep_cmul(k, 16); // also the stride between abc rows
+    size_t kfull = k & ~(size_t)3;
+    svcount_t pt = svwhilelt_c32((uint64_t)0, (uint64_t)((k - kfull) * 16), 4);
+    // Two tiles (four bands) per pass, so rows x bands <= 16 vector groups.
+    for (size_t nt = nt_lo; nt < nt_hi; nt += 2) {
+        size_t T = nt_hi - nt < 2 ? 2 * (nt_hi - nt) : 4; // bands
+        const float *b = b_pack + 2 * nt * per_band;
+        svzero_za();
+        if (T == 4) {
+            for (size_t d = 0; d < kfull; d += 4) {
+                svfloat32x4_t B0 = svld1_f32_x4(pn, b + d * 16);
+                svfloat32x4_t B1 = svld1_f32_x4(pn, b + per_band + d * 16);
+                svfloat32x4_t B2 = svld1_f32_x4(pn, b + 2 * per_band + d * 16);
+                svfloat32x4_t B3 = svld1_f32_x4(pn, b + 3 * per_band + d * 16);
+                for (size_t r = 0; r < rows; r++) {
+                    svfloat32x4_t A = svld1_f32_x4(pn, abc + r * per_band + d * 16);
+                    uint32_t w = (uint32_t)(4 * r);
+                    svmla_za32_f32_vg1x4(w, B0, A);
+                    svmla_za32_f32_vg1x4(w + 1, B1, A);
+                    svmla_za32_f32_vg1x4(w + 2, B2, A);
+                    svmla_za32_f32_vg1x4(w + 3, B3, A);
+                }
+            }
+        } else {
+            for (size_t t = 0; t < T; t++)
+                for (size_t d = 0; d < kfull; d += 4) {
+                    svfloat32x4_t B = svld1_f32_x4(pn, b + t * per_band + d * 16);
+                    for (size_t r = 0; r < rows; r++)
+                        svmla_za32_f32_vg1x4((uint32_t)(4 * r + t), B,
+                                             svld1_f32_x4(pn, abc + r * per_band + d * 16));
+                }
+        }
+        if (kfull < k)
+            for (size_t t = 0; t < T; t++) {
+                svfloat32x4_t B = svld1_f32_x4(pt, b + t * per_band + kfull * 16);
+                for (size_t r = 0; r < rows; r++)
+                    svmla_za32_f32_vg1x4((uint32_t)(4 * r + t), B,
+                                         svld1_f32_x4(pt, abc + r * per_band + kfull * 16));
+            }
+        for (size_t r = 0; r < rows; r++)
+            for (size_t t = 0; t < T; t += 2) {
+                size_t n0 = (nt + t / 2) * 32;
+                size_t nc = n - n0 < 32 ? n - n0 : 32;
+                svbool_t plo = svwhilelt_b32((uint32_t)0, (uint32_t)(nc < 16 ? nc : 16));
+                svbool_t phi = svwhilelt_b32((uint32_t)0, (uint32_t)(nc > 16 ? nc - 16 : 0));
+                svfloat32x4_t ql = svread_za32_f32_vg1x4((uint32_t)(4 * r + t));
+                svfloat32x4_t qh = svread_za32_f32_vg1x4((uint32_t)(4 * r + t + 1));
+                svfloat32_t lo = svadd_x(p32, svadd_x(p32, svget4(ql, 0), svget4(ql, 1)),
+                                         svadd_x(p32, svget4(ql, 2), svget4(ql, 3)));
+                svfloat32_t hi = svadd_x(p32, svadd_x(p32, svget4(qh, 0), svget4(qh, 1)),
+                                         svadd_x(p32, svget4(qh, 2), svget4(qh, 3)));
+                float *rp = dst + (long)r * dst_rs + n0;
+                float *rph = nc > 16 ? rp + 16 : rp;
+                if (pure) {
+                    svst1_f32(plo, rp, lo);
+                    svst1_f32(phi, rph, hi);
+                } else if (has_ep) {
+#define EP_GEMV_RDL(s) lo
+#define EP_GEMV_RDH(s) hi
+                    EP_STORE_TILE_ROWMAJOR_F32(p32, plo, phi, rp, dst_rs, EP_GEMV_RDL, EP_GEMV_RDH, 0, 1,
+                                               vb, va, read_dst, nodes, n_nodes, r, n0);
+#undef EP_GEMV_RDL
+#undef EP_GEMV_RDH
+                } else {
+                    lo = svmul_x(p32, lo, vb);
+                    hi = svmul_x(p32, hi, vb);
+                    if (read_dst) {
+                        lo = svmla_x(p32, lo, svld1_f32(plo, rp), va);
+                        hi = svmla_x(p32, hi, svld1_f32(phi, rph), va);
+                    }
+                    svst1_f32(plo, rp, lo);
+                    svst1_f32(phi, rph, hi);
+                }
+            }
+    }
+}
+
 // [nt_lo, nt_hi) is the N-tile sub-range this invocation owns -- pass
 // (0, n_tiles) for the whole problem, or a slice for the N-parallel flat-M path
 // (see the driver). f32 N-tiles are independent (no dual-tile lockstep), so any
@@ -724,6 +819,28 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
     size_t M_CHUNK = 2;
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
     int big = ep_flops(m, n, k) >= (1u << 21);
+    if (m <= GEMV_MAXR && dst_cs == 1 && !ep_has_reduce(ep)) {
+        float *abc = apack_scratch(ep_cmul(ep_cmul(m, per_tile), sizeof(float)));
+        if (!abc) return -1;
+        for (size_t r = 0; r < m; r++)
+            for (size_t d = 0; d < k; d++) {
+                float32x4_t v = vdupq_n_f32(lhs[(long)r * lhs_rs + (long)d * lhs_cs]);
+                float32x4x4_t q = {{v, v, v, v}};
+                vst1q_f32_x4(abc + r * per_tile + d * 16, q);
+            }
+        size_t G_CHUNK = 4; // tiles per chunk
+        size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
+        if (!big || g_chunks < 3) {
+            run_gemv(dst, dst_rs, abc, m, b_pack, n, k, 0, n_tiles, alpha, beta, read_dst, ep);
+            return 0;
+        }
+        dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t nt0 = ci * G_CHUNK;
+          size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
+          run_gemv(dst, dst_rs, abc, m, b_pack, n, k, nt0, nt1, alpha, beta, read_dst, ep);
+        });
+        return 0;
+    }
 
     // Flat-M (few M-tiles) but large/wide: M is the only M-chunk axis, so the
     // M-parallel scheme below would run this on ONE cluster. Parallelize over N
@@ -768,17 +885,22 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
     // blocking cannot help because it only ever sees one chunk. A reduction
     // epilogue spans all of N, so it keeps a single block.
     size_t nc_blk = ep_has_reduce(ep) ? n_tiles : f32_nc_blk(k, n_tiles);
-    for (size_t jc = 0; jc < n_tiles; jc += nc_blk) {
-        size_t jc_end = jc + nc_blk < n_tiles ? jc + nc_blk : n_tiles;
-        int pack_a = (jc == 0); // A-pack is shared and reused by later N-blocks
+    size_t n_blocks = (n_tiles + nc_blk - 1) / nc_blk;
+    if (n_blocks > 1)
         dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
           size_t mt0 = ci * M_CHUNK;
-          size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
-          if (pack_a) PACKA_RANGE(a_pack, mt0, mt1);
-          run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, jc, jc_end, k, alpha,
-                        beta, read_dst, ep);
+          PACKA_RANGE(a_pack, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
         });
-    }
+    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.c.
+    dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
+      size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
+      size_t mt0 = ci * M_CHUNK;
+      size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
+      size_t jc_end = jc + nc_blk < n_tiles ? jc + nc_blk : n_tiles;
+      if (n_blocks == 1) PACKA_RANGE(a_pack, mt0, mt1);
+      run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, jc, jc_end, k, alpha, beta,
+                    read_dst, ep);
+    });
 #undef PACKA_RANGE
     free(a_pack);
     return 0;

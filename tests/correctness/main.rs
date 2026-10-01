@@ -235,6 +235,7 @@ mod batched;
 mod epilogue_half;
 mod epilogue_wide;
 mod exhaustive;
+mod gemv;
 mod nan;
 mod narrow;
 mod q4;

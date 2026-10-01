@@ -2,12 +2,11 @@
 //! then `matmul_f16_packed`), which is the same math with the weights expanded
 //! up front. Weight packing is outside the timed region for both.
 //!
-//! For a single weight set, eager leads throughout: residency buys a 4x smaller
-//! footprint at a modest throughput cost, and at small M the on-the-fly dequant
-//! (O(n*k) whatever M is) has almost no MOPA work to hide behind. Residency
-//! turns into a speed win only once the TOTAL weight working set stops fitting
-//! -- with several distinct weight sets live, the f16 expansion saturates
-//! bandwidth and the ordering inverts.
+//! At decode (m <= 4) resident wins outright: the GEMV kernel decodes nibbles
+//! with LUTI4 in the streaming region and reads a quarter of eager's bytes. Past
+//! that, eager leads on a single weight set -- the on-the-fly dequant is O(n*k)
+//! whatever M is -- until the total weight working set stops fitting and the f16
+//! expansion saturates bandwidth.
 //!   cargo run --release --example `q4_bench`
 
 use std::time::Instant;

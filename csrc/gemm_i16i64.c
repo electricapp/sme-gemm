@@ -76,6 +76,103 @@ static void pack_band(int16_t *dst, const int16_t *src, long lane_stride, long d
     svmopa_za64_s16_m(0, pb, pb, al, bl);                                                          \
     svmopa_za64_s16_m(1, pb, pb, al, bh)
 
+// m == 1: SME2 multi-vector SDOT into ZA64 vector groups instead of SMOPA;
+// see run_gemv in gemm_f16f16.c. 8-column bands of 4-deep groups, two per
+// 16-wide tile; `abc` is [kp4][32]: A[4p..4p+3] repeated across the vector.
+// Past one row the SMOPA is cheaper.
+__arm_locally_streaming __arm_new("za") static void run_gemv(void *dst_v, const int16_t *abc,
+                                                             const int16_t *b_pack, size_t n,
+                                                             size_t kp4, size_t nt_lo,
+                                                             size_t nt_hi, const ep_dq_f32 *dq) {
+    svbool_t p64 = svptrue_b64();
+    svbool_t p32 = svptrue_b32();
+    svcount_t pn = svptrue_c16();
+    size_t per_band = ep_cmul(kp4, 32);
+    size_t pfull = kp4 & ~(size_t)3;
+    svcount_t pt = svwhilelt_c16((uint64_t)0, (uint64_t)((kp4 - pfull) * 32), 4);
+    for (size_t nt = nt_lo; nt < nt_hi; nt += 2) {
+        size_t T = nt_hi - nt < 2 ? 2 : 4; // bands
+        const int16_t *b = b_pack + 2 * nt * per_band;
+        svzero_za();
+        if (T == 4) {
+            for (size_t p = 0; p < pfull; p += 4) {
+                svint16x4_t A = svld1_s16_x4(pn, abc + p * 32);
+                svdot_za64_s16_vg1x4(0, svld1_s16_x4(pn, b + p * 32), A);
+                svdot_za64_s16_vg1x4(1, svld1_s16_x4(pn, b + per_band + p * 32), A);
+                svdot_za64_s16_vg1x4(2, svld1_s16_x4(pn, b + 2 * per_band + p * 32), A);
+                svdot_za64_s16_vg1x4(3, svld1_s16_x4(pn, b + 3 * per_band + p * 32), A);
+            }
+        } else {
+            for (size_t t = 0; t < T; t++)
+                for (size_t p = 0; p < pfull; p += 4)
+                    svdot_za64_s16_vg1x4((uint32_t)t, svld1_s16_x4(pn, b + t * per_band + p * 32),
+                                         svld1_s16_x4(pn, abc + p * 32));
+        }
+        if (pfull < kp4) {
+            svint16x4_t A = svld1_s16_x4(pt, abc + pfull * 32);
+            for (size_t t = 0; t < T; t++)
+                svdot_za64_s16_vg1x4((uint32_t)t, svld1_s16_x4(pt, b + t * per_band + pfull * 32), A);
+        }
+        for (size_t t = 0; t < T; t += 2) {
+            size_t n0 = (nt + t / 2) * 16;
+            size_t nc = n - n0 < 16 ? n - n0 : 16;
+            svint64x4_t ql = svread_za64_s64_vg1x4((uint32_t)t);
+            svint64x4_t qh = svread_za64_s64_vg1x4((uint32_t)(t + 1));
+            svint64_t lo = svadd_x(p64, svadd_x(p64, svget4(ql, 0), svget4(ql, 1)),
+                                   svadd_x(p64, svget4(ql, 2), svget4(ql, 3)));
+            svint64_t hi = svadd_x(p64, svadd_x(p64, svget4(qh, 0), svget4(qh, 1)),
+                                   svadd_x(p64, svget4(qh, 2), svget4(qh, 3)));
+            if (dq) {
+                float *fdst = (float *)dst_v;
+                svbool_t pst = svwhilelt_b32((uint32_t)0, (uint32_t)nc);
+                svfloat32_t sc =
+                    dq->scale_n ? svld1_f32(pst, dq->scale_n + n0) : svdup_n_f32(dq->scale);
+                svfloat32_t v = svmul_f32_x(
+                    p32, svuzp1_f32(svcvt_f32_s64_x(p64, lo), svcvt_f32_s64_x(p64, hi)), sc);
+                v = ep_apply_nodes_f32(p32, pst, v, dq->nodes, dq->n_nodes, 1, 0, n0, 0);
+                svst1_f32(pst, fdst + n0, v);
+            } else {
+                int64_t *rp = (int64_t *)dst_v + n0;
+                svst1_s64(svwhilelt_b64((uint64_t)0, (uint64_t)(nc < 8 ? nc : 8)), rp, lo);
+                if (nc > 8) svst1_s64(svwhilelt_b64((uint64_t)0, (uint64_t)(nc - 8)), rp + 8, hi);
+            }
+        }
+    }
+}
+
+// abc[p*32 + 4j + s] = A[0, 4p+s], zero past k.
+static void bcast_row(int16_t *abc, const int16_t *a, long lhs_cs, size_t k) {
+    size_t kp4 = (k + 3) / 4;
+    for (size_t p = 0; p < kp4; p++) {
+        int16_t g[4];
+        for (size_t s = 0; s < 4; s++) {
+            size_t d = 4 * p + s;
+            g[s] = d < k ? a[(long)d * lhs_cs] : 0;
+        }
+        uint64_t w;
+        __builtin_memcpy(&w, g, 8);
+        uint16x8_t v = vreinterpretq_u16_u64(vdupq_n_u64(w));
+        uint16x8x4_t q = {{v, v, v, v}};
+        vst1q_u16_x4((uint16_t *)(abc + p * 32), q);
+    }
+}
+
+// L2 blocking budget in 16-wide super-tiles.
+static size_t i16_budget(size_t kp4) {
+    size_t tile_bytes = 2 * ep_cmul(kp4, 32) * sizeof(int16_t);
+    size_t b = (size_t)(16u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
+    return b < 2 ? 2 : b;
+}
+
+// N-block width shared by the driver and run_streaming.
+static size_t i16_nc_blk(size_t kp4, size_t n_tiles) {
+    size_t nc = i16_budget(kp4) / 2;
+    if (nc < 1) nc = 1;
+    if (nc >= n_tiles) return n_tiles;
+    size_t blocks = (n_tiles + nc - 1) / nc;
+    return (n_tiles + blocks - 1) / blocks;
+}
+
 // [nt_lo, nt_hi) is the N-tile sub-range this invocation owns -- pass
 // (0, n_tiles) for the whole problem, or a slice for the N-parallel flat-M path
 // (see the driver). i16 N-tiles are independent (svzero_za per nt, no cross-tile
@@ -96,17 +193,9 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     int col_major = (dst_rs == 1);
     int row_major = (dst_cs == 1);
 
-    // nc_blk/mc_blk count 32-wide SUPER-tiles (= 2 packed 16-lane bands each), so
-    // tile_bytes is the full super-tile and the budget constant equals the total
-    // resident bytes (A-block + B-block). A band-sized tile_bytes would
-    // instead halve the block count and double the working set.
-    size_t tile_bytes = 2 * per_tile * sizeof(int16_t);
-    size_t budget = (size_t)(16u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
-    if (budget < 2) budget = 2;
+    size_t budget = i16_budget(kp4);
     size_t nt_span = nt_hi - nt_lo;
-    size_t nc_blk = budget / 2;
-    if (nc_blk < 1) nc_blk = 1;
-    if (nc_blk > nt_span) nc_blk = nt_span;
+    size_t nc_blk = i16_nc_blk(kp4, nt_span);
     size_t mc_blk = budget / 2;
     if (mc_blk < 1) mc_blk = 1;
     if (mc_blk > mt_hi - mt_lo) mc_blk = mt_hi - mt_lo;
@@ -678,6 +767,23 @@ int gemm_sme_i16i64_run_packed_impl(size_t m, size_t n, size_t k, void *dst, lon
     size_t M_CHUNK = 2;
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
     int big = ep_flops(m, n, k) >= (1u << 21);
+    if (m == 1 && dst_cs == 1) {
+        int16_t *abc = apack_scratch(ep_cmul(per_tile, sizeof(int16_t)));
+        if (!abc) return -1;
+        bcast_row(abc, lhs, lhs_cs, k);
+        size_t G_CHUNK = 4; // tiles per chunk
+        size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
+        if (!big || g_chunks < 3) {
+            run_gemv(dst, abc, b_pack, n, kp4, 0, n_tiles, dq);
+            return 0;
+        }
+        dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t nt0 = ci * G_CHUNK;
+          size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
+          run_gemv(dst, abc, b_pack, n, kp4, nt0, nt1, dq);
+        });
+        return 0;
+    }
 
     // Flat-M (few M-tiles) but large/wide: M is the only M-chunk axis, so the
     // M-parallel scheme below would run this on ONE cluster -- exactly the
@@ -710,11 +816,22 @@ int gemm_sme_i16i64_run_packed_impl(size_t m, size_t n, size_t k, void *dst, lon
     }
     int16_t *a_pack = (int16_t *)xmalloc(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(int16_t)));
     if (!a_pack) return -1;
-    dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+    size_t nc_blk = i16_nc_blk(kp4, n_tiles);
+    size_t n_blocks = (n_tiles + nc_blk - 1) / nc_blk;
+    if (n_blocks > 1)
+        dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t mt0 = ci * M_CHUNK;
+          PACKA_RANGE(a_pack, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
+        });
+    // One flat dispatch over (N-block, M-chunk), block-major: no barrier per
+    // block, so an E-cluster worker (~9x slower at SME) only delays the last item.
+    dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
+      size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
       size_t mt0 = ci * M_CHUNK;
       size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
-      PACKA_RANGE(a_pack, mt0, mt1);
-      run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, 0, n_tiles, kp4, dq);
+      size_t jc_end = jc + nc_blk < n_tiles ? jc + nc_blk : n_tiles;
+      if (n_blocks == 1) PACKA_RANGE(a_pack, mt0, mt1);
+      run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, jc, jc_end, kp4, dq);
     });
 #undef PACKA_RANGE
     free(a_pack);

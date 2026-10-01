@@ -18,9 +18,9 @@ SME on Apple Silicon is not the server-SME model, and most design decisions
 follow from the differences.
 
 - **Per-cluster shared unit, not per-core.** Each CPU cluster (P and E) has one
-  SME matrix unit shared by all its cores, not one pipe per thread. Multiple
-  threads on a single cluster do not scale; the only real parallelism is across
-  clusters (§2.1).
+  SME matrix unit shared by all its cores. On M5 nearly all the throughput is
+  the P unit: one P thread reaches ~4.1 of ~5.0 f16 TF/s and 4-5 threads
+  saturate it, while a busy E thread runs ~9x slower than a P thread (§2.1).
 - **Streaming mode.** SME runs inside a region bracketed by `SMSTART`/`SMSTOP`
   (`__arm_streaming` / `__arm_locally_streaming`). Inside it the SVE registers
   become streaming SVE at the streaming vector length and the ZA accumulator is
@@ -48,9 +48,12 @@ follow from the differences.
 
 ### 2.1 Multi-cluster dispatch
 
-Since the SME unit is per-cluster, the kernels parallelize across clusters with
-`dispatch_apply`: M is chunked into tiles and the chunks go to
-`dispatch_get_global_queue`, which schedules them on both cluster units.
+The kernels parallelize with `dispatch_apply`: M is chunked into tiles and the
+chunks go to `dispatch_get_global_queue`, which runs them on every core. The
+P-cluster unit does almost all of the work; an E thread holding a chunk is a
+straggler (measured per CPU with `pthread_cpu_number_np`: ~0.15 TF/s against
+~1.3 for a P thread when all ten are busy), so no SME loop may carry a dispatch
+barrier per iteration (§2.4).
 
 Chunks are finer than pure L2 residency would pick (`M_CHUNK = 2` tiles) so
 `dispatch_apply` can work-steal instead of stalling on the slower E-cluster: ~5%
@@ -146,13 +149,17 @@ from Q4 measured 2.3–3.9× on decode-shaped calls.
 The large path adds BLIS-style `jc→ic→mt→nt` blocking so each packed panel
 streams from DRAM once rather than once per opposing tile.
 
-In f32 and f64 the `jc` loop sits **outside** the `dispatch_apply` over
-M-chunks, so one B-block serves every M-chunk while it is still L2-resident, and
-A is packed on the first block only. Nested the other way each chunk sweeps all
-of B and B leaves L2 before the next chunk reaches it, so packed B is
-re-streamed from DRAM once per chunk — gigabytes of it on a large square — and
-the inner blocking cannot help, since it only ever sees one chunk. A reduction
-epilogue spans all of N and so keeps a single block.
+In every driver the `jc` loop sits **outside** the M-chunks, so one B-block
+serves every M-chunk while it is still L2-resident. Nested the other way each
+chunk sweeps all of B and B leaves L2 before the next chunk reaches it, so
+packed B is re-streamed from DRAM once per chunk — 1.2–1.5× lost on i16 and the
+native 16-bit kernels at 1024×16384×8192. A reduction epilogue spans all of N
+and so keeps a single block.
+
+The (N-block, M-chunk) pairs run as one flat `dispatch_apply` in block-major
+order (GCD hands out indices in order), with A packed in a pass of its own when
+there is more than one block. A `dispatch_apply` per block instead waits on its
+E-thread chunks every block: 0.45× on f16→f32 1024×16384×8192.
 
 Block sizes come from a per-dtype byte budget: `nc_blk`/`mc_blk` count whole
 32-wide super-tiles, and `tile_bytes` is the full super-tile — two packed
@@ -275,6 +282,30 @@ entirely, an upper bound on any fusion, measures 1.00–1.06×, mostly 1.00×: i
 loads are already hidden behind the memory-bound exp pass. For the same reason,
 giving that sweep four accumulators rather than one changes nothing — it is
 bound by load throughput, not by the serial `vmaxnm` chain.
+
+### 2.8 Decode: ZA-vector GEMV
+
+With one live row a MOPA spends 1/32 of its work (1/16 for the 16x16 tiles), so
+decode shapes run out of MOPA issue before DRAM bandwidth. For m ≤ 4 (m ≤ 2 for
+f32, m = 1 for f64 and i16, whose MOPA issues twice as fast) the packed drivers
+use SME2 multi-vector ops into ZA vector groups instead: one FMLA (SDOT for the
+ints) takes four consecutive depths of a B band — a single x4 load — against
+four broadcast copies of A, built once per call. Vector group `4r+t` holds row
+r, band t; the store sums its four vectors. That is a quarter of the ZA-unit
+instructions per byte of B, and the large decode shapes now run at the DRAM roof
+(~135 GB/s): 1.3–1.9× on f16/bf16/i8, 2.5–4× where B is cache-resident.
+
+Q4 decode decodes nibbles in the streaming region with LUTI4 from a ZT0 table
+(one 64-byte load gives four depths of a 32-column tile, in natural order). The
+scale factors out of each K-block, so the block sums raw codes in groups 0-3
+(and 8-11), folds `acc*scale` (+`min*sum(A)`) into totals in groups 4-7 (and
+12-15) at the block edge, and one `ZERO {za0-3.d}` clears the block sums — a
+vg1x4 group w lies in ZA64 tile w%8. bf16 folds with a bf16 copy of the scales,
+built once per weight set. 7–10× over the dequantize-then-MOPA path.
+
+Q4 prefill with a small B (≤ 8 MB as f16) and ≥ ~600³ of work dequantizes all of
+B once in parallel and runs the dense packed driver, whose M-chunks balance the
+clusters; the tile path parallelizes over N-pairs only.
 
 ---
 
@@ -494,7 +525,7 @@ regresses the relu store, so bias+activation keeps the in-store add.
 
 | suite                  | count | covers                                                        |
 | ---------------------- | ----- | ------------------------------------------------------------- |
-| `tests/correctness/`   | 100   | dtypes, shapes, layouts, packed/batched, epilogue graphs      |
+| `tests/correctness/`   | 114   | dtypes, shapes, layouts, packed/batched, epilogue graphs      |
 | `tests/validation.rs`  | 19    | pre-FFI footprint asserts and panic contracts                 |
 | `tests/proptest.rs`    | 17    | randomized shapes/strides/operands against the oracle         |
 | `tests/guard_page.rs`  | 13    | reads past the declared footprint fault on a `PROT_NONE` page |
@@ -502,7 +533,7 @@ regresses the relu store, so bias+activation keeps the in-store add.
 | doctests               | 5     | the documented API examples                                   |
 | `tests/concurrency.rs` | 4     | one GEMM from many threads, bit-identical, across branches    |
 
-169 total. `tests/correctness/main.rs` holds the shared oracles and shape
+183 total. `tests/correctness/main.rs` holds the shared oracles and shape
 tables: `SIZES`, and `TAIL_SIZES` for shapes that clear the flop floor and have
 ragged M/N/K tails, where tail-predicate handling is exercised.
 `PROPTEST_CASES=N` widens the random sweep for a soak run.

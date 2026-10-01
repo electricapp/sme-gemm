@@ -185,6 +185,122 @@ static int run_q4_bf16(bf16 *dst, const bf16 *a_pack, const uint8_t *nibbles, co
     return 0;
 }
 
+// m == 1 Q4 GEMV; see run_q4_gemv in gemm_f16f16_q4.h. Scales are the bf16 copies.
+#define Q4_ACC(q) ((uint32_t)((q) < 4 ? (q) : (q) + 4))
+__arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
+    bf16 *dst, const bf16 *abc, const bf16 *asum, size_t rows, const uint8_t *nibbles,
+    const bf16 *scales, const bf16 *mins, size_t n, size_t k, size_t nt_lo, size_t nt_hi,
+    size_t nib_per_tile, size_t sc_per_tile, unsigned bshift, const uint32_t *lut,
+    const ep_desc16 *ep) {
+    svbool_t p16 = svptrue_b16();
+    svbool_t p8 = svptrue_b8();
+    svcount_t pn = svptrue_c16();
+    const svbfloat16_t z16 = svdup_n_bf16((bf16)0.0f);
+    const svbfloat16x4_t zero4 = svcreate4(z16, z16, z16, z16);
+    const EpNode *nodes = ep ? ep->nodes : NULL;
+    uint32_t n_nodes = ep ? ep->n_nodes : 0;
+    svbfloat16_t vb = svdup_n_bf16((bf16)1.0f);
+    svbfloat16_t va = svdup_n_bf16((bf16)0.0f);
+    svldr_zt(0, lut);
+    size_t block = (size_t)1 << bshift;
+    size_t nbk = (k + block - 1) >> bshift;
+    // Rows x tiles <= 8: block sums in groups 0-3 and 8-11 (ZA64 tiles 0-3),
+    // totals 4 above each (tiles 4-7).
+    size_t TT = rows <= 2 ? 4 : 2;
+    size_t per_row = ep_cmul(k, 32);
+    for (size_t nt = nt_lo; nt < nt_hi; nt += TT) {
+        size_t T = nt_hi - nt < TT ? nt_hi - nt : TT;
+        const uint8_t *nb = nibbles + nt * nib_per_tile;
+        const bf16 *sc = scales + nt * sc_per_tile;
+        const bf16 *mn = mins ? mins + nt * sc_per_tile : NULL;
+        svzero_za();
+        for (size_t bk = 0; bk < nbk; bk++) {
+            size_t d = bk << bshift;
+            size_t d1 = d + block < k ? d + block : k;
+            if (rows == 1 && T == 4) {
+                for (; d + 4 <= d1; d += 4) {
+                    svbfloat16x4_t A = svld1_bf16_x4(pn, abc + d * 32);
+                    svmla_za16_bf16_vg1x4(
+                        0, svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + d * 16), 0), A);
+                    svmla_za16_bf16_vg1x4(
+                        1, svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + nib_per_tile + d * 16), 0),
+                        A);
+                    svmla_za16_bf16_vg1x4(
+                        2,
+                        svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + 2 * nib_per_tile + d * 16), 0),
+                        A);
+                    svmla_za16_bf16_vg1x4(
+                        3,
+                        svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + 3 * nib_per_tile + d * 16), 0),
+                        A);
+                }
+            } else {
+                for (; d + 4 <= d1; d += 4)
+                    for (size_t t = 0; t < T; t++) {
+                        svbfloat16x4_t C =
+                            svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + t * nib_per_tile + d * 16), 0);
+                        for (size_t r = 0; r < rows; r++)
+                            svmla_za16_bf16_vg1x4(Q4_ACC(r * T + t), C,
+                                                  svld1_bf16_x4(pn, abc + r * per_row + d * 32));
+                    }
+            }
+            if (d < d1) {
+                // K tail: nibble 0 decodes to 0 and A is zero past k.
+                svcount_t pt = svwhilelt_c16((uint64_t)0, (uint64_t)((d1 - d) * 32), 4);
+                svbool_t pb = svwhilelt_b8((uint64_t)0, (uint64_t)((d1 - d) * 16));
+                for (size_t t = 0; t < T; t++) {
+                    svbfloat16x4_t C =
+                        svluti4_lane_zt_bf16_x4(0, svld1_u8(pb, nb + t * nib_per_tile + d * 16), 0);
+                    for (size_t r = 0; r < rows; r++)
+                        svmla_za16_bf16_vg1x4(Q4_ACC(r * T + t), C,
+                                              svld1_bf16_x4(pt, abc + r * per_row + d * 32));
+                }
+            }
+            for (size_t r = 0; r < rows; r++)
+                for (size_t t = 0; t < T; t++) {
+                    uint32_t g = Q4_ACC(r * T + t);
+                    svmla_single_za16_bf16_vg1x4(g + 4, svread_za16_bf16_vg1x4(g),
+                                                 svld1_bf16(p16, sc + t * sc_per_tile + bk * 32));
+                    if (mn)
+                        svmla_single_za16_bf16_vg1x4(
+                            g + 4,
+                            svset4_bf16(zero4, 0, svld1_bf16(p16, mn + t * sc_per_tile + bk * 32)),
+                            svdup_n_bf16(asum[r * nbk + bk]));
+                }
+            svzero_mask_za(0x0F);
+        }
+        for (size_t r = 0; r < rows; r++)
+            for (size_t t = 0; t < T; t++) {
+                size_t n0 = (nt + t) * 32;
+                size_t ncols = n - n0 < 32 ? n - n0 : 32;
+                svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)ncols);
+                svbfloat16x4_t q = svread_za16_bf16_vg1x4(Q4_ACC(r * T + t) + 4);
+                svbfloat16_t acc = svadd_bf16_x(p16, svadd_bf16_x(p16, svget4(q, 0), svget4(q, 1)),
+                                         svadd_bf16_x(p16, svget4(q, 2), svget4(q, 3)));
+                bf16 *out = dst + r * n + n0;
+                if (!n_nodes) {
+                    svst1_bf16(pst, out, acc);
+                } else {
+#define EP_Q4G_RD(s) acc
+                    EP_STORE_TILE_ROWMAJOR_BF16(p16, pst, out, (long)n, EP_Q4G_RD, 1, vb, va, 0, nodes,
+                                               n_nodes, r, n0);
+#undef EP_Q4G_RD
+                }
+            }
+    }
+}
+
+// Code c -> bf16(sign-extended c); 16-bit LUTI4 reads the low half of 32-bit entries.
+static uint32_t g_q4_lut_bf16[16] __attribute__((aligned(64)));
+static void q4_lut_bf16_init(void) {
+    for (int c = 0; c < 16; c++) {
+        bf16 v = (bf16)(float)(c < 8 ? c : c - 16);
+        uint16_t bits;
+        __builtin_memcpy(&bits, &v, 2);
+        g_q4_lut_bf16[c] = bits;
+    }
+}
+
 // Q4 GEMM with on-the-fly dequant, bf16 accumulation (M5+ FEAT_SME_B16B16). B
 // stays 4-bit resident (nibbles tile-major [n_tiles][k][16 bytes], column-order
 // 2/byte) plus f16 scales ([n_tiles][ceil(k/block)][32]). `block` is the K-block
@@ -192,7 +308,8 @@ static int run_q4_bf16(bf16 *dst, const bf16 *a_pack, const uint8_t *nibbles, co
 // else the matching offsets: w = scale*code + min.
 int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
                        const uint8_t *nibbles, const uint16_t *scales, const uint16_t *mins,
-                       size_t block, const ep_desc16 *ep) {
+                       const uint16_t *scales_bf16, const uint16_t *mins_bf16, size_t block,
+                       const ep_desc16 *ep) {
     if (m == 0 || n == 0) return 0;
     if (block == 0 || (block & (block - 1)) != 0) return -1; // power of two only
     unsigned bshift = 0;
@@ -204,7 +321,61 @@ int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16
     size_t nbk = (k + block - 1) / block;
     size_t sc_per_tile = ep_cmul(nbk, 32);
 
+    if (m <= 4 && block >= 4 && scales_bf16 && (!mins || mins_bf16)) {
+        static dispatch_once_t lut_once;
+        dispatch_once_f(&lut_once, NULL, (dispatch_function_t)q4_lut_bf16_init);
+        size_t nbk_s = mins ? m * nbk : 0;
+        // [m][k][32] broadcast A, then the per-row, per-block sums of A.
+        size_t per_row = ep_cmul(k, 32);
+        bf16 *abc = apack_scratch(ep_cmul(ep_cmul(m, per_row) + nbk_s + 1, sizeof(bf16)));
+        if (!abc) return -1;
+        const bf16 *a = (const bf16 *)lhs;
+        for (size_t r = 0; r < m; r++) bcast_row(abc + r * per_row, a + r * k, 1, k);
+        bf16 *asum = abc + m * per_row;
+        for (size_t i = 0; i < nbk_s; i++) {
+            size_t r = i / nbk, b = i % nbk;
+            float acc = 0.0f;
+            size_t d1 = (b + 1) * block < k ? (b + 1) * block : k;
+            for (size_t d = b * block; d < d1; d++) acc += (float)a[r * k + d];
+            asum[i] = (bf16)acc;
+        }
+        const bf16 *sc = (const bf16 *)scales_bf16;
+        const bf16 *mn = mins ? (const bf16 *)mins_bf16 : NULL;
+        size_t G_CHUNK = 4;
+        size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
+        if (ep_flops(m, n, k) < (1u << 21) || g_chunks < 3) {
+            run_q4_gemv_bf16((bf16 *)dst, abc, asum, m, nibbles, sc, mn, n, k, 0, n_tiles,
+                             nib_per_tile, sc_per_tile, bshift, g_q4_lut_bf16, ep);
+            return 0;
+        }
+        dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t nt0 = ci * G_CHUNK;
+          size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
+          run_q4_gemv_bf16((bf16 *)dst, abc, asum, m, nibbles, sc, mn, n, k, nt0, nt1, nib_per_tile,
+                           sc_per_tile, bshift, g_q4_lut_bf16, ep);
+        });
+        return 0;
+    }
     // Shares the dense path's per-thread A-pack buffer; see gemm_f16f16_q4.h.
+    // Small B, enough work to hide the dequant pass (crossover ~640^3): expand B
+    // once in parallel and run the dense driver, which balances over M-chunks.
+    size_t n_tiles_pad = (n_tiles + 1) & ~(size_t)1;
+    size_t dense_bytes = ep_cmul(ep_cmul(n_tiles_pad, per_tile), sizeof(bf16));
+    if (dense_bytes <= ((size_t)8 << 20) && ep_flops(m, n, k) >= ((uint64_t)3 << 26)) {
+        bf16 *bp = q4_pool_scratch_bf16(dense_bytes);
+        if (bp) {
+            const ep_f16 *sc = (const ep_f16 *)scales, *mn = (const ep_f16 *)mins;
+            dispatch_apply(n_tiles_pad, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t t) {
+              if (t < n_tiles)
+                  dequant_q4_tile_bf16(bp + t * per_tile, nibbles + t * nib_per_tile, sc + t * sc_per_tile,
+                        mn ? mn + t * sc_per_tile : NULL, k, bshift);
+              else
+                  memset(bp + t * per_tile, 0, per_tile * sizeof(bf16));
+            });
+            return gemm_sme_b16b16_run_packed(m, n, k, dst, 1, (long)n, 0, lhs, 1, (long)k,
+                          (const uint16_t *)bp, 0, 0x3F80, ep);
+        }
+    }
     bf16 *a_pack = apack_scratch(ep_cmul(ep_cmul(m_tiles, per_tile), sizeof(bf16)));
     if (!a_pack) return -1;
     packa(a_pack, (const bf16 *)lhs, m, k, k, 1, 0, m_tiles, per_tile);

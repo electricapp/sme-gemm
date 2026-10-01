@@ -247,6 +247,94 @@ __arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
     }
 }
 
+// m == 1: SME2 multi-vector FMLA into ZA vector groups (4 depths per op) instead
+// of MOPA, which wastes 31/32 of its work on one row. `abc` is A broadcast [k][32].
+#define GEMV_T 4
+#define GEMV_MAXR 4 // rows; past this the MOPA path does fewer ZA ops
+__arm_locally_streaming __arm_new("za") static void run_gemv(f16 *dst, long dst_rs, const f16 *abc,
+                                                             size_t rows, const f16 *b_pack, size_t n,
+                                                             size_t k, size_t nt_lo, size_t nt_hi,
+                                                             float alpha, float beta, int read_dst,
+                                                             const ep_desc16 *ep) {
+    svbool_t p16 = svptrue_b16();
+    svcount_t pn = svptrue_c16();
+    const svfloat16_t va = svdup_n_f16((f16)alpha);
+    const svfloat16_t vb = svdup_n_f16((f16)beta);
+    int has_ep = ep && ep->n_nodes > 0;
+    int pure = (beta == 1.0f && !read_dst && !has_ep);
+    const EpNode *nodes = has_ep ? ep->nodes : NULL;
+    uint32_t n_nodes = has_ep ? ep->n_nodes : 0;
+    size_t per_tile = ep_cmul(k, 32); // also the stride between abc rows
+    size_t kfull = k & ~(size_t)3;
+    // K tail: predicated loads zero the dead depths.
+    svcount_t pt = svwhilelt_c16((uint64_t)0, (uint64_t)((k - kfull) * 32), 4);
+    for (size_t nt = nt_lo; nt < nt_hi; nt += GEMV_T) {
+        size_t T = nt_hi - nt < GEMV_T ? nt_hi - nt : GEMV_T;
+        const f16 *b = b_pack + nt * per_tile;
+        svzero_za();
+        if (T == GEMV_T) {
+            for (size_t d = 0; d < kfull; d += 4) {
+                svfloat16x4_t B0 = svld1_f16_x4(pn, b + d * 32);
+                svfloat16x4_t B1 = svld1_f16_x4(pn, b + per_tile + d * 32);
+                svfloat16x4_t B2 = svld1_f16_x4(pn, b + 2 * per_tile + d * 32);
+                svfloat16x4_t B3 = svld1_f16_x4(pn, b + 3 * per_tile + d * 32);
+                for (size_t r = 0; r < rows; r++) {
+                    svfloat16x4_t A = svld1_f16_x4(pn, abc + r * per_tile + d * 32);
+                    uint32_t w = (uint32_t)(4 * r);
+                    svmla_za16_f16_vg1x4(w, B0, A);
+                    svmla_za16_f16_vg1x4(w + 1, B1, A);
+                    svmla_za16_f16_vg1x4(w + 2, B2, A);
+                    svmla_za16_f16_vg1x4(w + 3, B3, A);
+                }
+            }
+        } else {
+            for (size_t t = 0; t < T; t++)
+                for (size_t d = 0; d < kfull; d += 4) {
+                    svfloat16x4_t B = svld1_f16_x4(pn, b + t * per_tile + d * 32);
+                    for (size_t r = 0; r < rows; r++)
+                        svmla_za16_f16_vg1x4((uint32_t)(4 * r + t), B,
+                                              svld1_f16_x4(pn, abc + r * per_tile + d * 32));
+                }
+        }
+        if (kfull < k)
+            for (size_t t = 0; t < T; t++) {
+                svfloat16x4_t B = svld1_f16_x4(pt, b + t * per_tile + kfull * 32);
+                for (size_t r = 0; r < rows; r++)
+                    svmla_za16_f16_vg1x4((uint32_t)(4 * r + t), B,
+                                          svld1_f16_x4(pt, abc + r * per_tile + kfull * 32));
+            }
+        for (size_t r = 0; r < rows; r++)
+            for (size_t t = 0; t < T; t++) {
+                size_t n0 = (nt + t) * 32;
+                size_t ncols = n - n0 < 32 ? n - n0 : 32;
+                svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)ncols);
+                svfloat16x4_t q = svread_za16_f16_vg1x4((uint32_t)(4 * r + t));
+                svfloat16_t acc = svadd_f16_x(p16, svadd_f16_x(p16, svget4(q, 0), svget4(q, 1)),
+                                         svadd_f16_x(p16, svget4(q, 2), svget4(q, 3)));
+                f16 *out = dst + (long)r * dst_rs + n0;
+                if (pure) {
+                    svst1_f16(pst, out, acc);
+                } else if (has_ep) {
+#define EP_GEMV_RD(s) acc
+                    EP_STORE_TILE_ROWMAJOR_F16(p16, pst, out, dst_rs, EP_GEMV_RD, 1, vb, va, read_dst,
+                                               nodes, n_nodes, r, n0);
+#undef EP_GEMV_RD
+                } else {
+                    store_slice(p16, pst, out, acc, vb, read_dst, va);
+                }
+            }
+    }
+}
+
+// abc[d*32 + j] = A[0, d].
+static void bcast_row(f16 *abc, const f16 *a, long lhs_cs, size_t k) {
+    for (size_t d = 0; d < k; d++) {
+        float16x8_t v = vdupq_n_f16(a[(long)d * lhs_cs]);
+        float16x8x4_t q = {{v, v, v, v}};
+        vst1q_f16_x4(abc + d * 32, q);
+    }
+}
+
 // =============================================================================
 // run_streaming: the SME hot loop. Computes the tile-blocked GEMM + epilogue for
 // the M-tile range [mt_lo, mt_hi) of this (cluster's) chunk.
@@ -309,6 +397,23 @@ __arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
 // restructuring against examples/bench.rs and examples/epilogue_bench.rs (and run
 // the correctness suite) before committing.
 // =============================================================================
+// L2 blocking budget in 32-wide tiles.
+static size_t f16_budget(size_t k) {
+    size_t tile_bytes = ep_cmul(k, 32) * sizeof(f16);
+    size_t b = (8u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
+    return b < 4 ? 4 : b;
+}
+
+// N-block width shared by the driver and run_streaming; even, split evenly.
+static size_t f16_nc_blk(size_t k, size_t span) {
+    size_t nc = (f16_budget(k) / 2) & ~(size_t)1;
+    if (nc < 2) nc = 2;
+    if (nc >= span) return span;
+    size_t blocks = (span + nc - 1) / nc;
+    size_t w = (span + blocks - 1) / blocks;
+    return (w + 1) & ~(size_t)1;
+}
+
 // [nt_lo, nt_hi) is the N-tile (pad) sub-range this invocation owns -- pass
 // (0, n_tiles_pad) for the whole problem, or an even-aligned slice for the
 // N-parallel flat-M path (see gemm_sme_f16f16_run_packed). Must be pair-aligned
@@ -373,14 +478,9 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     // and not monotonically -- these shapes are MOPA-bound, so the budget is not
     // a live knob here. (Q4 is the exception: there it also sets how many full
     // dequant passes run, which is why 16 MB wins in gemm_f16f16_q4.h.)
-    size_t tile_bytes = per_tile * sizeof(f16);
-    size_t budget_tiles = (8u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
-    if (budget_tiles < 4) budget_tiles = 4;
+    size_t budget_tiles = f16_budget(k);
     size_t nt_span = nt_hi - nt_lo;
-    size_t nc = budget_tiles / 2;
-    nc &= ~(size_t)1;
-    if (nc < 2) nc = 2;
-    if (nc > nt_span) nc = nt_span;
+    size_t nc = f16_nc_blk(k, nt_span);
     size_t mc = budget_tiles / 2;
     if (mc < 1) mc = 1;
     if (mc > mt_hi - mt_lo) mc = mt_hi - mt_lo;
@@ -651,6 +751,25 @@ int gemm_sme_f16f16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
     const f16 *bp = (const f16 *)b_pack;
     f16 *d = (f16 *)dst;
 
+    int big = ep_flops(m, n, k) >= (1u << 21);
+    if (m <= GEMV_MAXR && dst_cs == 1) {
+        f16 *abc = apack_scratch(ep_cmul(ep_cmul(m, per_tile), sizeof(f16)));
+        if (!abc) return -1;
+        for (size_t r = 0; r < m; r++) bcast_row(abc + r * per_tile, a + (long)r * lhs_rs, lhs_cs, k);
+        size_t G_CHUNK = 4; // tiles per chunk
+        size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
+        if (!big || g_chunks < 3) {
+            run_gemv(d, dst_rs, abc, m, bp, n, k, 0, n_tiles, alpha, beta, read_dst, ep);
+            return 0;
+        }
+        dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t nt0 = ci * G_CHUNK;
+          size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
+          run_gemv(d, dst_rs, abc, m, bp, n, k, nt0, nt1, alpha, beta, read_dst, ep);
+        });
+        return 0;
+    }
+
     // n_tiles==1 (n<=32) row-major: the dual-tile scheme wastes za1 on the pad
     // N-tile (~2x slow per flop). run_narrow_rowmajor pairs two M-tiles against the
     // single B-tile instead. Same M-chunk parallelism; just a different inner loop.
@@ -677,7 +796,6 @@ int gemm_sme_f16f16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
     // M-tiles, and an odd chunk would idle za1.
     size_t M_CHUNK = 2;
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
-    int big = ep_flops(m, n, k) >= (1u << 21);
     // Flat-M (few M-tiles) but large and wide: M is the only parallel axis, so the
     // M-chunk scheme would run this on ONE cluster. Parallelize over N instead --
     // pack all of A once (cheap, m_tiles is small) into a shared buffer, then hand
@@ -749,22 +867,40 @@ int gemm_sme_f16f16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
     }
     f16 *a_pack = (f16 *)malloc(ep_cmul(ep_cmul(m_tiles, per_tile), sizeof(f16)));
     if (!a_pack) return -1;
-    dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
-      size_t mt0 = ci * M_CHUNK;
-      size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
-      packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt1, per_tile);
-      if (narrow) {
+    if (narrow) {
+        dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t mt0 = ci * M_CHUNK;
+          size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
+          packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt1, per_tile);
           run_narrow_rowmajor(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, 0, alpha, beta,
                               read_dst, ep);
-      } else if (odd_tail) {
-          run_streaming(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles, 0, n_tiles - 1,
-                        alpha, beta, read_dst, ep);
+        });
+        free(a_pack);
+        return 0;
+    }
+    // N-blocks outside the M dispatch so each B-block stays L2-resident; the
+    // odd tail tile rides with the last block.
+    size_t nt_end = odd_tail ? n_tiles - 1 : n_tiles_pad;
+    size_t nc_blk = f16_nc_blk(k, nt_end);
+    size_t n_blocks = (nt_end + nc_blk - 1) / nc_blk;
+    if (n_blocks > 1)
+        dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t mt0 = ci * M_CHUNK;
+          packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles,
+                per_tile);
+        });
+    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.c.
+    dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
+      size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
+      size_t mt0 = ci * M_CHUNK;
+      size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
+      size_t jc_end = jc + nc_blk < nt_end ? jc + nc_blk : nt_end;
+      if (n_blocks == 1) packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt1, per_tile);
+      run_streaming(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles, jc, jc_end, alpha, beta,
+                    read_dst, ep);
+      if (odd_tail && jc_end == nt_end)
           run_narrow_rowmajor(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles - 1, alpha,
                               beta, read_dst, ep);
-      } else {
-          run_streaming(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles, 0, n_tiles_pad,
-                        alpha, beta, read_dst, ep);
-      }
     });
     free(a_pack);
     return 0;

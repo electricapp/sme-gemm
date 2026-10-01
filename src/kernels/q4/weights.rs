@@ -1,6 +1,8 @@
 //! The 4-bit-resident weight set: the tile-major pack the kernels read, plus the
 //! row-major unpack their fallbacks use.
 
+use std::sync::OnceLock;
+
 use half::{bf16, f16};
 
 use super::{Q4Params, q4_check};
@@ -22,6 +24,8 @@ pub struct Q4Weights {
     /// Tile-major offsets, same shape as `scales`; empty for
     /// [`Q4Form::Scale`](super::Q4Form::Scale).
     pub(super) mins: Vec<u16>,
+    /// `scales` and `mins` as bf16, built on the first bf16 decode call.
+    pub(super) bf16_scales: OnceLock<(Vec<u16>, Vec<u16>)>,
     pub(super) n: usize,
     pub(super) k: usize,
     pub(super) params: Q4Params,
@@ -111,10 +115,23 @@ impl Q4Weights {
             nibbles,
             scales: sc,
             mins: mn,
+            bf16_scales: OnceLock::new(),
             n,
             k,
             params: p,
         }
+    }
+
+    /// Tile-major scales and mins converted to bf16 bits.
+    pub(super) fn bf16_scales(&self) -> &(Vec<u16>, Vec<u16>) {
+        self.bf16_scales.get_or_init(|| {
+            let cvt = |v: &[u16]| -> Vec<u16> {
+                v.iter()
+                    .map(|&b| bf16::from_f32(f16::from_bits(b).to_f32()).to_bits())
+                    .collect()
+            };
+            (cvt(&self.scales), cvt(&self.mins))
+        })
     }
 
     /// The quantization layout these weights were packed with.

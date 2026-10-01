@@ -18,6 +18,8 @@ fn f16_batched() {
         (32, 48, 24, 20),
         (8, 33, 17, 13),
         (31, 31, 31, 7),
+        (70, 100, 75, 3),
+        (33, 65, 64, 4),
     ];
     for &(m, n, k, count) in cases {
         let mut s = 0xba7c_0ed0_1111_0001 ^ ((m * 131 + n * 17 + k * 7 + count) as u64);
@@ -42,8 +44,12 @@ fn bf16_batched() {
     if !caps().sme_b16b16 {
         return;
     }
-    let cases: &[(usize, usize, usize, usize)] =
-        &[(16, 16, 16, 40), (32, 48, 24, 16), (31, 31, 31, 6)];
+    let cases: &[(usize, usize, usize, usize)] = &[
+        (16, 16, 16, 40),
+        (32, 48, 24, 16),
+        (31, 31, 31, 6),
+        (70, 100, 75, 3),
+    ];
     for &(m, n, k, count) in cases {
         let mut s = 0xbf16_bf16_3333_0001 ^ ((m * 131 + n * 17 + k * 7 + count) as u64);
         let rb = |s: &mut u64| {
@@ -85,6 +91,7 @@ fn f32_batched() {
         (33, 17, 9, 13),
         (16, 48, 24, 17),
         (31, 31, 31, 7),
+        (70, 100, 75, 3),
     ];
     for &(m, n, k, count) in cases {
         let mut s = 0xf32b_a7c0_5555_0001 ^ ((m * 131 + n * 17 + k * 7 + count) as u64);
@@ -119,6 +126,7 @@ fn f64_batched() {
         (17, 9, 5, 13),
         (16, 48, 24, 11),
         (15, 15, 15, 7),
+        (40, 37, 29, 3),
     ];
     for &(m, n, k, count) in cases {
         let mut s = 0xf64b_a7c0_7777_0001 ^ ((m * 131 + n * 17 + k * 7 + count) as u64);
@@ -238,6 +246,7 @@ fn f16_batched_ep() {
         (32, 48, 24, 12),
         (8, 33, 17, 9),
         (31, 31, 31, 5),
+        (70, 100, 75, 3),
     ];
     for &(m, n, k, count) in cases {
         let mut s = 0xe9_f16e_be11_0001 ^ ((m * 131 + n * 17 + k * 7 + count) as u64);
@@ -311,8 +320,12 @@ fn bf16_batched_ep() {
     if !caps().sme_b16b16 {
         return;
     }
-    let cases: &[(usize, usize, usize, usize)] =
-        &[(16, 16, 16, 24), (32, 48, 24, 10), (31, 31, 31, 5)];
+    let cases: &[(usize, usize, usize, usize)] = &[
+        (16, 16, 16, 24),
+        (32, 48, 24, 10),
+        (31, 31, 31, 5),
+        (33, 65, 64, 3),
+    ];
     for &(m, n, k, count) in cases {
         let mut s = 0xbf16_be11_4444_0001 ^ ((m * 131 + n * 17 + k * 7 + count) as u64);
         let rb = |s: &mut u64| {
@@ -367,6 +380,7 @@ fn f32_batched_ep() {
         (33, 17, 9, 11),
         (16, 48, 24, 13),
         (31, 31, 31, 5),
+        (40, 70, 33, 3),
     ];
     for &(m, n, k, count) in cases {
         let mut s = 0xf32e_be11_6666_0001 ^ ((m * 131 + n * 17 + k * 7 + count) as u64);
@@ -444,6 +458,7 @@ fn f64_batched_ep() {
         (16, 16, 16, 16),
         (17, 9, 5, 11),
         (16, 48, 24, 9),
+        (40, 37, 29, 3),
         (15, 15, 15, 5),
     ];
     for &(m, n, k, count) in cases {

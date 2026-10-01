@@ -221,6 +221,111 @@ __arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
     }
 }
 
+// m == 1 GEMV; see gemm_f16f16.c.
+#define GEMV_T 4
+#define GEMV_MAXR 4 // rows; past this the MOPA path does fewer ZA ops
+__arm_locally_streaming __arm_new("za") static void run_gemv(bf16 *dst, long dst_rs, const bf16 *abc,
+                                                             size_t rows, const bf16 *b_pack, size_t n,
+                                                             size_t k, size_t nt_lo, size_t nt_hi,
+                                                             float alpha, float beta, int read_dst,
+                                                             const ep_desc16 *ep) {
+    svbool_t p16 = svptrue_b16();
+    svcount_t pn = svptrue_c16();
+    const svbfloat16_t va = svdup_n_bf16((bf16)alpha);
+    const svbfloat16_t vb = svdup_n_bf16((bf16)beta);
+    int has_ep = ep && ep->n_nodes > 0;
+    int pure = (beta == 1.0f && !read_dst && !has_ep);
+    const EpNode *nodes = has_ep ? ep->nodes : NULL;
+    uint32_t n_nodes = has_ep ? ep->n_nodes : 0;
+    size_t per_tile = ep_cmul(k, 32); // also the stride between abc rows
+    size_t kfull = k & ~(size_t)3;
+    // K tail: predicated loads zero the dead depths.
+    svcount_t pt = svwhilelt_c16((uint64_t)0, (uint64_t)((k - kfull) * 32), 4);
+    for (size_t nt = nt_lo; nt < nt_hi; nt += GEMV_T) {
+        size_t T = nt_hi - nt < GEMV_T ? nt_hi - nt : GEMV_T;
+        const bf16 *b = b_pack + nt * per_tile;
+        svzero_za();
+        if (T == GEMV_T) {
+            for (size_t d = 0; d < kfull; d += 4) {
+                svbfloat16x4_t B0 = svld1_bf16_x4(pn, b + d * 32);
+                svbfloat16x4_t B1 = svld1_bf16_x4(pn, b + per_tile + d * 32);
+                svbfloat16x4_t B2 = svld1_bf16_x4(pn, b + 2 * per_tile + d * 32);
+                svbfloat16x4_t B3 = svld1_bf16_x4(pn, b + 3 * per_tile + d * 32);
+                for (size_t r = 0; r < rows; r++) {
+                    svbfloat16x4_t A = svld1_bf16_x4(pn, abc + r * per_tile + d * 32);
+                    uint32_t w = (uint32_t)(4 * r);
+                    svmla_za16_bf16_vg1x4(w, B0, A);
+                    svmla_za16_bf16_vg1x4(w + 1, B1, A);
+                    svmla_za16_bf16_vg1x4(w + 2, B2, A);
+                    svmla_za16_bf16_vg1x4(w + 3, B3, A);
+                }
+            }
+        } else {
+            for (size_t t = 0; t < T; t++)
+                for (size_t d = 0; d < kfull; d += 4) {
+                    svbfloat16x4_t B = svld1_bf16_x4(pn, b + t * per_tile + d * 32);
+                    for (size_t r = 0; r < rows; r++)
+                        svmla_za16_bf16_vg1x4((uint32_t)(4 * r + t), B,
+                                              svld1_bf16_x4(pn, abc + r * per_tile + d * 32));
+                }
+        }
+        if (kfull < k)
+            for (size_t t = 0; t < T; t++) {
+                svbfloat16x4_t B = svld1_bf16_x4(pt, b + t * per_tile + kfull * 32);
+                for (size_t r = 0; r < rows; r++)
+                    svmla_za16_bf16_vg1x4((uint32_t)(4 * r + t), B,
+                                          svld1_bf16_x4(pt, abc + r * per_tile + kfull * 32));
+            }
+        for (size_t r = 0; r < rows; r++)
+            for (size_t t = 0; t < T; t++) {
+                size_t n0 = (nt + t) * 32;
+                size_t ncols = n - n0 < 32 ? n - n0 : 32;
+                svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)ncols);
+                svbfloat16x4_t q = svread_za16_bf16_vg1x4((uint32_t)(4 * r + t));
+                svbfloat16_t acc = svadd_bf16_x(p16, svadd_bf16_x(p16, svget4(q, 0), svget4(q, 1)),
+                                         svadd_bf16_x(p16, svget4(q, 2), svget4(q, 3)));
+                bf16 *out = dst + (long)r * dst_rs + n0;
+                if (pure) {
+                    svst1_bf16(pst, out, acc);
+                } else if (has_ep) {
+#define EP_GEMV_RD(s) acc
+                    EP_STORE_TILE_ROWMAJOR_BF16(p16, pst, out, dst_rs, EP_GEMV_RD, 1, vb, va, read_dst,
+                                               nodes, n_nodes, r, n0);
+#undef EP_GEMV_RD
+                } else {
+                    store_slice(p16, pst, out, acc, vb, read_dst, va);
+                }
+            }
+    }
+}
+
+// abc[d*32 + j] = A[0, d].
+static void bcast_row(bf16 *abc, const bf16 *a, long lhs_cs, size_t k) {
+    const uint16_t *src = (const uint16_t *)a;
+    uint16_t *out = (uint16_t *)abc;
+    for (size_t d = 0; d < k; d++) {
+        uint16x8_t v = vdupq_n_u16(src[(long)d * lhs_cs]);
+        uint16x8x4_t q = {{v, v, v, v}};
+        vst1q_u16_x4(out + d * 32, q);
+    }
+}
+
+// See f16_budget / f16_nc_blk.
+static size_t b16_budget(size_t k) {
+    size_t tile_bytes = ep_cmul(k, 32) * sizeof(bf16);
+    size_t b = (8u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
+    return b < 4 ? 4 : b;
+}
+
+static size_t b16_nc_blk(size_t k, size_t span) {
+    size_t nc = (b16_budget(k) / 2) & ~(size_t)1;
+    if (nc < 2) nc = 2;
+    if (nc >= span) return span;
+    size_t blocks = (span + nc - 1) / nc;
+    size_t w = (span + blocks - 1) / blocks;
+    return (w + 1) & ~(size_t)1;
+}
+
 // [nt_lo, nt_hi): the even-aligned N-tile (pad) sub-range this invocation owns
 // (whole problem = (0, n_tiles_pad); a slice for the N-parallel flat-M path).
 // See gemm_f16f16.c run_streaming and gemm_sme_b16b16_run_packed.
@@ -259,14 +364,9 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     uint32_t n_nodes = has_ep ? ep_eff->n_nodes : 0;
     int has_tensor = has_ep && ep_has_tensor(nodes, n_nodes);
 
-    size_t tile_bytes = per_tile * sizeof(bf16);
-    size_t budget_tiles = (8u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
-    if (budget_tiles < 4) budget_tiles = 4;
+    size_t budget_tiles = b16_budget(k);
     size_t nt_span = nt_hi - nt_lo;
-    size_t nc = budget_tiles / 2;
-    nc &= ~(size_t)1;
-    if (nc < 2) nc = 2;
-    if (nc > nt_span) nc = nt_span;
+    size_t nc = b16_nc_blk(k, nt_span);
     size_t mc = budget_tiles / 2;
     if (mc < 1) mc = 1;
     if (mc > mt_hi - mt_lo) mc = mt_hi - mt_lo;
@@ -529,6 +629,23 @@ int gemm_sme_b16b16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
     size_t M_CHUNK = 2;
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
     int big = ep_flops(m, n, k) >= (1u << 21);
+    if (m <= GEMV_MAXR && dst_cs == 1) {
+        bf16 *abc = apack_scratch(ep_cmul(ep_cmul(m, per_tile), sizeof(bf16)));
+        if (!abc) return -1;
+        for (size_t r = 0; r < m; r++) bcast_row(abc + r * per_tile, a + (long)r * lhs_rs, lhs_cs, k);
+        size_t G_CHUNK = 4; // tiles per chunk
+        size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
+        if (!big || g_chunks < 3) {
+            run_gemv(d, dst_rs, abc, m, bp, n, k, 0, n_tiles, alpha, beta, read_dst, ep);
+            return 0;
+        }
+        dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t nt0 = ci * G_CHUNK;
+          size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
+          run_gemv(d, dst_rs, abc, m, bp, n, k, nt0, nt1, alpha, beta, read_dst, ep);
+        });
+        return 0;
+    }
     // n_tiles==1 (n<=32) row-major: pair two M-tiles against the single B-tile
     // (run_narrow_rowmajor) instead of wasting za1 on the pad N-tile. See f16f16.
     int narrow = (n_tiles == 1 && dst_cs == 1);
@@ -591,22 +708,40 @@ int gemm_sme_b16b16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
     }
     bf16 *a_pack = (bf16 *)malloc(ep_cmul(ep_cmul(m_tiles, per_tile), sizeof(bf16)));
     if (!a_pack) return -1;
-    dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
-      size_t mt0 = ci * M_CHUNK;
-      size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
-      packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt1, per_tile);
-      if (narrow) {
+    if (narrow) {
+        dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t mt0 = ci * M_CHUNK;
+          size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
+          packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt1, per_tile);
           run_narrow_rowmajor(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, 0, alpha, beta,
                               read_dst, ep);
-      } else if (odd_tail) {
-          run_streaming(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles, 0,
-                        n_tiles - 1, alpha, beta, read_dst, ep);
-          run_narrow_rowmajor(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles - 1,
-                              alpha, beta, read_dst, ep);
-      } else {
-          run_streaming(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles, 0,
-                        n_tiles_pad, alpha, beta, read_dst, ep);
-      }
+        });
+        free(a_pack);
+        return 0;
+    }
+    // N-blocks outside the M dispatch so each B-block stays L2-resident; the
+    // odd tail tile rides with the last block.
+    size_t nt_end = odd_tail ? n_tiles - 1 : n_tiles_pad;
+    size_t nc_blk = b16_nc_blk(k, nt_end);
+    size_t n_blocks = (nt_end + nc_blk - 1) / nc_blk;
+    if (n_blocks > 1)
+        dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t mt0 = ci * M_CHUNK;
+          packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles,
+                per_tile);
+        });
+    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.c.
+    dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
+      size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
+      size_t mt0 = ci * M_CHUNK;
+      size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
+      size_t jc_end = jc + nc_blk < nt_end ? jc + nc_blk : nt_end;
+      if (n_blocks == 1) packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt1, per_tile);
+      run_streaming(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles, jc, jc_end, alpha, beta,
+                    read_dst, ep);
+      if (odd_tail && jc_end == nt_end)
+          run_narrow_rowmajor(d, dst_cs, dst_rs, a_pack, bp, m, n, k, mt0, mt1, n_tiles - 1, alpha,
+                              beta, read_dst, ep);
     });
     free(a_pack);
     return 0;
@@ -641,12 +776,13 @@ int gemm_sme_b16b16_run(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs
     return rc;
 }
 
-// One row-major GEMM (C = A@B overwrite), already in streaming mode -- a batch
-// pays the streaming entry once. See gemm_f16f16.c batch_one. `ep` (NULL /
-// n_nodes==0 = raw store) applies the fused op-graph at the per-row store; the
-// output is row-major so COL/TENSOR are N-vector loads and ROW/SCALAR splats.
-static void batch_one(bf16 *dst, const bf16 *a_pack, const bf16 *b_pack, size_t m, size_t n,
-                      size_t k, size_t per_tile, size_t n_tiles, const EpNode *nodes,
+// One row-major GEMM (C = A@B overwrite), already in streaming mode. B is read
+// straight from the row-major input (a 32-column tile at depth d is contiguous)
+// and each A tile is transposed through ZA tile 0 into `a_scr` ([k][32]), so
+// nothing is packed outside the streaming session. `ep` applies the op-graph
+// at the per-row store, as run_streaming's row-major path does.
+static void batch_one(bf16 *dst, const bf16 *a, const bf16 *b, bf16 *a_scr, size_t m, size_t n,
+                      size_t k, size_t n_tiles, const EpNode *nodes,
                       uint32_t n_nodes) __arm_streaming __arm_inout("za") {
     svbool_t p16 = svptrue_b16();
     const svbfloat16_t z16 = svdup_n_bf16((bf16)0.0f);
@@ -655,43 +791,54 @@ static void batch_one(bf16 *dst, const bf16 *a_pack, const bf16 *b_pack, size_t 
     int has_ep = nodes && n_nodes > 0;
     size_t m_tiles = (m + 31) / 32;
     for (size_t mt = 0; mt < m_tiles; mt++) {
-        const bf16 *at = a_pack + mt * per_tile;
         size_t m0 = mt * 32;
         size_t mrows = (m - m0 < 32) ? (m - m0) : 32;
+        for (size_t d0 = 0; d0 < k; d0 += 32) {
+            size_t dc = k - d0 < 32 ? k - d0 : 32;
+            svbool_t pk = svwhilelt_b16((uint64_t)0, (uint64_t)dc);
+            svzero_za();
+            for (size_t r = 0; r < mrows; r++)
+                svld1_hor_za16(0, (uint32_t)r, pk, a + (m0 + r) * k + d0);
+            for (size_t c = 0; c < dc; c++)
+                svst1_ver_za16(0, (uint32_t)c, p16, a_scr + (d0 + c) * 32);
+        }
         for (size_t nt = 0; nt < n_tiles; nt += 2) {
-            const bf16 *b0 = b_pack + nt * per_tile;
-            const bf16 *b1 = b_pack + (nt + 1) * per_tile;
+            size_t n0 = nt * 32;
+            size_t n1 = n0 + 32;
+            svbool_t pb0 = svwhilelt_b16((uint64_t)n0, (uint64_t)n);
+            svbool_t pb1 = n1 < n ? svwhilelt_b16((uint64_t)n1, (uint64_t)n) : svpfalse_b();
+            const bf16 *b1 = n1 < n ? b + n1 : b;
             svzero_za();
             for (size_t d = 0; d < k; d++) {
-                svbfloat16_t av = svld1_bf16(p16, at + d * 32);
-                svmopa_za16_bf16_m(0, p16, p16, av, svld1_bf16(p16, b0 + d * 32));
-                svmopa_za16_bf16_m(1, p16, p16, av, svld1_bf16(p16, b1 + d * 32));
+                svbfloat16_t av = svld1_bf16(p16, a_scr + d * 32);
+                svmopa_za16_bf16_m(0, p16, p16, av, svld1_bf16(pb0, b + d * n + n0));
+                svmopa_za16_bf16_m(1, p16, p16, av, svld1_bf16(pb1, b1 + d * n));
             }
             for (size_t t = 0; t < 2; t++) {
                 size_t ntt = nt + t;
                 if (ntt >= n_tiles) break;
-                size_t n0 = ntt * 32;
-                size_t ncols = (n - n0 < 32) ? (n - n0) : 32;
+                size_t nc0 = ntt * 32;
+                size_t ncols = (n - nc0 < 32) ? (n - nc0) : 32;
                 svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)ncols);
                 if (has_ep) {
-                    bf16 *base = dst + (m0 + 0) * n + n0;
+                    bf16 *base = dst + m0 * n + nc0;
                     if (t == 0) {
 #define EP_RD0(s) svread_hor_za16_bf16_m(z16, p16, 0, (s))
                         EP_STORE_TILE_ROWMAJOR_BF16(p16, pst, base, (long)n, EP_RD0, mrows, vb, va,
-                                                    /*read_dst=*/0, nodes, n_nodes, m0, n0);
+                                                   /*read_dst=*/0, nodes, n_nodes, m0, nc0);
 #undef EP_RD0
                     } else {
 #define EP_RD1(s) svread_hor_za16_bf16_m(z16, p16, 1, (s))
                         EP_STORE_TILE_ROWMAJOR_BF16(p16, pst, base, (long)n, EP_RD1, mrows, vb, va,
-                                                    /*read_dst=*/0, nodes, n_nodes, m0, n0);
+                                                   /*read_dst=*/0, nodes, n_nodes, m0, nc0);
 #undef EP_RD1
                     }
                 } else if (t == 0) {
                     for (size_t r = 0; r < mrows; r++)
-                        svst1_hor_za16(0, (uint32_t)r, pst, dst + (m0 + r) * n + n0);
+                        svst1_hor_za16(0, (uint32_t)r, pst, dst + (m0 + r) * n + nc0);
                 } else {
                     for (size_t r = 0; r < mrows; r++)
-                        svst1_hor_za16(1, (uint32_t)r, pst, dst + (m0 + r) * n + n0);
+                        svst1_hor_za16(1, (uint32_t)r, pst, dst + (m0 + r) * n + nc0);
                 }
             }
         }
@@ -699,12 +846,11 @@ static void batch_one(bf16 *dst, const bf16 *a_pack, const bf16 *b_pack, size_t 
 }
 
 __arm_locally_streaming __arm_new("za") static void run_batched(
-    size_t count, bf16 *dst, const bf16 *a_packs, const bf16 *b_packs, size_t m, size_t n, size_t k,
-    size_t per_tile, size_t n_tiles, size_t a_per, size_t b_per, size_t c_per, const EpNode *nodes,
-    uint32_t n_nodes) {
+    size_t count, bf16 *dst, const bf16 *lhs, const bf16 *rhs, bf16 *a_scr, size_t m, size_t n,
+    size_t k, size_t n_tiles, const EpNode *nodes, uint32_t n_nodes) {
     for (size_t bi = 0; bi < count; bi++)
-        batch_one(dst + bi * c_per, a_packs + bi * a_per, b_packs + bi * b_per, m, n, k, per_tile,
-                  n_tiles, nodes, n_nodes);
+        batch_one(dst + bi * m * n, lhs + bi * m * k, rhs + bi * k * n, a_scr, m, n, k, n_tiles,
+                  nodes, n_nodes);
 }
 
 // Batched bf16 GEMM with an optional fused op-graph epilogue applied to EACH
@@ -719,37 +865,12 @@ int gemm_sme_b16b16_batched_ep(size_t count, size_t m, size_t n, size_t k, uint1
     int has_ep = ep && ep->n_nodes > 0;
     const EpNode *nodes = has_ep ? ep->nodes : NULL;
     uint32_t n_nodes = has_ep ? ep->n_nodes : 0;
-    size_t m_tiles = (m + 31) / 32;
     size_t n_tiles = (n + 31) / 32;
-    size_t n_tiles_pad = (n_tiles + 1) & ~(size_t)1;
-    size_t per_tile = ep_cmul(k, 32);
-    size_t a_per = m_tiles * per_tile, b_per = n_tiles_pad * per_tile, c_per = m * n;
-
-    // `count` is the one factor not bounded by a C-side size invariant, so guard
-    // the pack-buffer products against overflow (the calloc nmemb `count*b_per` is
-    // multiplied before calloc can check it). Return -1 -> the Rust side falls back.
-    size_t a_bytes, b_elems;
-    if (__builtin_mul_overflow(count, a_per, &a_bytes) ||
-        __builtin_mul_overflow(a_bytes, sizeof(bf16), &a_bytes) ||
-        __builtin_mul_overflow(count, b_per, &b_elems)) {
-        return -1;
-    }
-    bf16 *a_packs = (bf16 *)malloc(a_bytes);
-    bf16 *b_packs = (bf16 *)calloc(b_elems, sizeof(bf16));
-    if (!a_packs || !b_packs) {
-        free(a_packs);
-        free(b_packs);
-        return -1;
-    }
-    for (size_t bi = 0; bi < count; bi++) {
-        packa(a_packs + bi * a_per, (const bf16 *)lhs + bi * (m * k), m, k, k, 1, 0, m_tiles,
-              per_tile);
-        packb(b_packs + bi * b_per, (const bf16 *)rhs + bi * (k * n), n, k, n, 1, n_tiles, per_tile);
-    }
-    run_batched(count, (bf16 *)dst, a_packs, b_packs, m, n, k, per_tile, n_tiles, a_per, b_per,
-                c_per, nodes, n_nodes);
-    free(a_packs);
-    free(b_packs);
+    // A scratch for one M-tile, rounded up to whole 32-deep transpose blocks.
+    bf16 *a_scr = apack_scratch(ep_cmul(ep_cmul((k + 31) & ~(size_t)31, 32), sizeof(bf16)));
+    if (!a_scr) return -1;
+    run_batched(count, (bf16 *)dst, (const bf16 *)lhs, (const bf16 *)rhs, a_scr, m, n, k, n_tiles,
+                nodes, n_nodes);
     return 0;
 }
 

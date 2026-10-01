@@ -154,8 +154,23 @@ fn q4_bf16_impl(a: &[bf16], w: &Q4Weights, c: &mut [bf16], m: usize, ep: &Epilog
         } else {
             &raw const desc
         };
+        // The m <= 4 kernel folds the scale per K-block in bf16.
+        let (sb, mb) = if m <= 4 {
+            let (sb, mb) = w.bf16_scales();
+            (
+                sb.as_ptr(),
+                if mb.is_empty() {
+                    core::ptr::null()
+                } else {
+                    mb.as_ptr()
+                },
+            )
+        } else {
+            (core::ptr::null(), core::ptr::null())
+        };
         // SAFETY: as `q4_f16_impl`, with bf16 activations/output -- the kernel
-        // reads the same tile-major nibbles and f16 scales.
+        // reads the same tile-major nibbles and f16 scales; the bf16 copies have
+        // the same shape.
         let rc = unsafe {
             gemm_sme_b16b16_q4(
                 m,
@@ -170,6 +185,8 @@ fn q4_bf16_impl(a: &[bf16], w: &Q4Weights, c: &mut [bf16], m: usize, ep: &Epilog
                 } else {
                     w.mins.as_ptr()
                 },
+                sb,
+                mb,
                 w.params.block,
                 ep_ptr,
             )

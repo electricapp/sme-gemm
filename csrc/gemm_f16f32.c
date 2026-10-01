@@ -213,6 +213,22 @@ static inline void store_vec(svbool_t p32, svbool_t pst, f16 *ptr, svfloat32_t l
     svmopa_za32_f16_m(0, p16, p16, al, bl);                                                        \
     svmopa_za32_f16_m(1, p16, p16, al, bh)
 
+// L2 blocking budget in 32-wide super-tiles.
+static size_t f16w_budget(size_t kp) {
+    size_t tile_bytes = 2 * ep_cmul(kp, 32) * sizeof(f16);
+    size_t b = (size_t)(16u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
+    return b < 2 ? 2 : b;
+}
+
+// N-block width shared by the driver and sme_run_streaming.
+static size_t f16w_nc_blk(size_t kp, size_t n_tiles) {
+    size_t nc = f16w_budget(kp) / 2;
+    if (nc < 1) nc = 1;
+    if (nc >= n_tiles) return n_tiles;
+    size_t blocks = (n_tiles + nc - 1) / nc;
+    return (n_tiles + blocks - 1) / blocks;
+}
+
 // The streaming compute: one ZA lifetime for the whole tile grid.
 // [nt_lo, nt_hi) is the N-tile sub-range this invocation owns -- pass
 // (0, n_tiles) for the whole problem, or a slice for the N-parallel flat-M path
@@ -236,13 +252,9 @@ __arm_locally_streaming __arm_new("za") static void sme_run_streaming(
     // tile_bytes is the full super-tile and the budget constant equals the total
     // resident bytes (A-block + B-block) -- matching gemm_f32.c. A band-sized tile_bytes would
     // instead double the working set.
-    size_t tile_bytes = 2 * per_tile * sizeof(f16);
-    size_t budget = (size_t)(16u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
-    if (budget < 2) budget = 2;
+    size_t budget = f16w_budget(kp);
     size_t nt_span = nt_hi - nt_lo;
-    size_t nc_blk = budget / 2;
-    if (nc_blk < 1) nc_blk = 1;
-    if (nc_blk > nt_span) nc_blk = nt_span;
+    size_t nc_blk = f16w_nc_blk(kp, nt_span);
     size_t mc_blk = budget / 2;
     if (mc_blk < 1) mc_blk = 1;
     if (mc_blk > mt_hi - mt_lo) mc_blk = mt_hi - mt_lo;
@@ -492,11 +504,22 @@ int gemm_sme_f16f32_run(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs
         free(b_pack);
         return -1;
     }
-    dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+    size_t nc_blk = f16w_nc_blk(kp, n_tiles);
+    size_t n_blocks = (n_tiles + nc_blk - 1) / nc_blk;
+    if (n_blocks > 1)
+        dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t mt0 = ci * M_CHUNK;
+          PACKA_RANGE(a_pack, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
+        });
+    // One flat dispatch over (N-block, M-chunk), block-major: no barrier per
+    // block, so an E-cluster worker (~9x slower at SME) only delays the last item.
+    dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
+      size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
       size_t mt0 = ci * M_CHUNK;
       size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
-      PACKA_RANGE(a_pack, mt0, mt1);
-      sme_run_streaming((f16 *)dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, 0, n_tiles, kp,
+      size_t jc_end = jc + nc_blk < n_tiles ? jc + nc_blk : n_tiles;
+      if (n_blocks == 1) PACKA_RANGE(a_pack, mt0, mt1);
+      sme_run_streaming((f16 *)dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, jc, jc_end, kp,
                         alpha, beta, read_dst);
     });
 #undef PACKA_RANGE

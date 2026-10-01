@@ -139,6 +139,8 @@ unsafe extern "C" {
         nibbles: *const u8,
         scales: *const u16,
         mins: *const u16,
+        scales_bf16: *const u16,
+        mins_bf16: *const u16,
         block: usize,
         ep: *const EpDesc16,
     ) -> core::ffi::c_int;
