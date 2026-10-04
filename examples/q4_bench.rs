@@ -2,7 +2,7 @@
 //! then `matmul_f16_packed`), which is the same math with the weights expanded
 //! up front. Weight packing is outside the timed region for both.
 //!
-//! At decode (m <= 4) resident wins outright: the GEMV kernel decodes nibbles
+//! At m <= 7 resident wins outright: the GEMV kernel expands nibbles
 //! with LUTI4 in the streaming region and reads a quarter of eager's bytes. Past
 //! that, eager leads on a single weight set -- the on-the-fly dequant is O(n*k)
 //! whatever M is -- until the total weight working set stops fitting and the f16
@@ -30,7 +30,7 @@ fn best<F: FnMut()>(mut f: F) -> f64 {
 fn main() {
     println!("{:?}\n", caps());
     println!("  M     N    K    | q4-resident   eager-f16   4-bit B");
-    // Decode-shaped (small M) through prefill-shaped, since the resident path's
+    // Small M through large M, since the resident path's
     // whole point is holding a large weight set while M is small.
     for &(m, n, k) in &[
         (1usize, 4096usize, 4096usize),

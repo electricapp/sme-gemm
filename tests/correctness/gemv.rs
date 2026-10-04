@@ -224,7 +224,7 @@ fn gemv_i8_packed_dequant() {
     }
 }
 
-// Q4 decode against f64 dequant: ragged N and K, partial last K-block, both forms.
+// Q4 GEMV against f64 dequant: ragged N and K, partial last K-block, both forms.
 #[test]
 fn gemv_q4() {
     use sme_gemm::{Epilogue, Q4Params, Q4Weights, matmul_q4, matmul_q4_ep};
@@ -236,6 +236,8 @@ fn gemv_q4() {
         (2, 100, 70),
         (3, 129, 1027),
         (4, 4109, 4099),
+        (5, 70, 513),
+        (7, 1030, 2050),
     ] {
         for &block in &[16usize, 32, 64] {
             for affine in [false, true] {
@@ -330,6 +332,8 @@ fn gemv_q4_bf16() {
         (2, 100, 70),
         (3, 129, 1027),
         (4, 4109, 4099),
+        (5, 70, 513),
+        (7, 1030, 2050),
     ] {
         for &block in &[16usize, 32, 64] {
             for affine in [false, true] {

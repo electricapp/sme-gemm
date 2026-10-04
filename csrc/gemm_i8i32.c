@@ -67,7 +67,7 @@ static void pack_band(int8_t *dst, const int8_t *src, long lane_stride, long dep
 // half the MOPAs are wasted (n=16 measured ~half of n=32 per flop). Pair two
 // M-tiles against the single N-band instead: za0/za2 = A[mt] (rows 0-15 / 16-31),
 // za1/za3 = A[mt+1] -- all four tiles cols 0..n, every MOPA productive. Row-major
-// only; covers raw i32 AND fused dequant (the quantized-decode f32 output). The
+// only; covers raw i32 AND fused dequant (the dequantized f32 output). The
 // single N-tile sits at column 0, so n0 == 0. run_streaming is untouched.
 __arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
     void *dst_v, long dst_cs, long dst_rs, const int8_t *a_pack, const int8_t *b_pack, size_t m,
@@ -607,7 +607,7 @@ int gemm_sme_i8i32_run_packed_impl(size_t m, size_t n, size_t k, void *dst, long
 
     // Flat-M (few M-tiles) but large/wide: M is the only M-chunk axis, so the
     // M-parallel scheme below would run this on ONE cluster -- exactly the
-    // quantized batch-1 decode shape (m small, n/k large). Parallelize over N
+    // quantized small-m shape (n/k large). Parallelize over N
     // instead: pack all of A once (cheap; m_tiles small) into a shared buffer and
     // hand N-tile chunks to both clusters. C columns are disjoint per chunk; A and
     // B (and dq) are read-only and shared. Needs >= 2 chunks to beat serial.

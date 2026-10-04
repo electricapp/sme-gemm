@@ -1,5 +1,6 @@
 //! Throughput across all dtypes. Best-of-N to reject thermal throttling.
-//! Run: `cargo run --release --example bench`.
+//! Run: `cargo run --release --example bench`. An argument keeps only the rows
+//! whose name contains it (`-- q4`), so a row can be measured cold.
 
 use std::time::Instant;
 
@@ -54,6 +55,11 @@ fn best<F: FnMut()>(m: usize, n: usize, k: usize, mut f: F) -> f64 {
 /// point, so the call would re-pack the whole weight set and report packing cost
 /// rather than kernel throughput.
 fn row(name: &str, mut f: impl FnMut(usize, usize, usize) -> Option<f64>) {
+    if let Some(want) = std::env::args().nth(1)
+        && !name.to_lowercase().contains(&want.to_lowercase())
+    {
+        return;
+    }
     print!("{name:<16}");
     for &(m, n, k) in SIZES {
         match f(m, n, k) {
@@ -91,7 +97,7 @@ fn main() {
     int_rows(c);
     println!("\nTF/s (integer rows are TOPS), same 2*M*N*K op count throughout.");
     println!("f16/bf16 = native 16-bit MOPA (M5); f16/f32 and bf16/f32 = widening.");
-    println!("1x4096x4096 is the decode shape -- one row against a resident weight");
+    println!("1x4096x4096 is the m = 1 shape -- one row against a resident weight");
     println!("set, so it is bandwidth-bound and only pre-packed paths can run it.");
 }
 

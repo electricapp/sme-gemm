@@ -16,6 +16,7 @@
 
 #include "attention.h"
 #include "epilogue.h"
+#include "panel_ring.h"
 
 // Pack one 16-wide band into [k, 16]: dst[d*16 + i] = src[i, d]. Two NEON fast
 // paths for the full-16-lane case (a scalar transpose was the dominant
@@ -98,7 +99,7 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p32, const float *bi
 // (0=lo-M x lo-N, 1=lo-M x hi-N, 2=hi-M x lo-N, 3=hi-M x hi-N). A NARROW-N tile
 // (nc <= 16) has the hi-N band all zero-pad, so za1/za3 are dead; a NARROW-M
 // tile (mr <= 16) has the hi-M band all-pad, so za2/za3 are dead. Issuing only
-// the live quadrants halves MOPA issue on those decode/GEMV shapes (the store,
+// the live quadrants halves MOPA issue on those small-m shapes (the store,
 // which reads ZA by nc/mr predicates, is unaffected). The dispatch is hoisted
 // out of the K-loop, so the inner loop stays branch-free.
 #define F32_STEP_FULL(al, ah, bl, bh)                                                              \
@@ -164,7 +165,9 @@ static size_t f32_nc_blk(size_t k, size_t n_tiles) {
 
 // m <= 4: SME2 multi-vector FMLA into ZA vector groups instead of MOPA; see
 // run_gemv in gemm_f16f16.c. 16-column bands, two per 32-wide tile; `abc` is
-// [rows][k][16] broadcast A.
+// [rows][k][16] broadcast A; b_pack points at tile nt_lo. The bound is FMLA
+// issue (~3 cycles per vg1x4, measured), and the P-cluster's one SME unit is
+// shared, so more threads do not raise it.
 #define GEMV_MAXR 2 // f32 MOPA issues ~2x the FMLA rate, so the crossover is lower
 __arm_locally_streaming __arm_new("za") static void run_gemv(float *dst, long dst_rs,
                                                              const float *abc, size_t rows,
@@ -186,7 +189,7 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(float *dst, long ds
     // Two tiles (four bands) per pass, so rows x bands <= 16 vector groups.
     for (size_t nt = nt_lo; nt < nt_hi; nt += 2) {
         size_t T = nt_hi - nt < 2 ? 2 * (nt_hi - nt) : 4; // bands
-        const float *b = b_pack + 2 * nt * per_band;
+        const float *b = b_pack + 2 * (nt - nt_lo) * per_band;
         svzero_za();
         if (T == 4) {
             for (size_t d = 0; d < kfull; d += 4) {
@@ -257,10 +260,143 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(float *dst, long ds
     }
 }
 
+// Row-major-B GEMV read in place (`b_rm` is column nt_lo*32, row stride b_rs).
+// One load is four bands at one depth, so it takes the tuple-by-vector FMLA,
+// which issues ~25% faster than run_gemv's tuple-by-tuple form; group (r, g, p)
+// holds band group g's depth phase p. Loads go depth-major across the pass's
+// band groups: down one band group at a power-of-two stride every load hits the
+// same L2 bank (1.8x slower, measured). Each band still sums its four depth
+// phases in run_gemv's order, so the two agree bit for bit.
+//
+// One pass's accumulate, inlined per row count (see gemm_f16f16.c's twin).
+__attribute__((always_inline)) static inline void
+gemv_rm_acc(size_t rows, const float *b, long b_rs, const float *abc, size_t per_band, size_t k,
+            size_t G, svcount_t pc0, svcount_t pc1, svcount_t pc2,
+            svcount_t pc3) __arm_streaming __arm_inout("za") {
+    svbool_t p32 = svptrue_b32();
+    svcount_t pn = svptrue_c32();
+    size_t BG = 4 / rows, kfull = k & ~(size_t)3;
+#define GEMV_FMLA(r, p, a_)                                                                        \
+    if (rows > (r)) {                                                                              \
+        uint32_t w = (uint32_t)(4 * (r) * BG + (p));                                               \
+        svmla_single_za32_f32_vg1x4(w, B0, a_);                                                    \
+        if (G > 1) svmla_single_za32_f32_vg1x4(w + 4, B1, a_);                                     \
+        if (G > 2) svmla_single_za32_f32_vg1x4(w + 8, B2, a_);                                     \
+        if (G > 3) svmla_single_za32_f32_vg1x4(w + 12, B3, a_);                                    \
+    }
+#define GEMV_ROW(p, row, AV)                                                                       \
+    {                                                                                              \
+        svfloat32x4_t B0 = svld1_f32_x4(pc0, (row)), B1 = B0, B2 = B0, B3 = B0;                    \
+        if (G > 1) B1 = svld1_f32_x4(pc1, (row) + 64);                                             \
+        if (G > 2) B2 = svld1_f32_x4(pc2, (row) + 128);                                            \
+        if (G > 3) B3 = svld1_f32_x4(pc3, (row) + 192);                                            \
+        GEMV_FMLA(0, p, AV(0))                                                                     \
+        GEMV_FMLA(1, p, AV(1))                                                                     \
+    }
+    size_t d = 0;
+    for (; d < kfull; d += 4) {
+        const float *b0 = b + (long)d * b_rs;
+        svfloat32x4_t A0 = svld1_f32_x4(pn, abc + d * 16), A1 = A0;
+        if (rows > 1) A1 = svld1_f32_x4(pn, abc + per_band + d * 16);
+#define AV0(r) svget4(A##r, 0)
+#define AV1(r) svget4(A##r, 1)
+#define AV2(r) svget4(A##r, 2)
+#define AV3(r) svget4(A##r, 3)
+        GEMV_ROW(0, b0, AV0)
+        GEMV_ROW(1, b0 + b_rs, AV1)
+        GEMV_ROW(2, b0 + 2 * b_rs, AV2)
+        GEMV_ROW(3, b0 + 3 * b_rs, AV3)
+#undef AV0
+#undef AV1
+#undef AV2
+#undef AV3
+    }
+#define AVT(r) svld1_f32(p32, abc + (r) * per_band + d * 16)
+    for (; d < k; d++)
+        GEMV_ROW(d - kfull, b + (long)d * b_rs, AVT)
+#undef AVT
+#undef GEMV_ROW
+#undef GEMV_FMLA
+}
+
+__arm_locally_streaming __arm_new("za") static void run_gemv_rm(
+    float *dst, long dst_rs, const float *abc, size_t rows, const float *b_rm, long b_rs, size_t n,
+    size_t k, size_t nt_lo, size_t nt_hi, float alpha, float beta, int read_dst,
+    const ep_desc_f32 *ep) {
+    svbool_t p32 = svptrue_b32();
+    const svfloat32_t va = svdup_n_f32(alpha);
+    const svfloat32_t vb = svdup_n_f32(beta);
+    int has_ep = ep && ep->n_nodes > 0;
+    int pure = (beta == 1.0f && !read_dst && !has_ep);
+    const EpNode *nodes = has_ep ? ep->nodes : NULL;
+    uint32_t n_nodes = has_ep ? ep->n_nodes : 0;
+    size_t per_band = ep_cmul(k, 16); // the stride between abc rows
+    size_t BG = 4 / rows;             // band groups (64 columns, two tiles) per pass
+    for (size_t nt = nt_lo; nt < nt_hi; nt += 2 * BG) {
+        size_t G = (nt_hi - nt + 1) / 2 < BG ? (nt_hi - nt + 1) / 2 : BG;
+        const float *b = b_rm + (nt - nt_lo) * 32;
+        svcount_t pc0 = svwhilelt_c32((uint64_t)nt * 32, (uint64_t)n, 4);
+        svcount_t pc1 = svwhilelt_c32((uint64_t)nt * 32 + 64, (uint64_t)n, 4);
+        svcount_t pc2 = svwhilelt_c32((uint64_t)nt * 32 + 128, (uint64_t)n, 4);
+        svcount_t pc3 = svwhilelt_c32((uint64_t)nt * 32 + 192, (uint64_t)n, 4);
+        svzero_za();
+        if (rows == 1)
+            gemv_rm_acc(1, b, b_rs, abc, per_band, k, G, pc0, pc1, pc2, pc3);
+        else
+            gemv_rm_acc(2, b, b_rs, abc, per_band, k, G, pc0, pc1, pc2, pc3);
+        for (size_t r = 0; r < rows; r++)
+            for (size_t g = 0; g < G; g++) {
+                uint32_t w = (uint32_t)(4 * (r * BG + g));
+                svfloat32x4_t Q0 = svread_za32_f32_vg1x4(w), Q1 = svread_za32_f32_vg1x4(w + 1);
+                svfloat32x4_t Q2 = svread_za32_f32_vg1x4(w + 2), Q3 = svread_za32_f32_vg1x4(w + 3);
+                size_t T = 2 * (nt_hi - nt) - 4 * g < 4 ? 2 * (nt_hi - nt) - 4 * g : 4; // bands
+                size_t ntg = nt + 2 * g;
+            // Tile i = bands 2i, 2i+1, each its four phase partials in run_gemv's order.
+#define GEMV_BAND(j)                                                                               \
+    svadd_x(p32, svadd_x(p32, svget4(Q0, j), svget4(Q1, j)),                                       \
+            svadd_x(p32, svget4(Q2, j), svget4(Q3, j)))
+#define GEMV_ST(i)                                                                                 \
+    if (2 * i < T) {                                                                               \
+        size_t n0 = (ntg + i) * 32;                                                                \
+        size_t nc = n - n0 < 32 ? n - n0 : 32;                                                     \
+        svbool_t plo = svwhilelt_b32((uint32_t)0, (uint32_t)(nc < 16 ? nc : 16));                  \
+        svbool_t phi = svwhilelt_b32((uint32_t)0, (uint32_t)(nc > 16 ? nc - 16 : 0));              \
+        svfloat32_t lo = GEMV_BAND(2 * i), hi = GEMV_BAND(2 * i + 1);                              \
+        float *rp = dst + (long)r * dst_rs + n0;                                                   \
+        float *rph = nc > 16 ? rp + 16 : rp;                                                       \
+        if (pure) {                                                                                \
+            svst1_f32(plo, rp, lo);                                                                \
+            svst1_f32(phi, rph, hi);                                                               \
+        } else if (has_ep) {                                                                       \
+            EP_STORE_TILE_ROWMAJOR_F32(p32, plo, phi, rp, dst_rs, EP_GEMV_RDL, EP_GEMV_RDH, 0, 1,  \
+                                       vb, va, read_dst, nodes, n_nodes, r, n0);                   \
+        } else {                                                                                   \
+            lo = svmul_x(p32, lo, vb);                                                             \
+            hi = svmul_x(p32, hi, vb);                                                             \
+            if (read_dst) {                                                                        \
+                lo = svmla_x(p32, lo, svld1_f32(plo, rp), va);                                     \
+                hi = svmla_x(p32, hi, svld1_f32(phi, rph), va);                                    \
+            }                                                                                      \
+            svst1_f32(plo, rp, lo);                                                                \
+            svst1_f32(phi, rph, hi);                                                               \
+        }                                                                                          \
+    }
+#define EP_GEMV_RDL(s) lo
+#define EP_GEMV_RDH(s) hi
+                GEMV_ST(0)
+                GEMV_ST(1)
+#undef EP_GEMV_RDL
+#undef EP_GEMV_RDH
+#undef GEMV_ST
+#undef GEMV_BAND
+            }
+    }
+}
+
 // [nt_lo, nt_hi) is the N-tile sub-range this invocation owns -- pass
 // (0, n_tiles) for the whole problem, or a slice for the N-parallel flat-M path
-// (see the driver). f32 N-tiles are independent (no dual-tile lockstep), so any
-// chunk granularity is safe.
+// (see the driver); b_pack points at super-tile nt_lo's bands. f32 N-tiles are
+// independent (no dual-tile lockstep), so any chunk granularity is safe.
 __arm_locally_streaming __arm_new("za") static void run_streaming(
     float *dst, long dst_cs, long dst_rs, const float *a_pack, const float *b_pack, size_t m,
     size_t n, size_t mt_lo, size_t mt_hi, size_t nt_lo, size_t nt_hi, size_t k, float alpha,
@@ -269,6 +405,7 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     const svfloat32_t z32 = svdup_n_f32(0.0f);
     const svfloat32_t va = svdup_n_f32(alpha);
     const svfloat32_t vb = svdup_n_f32(beta);
+    svcount_t pn32 = svptrue_c32();
     size_t per_tile = ep_cmul(k, 16);
     int col_major = (dst_rs == 1);
     int row_major = (dst_cs == 1);
@@ -313,8 +450,8 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                 size_t mr_lo = mr < 16 ? mr : 16;
                 size_t mr_hi = mr > 16 ? mr - 16 : 0;
                 for (size_t nt = jc; nt < jc_end; nt++) {
-                    const float *b_lo = b_pack + (size_t)(2 * nt) * per_tile;
-                    const float *b_hi = b_pack + (size_t)(2 * nt + 1) * per_tile;
+                    const float *b_lo = b_pack + (size_t)(2 * (nt - nt_lo)) * per_tile;
+                    const float *b_hi = b_lo + per_tile;
                     size_t n0 = nt * 32;
                     size_t nc = n - n0 < 32 ? n - n0 : 32;
 
@@ -359,6 +496,21 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                             F32_STEP_NARROW_M(al, bl, bh);
                         }
                     } else {
+                        // One multi-vector LD1W per band: 4 depth-vectors a load.
+                        for (; d + 4 <= k; d += 4) {
+                            svfloat32x4_t AL = svld1_f32_x4(pn32, a_lo + d * 16);
+                            svfloat32x4_t AH = svld1_f32_x4(pn32, a_hi + d * 16);
+                            svfloat32x4_t BL = svld1_f32_x4(pn32, b_lo + d * 16);
+                            svfloat32x4_t BH = svld1_f32_x4(pn32, b_hi + d * 16);
+                            F32_STEP_FULL(svget4(AL, 0), svget4(AH, 0), svget4(BL, 0),
+                                          svget4(BH, 0));
+                            F32_STEP_FULL(svget4(AL, 1), svget4(AH, 1), svget4(BL, 1),
+                                          svget4(BH, 1));
+                            F32_STEP_FULL(svget4(AL, 2), svget4(AH, 2), svget4(BL, 2),
+                                          svget4(BH, 2));
+                            F32_STEP_FULL(svget4(AL, 3), svget4(AH, 3), svget4(BL, 3),
+                                          svget4(BH, 3));
+                        }
                         for (; d + 2 <= k; d += 2) {
                             svfloat32_t al0 = svld1_f32(p32, a_lo + d * 16);
                             svfloat32_t ah0 = svld1_f32(p32, a_hi + d * 16);
@@ -674,6 +826,273 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
                             int read_dst, const float *lhs, long lhs_cs, long lhs_rs,
                             const float *b_pack, float alpha, float beta, const ep_desc_f32 *ep);
 
+// GEMV operand: abc[r][d*16 + j] = A[r, d], in the per-thread A scratch.
+static float *bcast_rows(const float *a, long rs, long cs, size_t m, size_t k) {
+    size_t per_band = ep_cmul(k, 16);
+    float *abc = apack_scratch(ep_cmul(ep_cmul(m, per_band), sizeof(float)));
+    if (!abc) return NULL;
+    for (size_t r = 0; r < m; r++)
+        for (size_t d = 0; d < k; d++) {
+            float32x4_t v = vdupq_n_f32(a[(long)r * rs + (long)d * cs]);
+            float32x4x4_t q = {{v, v, v, v}};
+            vst1q_f32_x4(abc + r * per_band + d * 16, q);
+        }
+    return abc;
+}
+
+// Pack super-tiles [t0, t1) of B into consecutive band pairs at dst.
+static void pack_b_range(float *dst, const float *b, long rs, long cs, size_t n, size_t k,
+                         size_t t0, size_t t1) {
+    size_t per_tile = ep_cmul(k, 16);
+    for (size_t st = 2 * t0; st < 2 * t1; st++) {
+        size_t c0 = st * 16, vc = c0 < n ? (n - c0 < 16 ? n - c0 : 16) : 0;
+        pack_band(dst + (st - 2 * t0) * per_tile, vc ? b + (long)c0 * cs : b, cs, rs, k, vc);
+    }
+}
+
+static void pack_a_range(float *a_pack, const float *a, long rs, long cs, size_t m, size_t k,
+                         size_t mt0, size_t mt1) {
+    size_t per_tile = ep_cmul(k, 16);
+    for (size_t st = 2 * mt0; st < 2 * mt1; st++) {
+        size_t r0 = st * 16, vr = r0 < m ? (m - r0 < 16 ? m - r0 : 16) : 0;
+        pack_band(a_pack + st * per_tile, vr ? a + (long)r0 * rs : a, rs, cs, k, vr);
+    }
+}
+
+// Row-major B read in place for super-tile nt (`b` is B's column 0, row stride
+// b_rs): its two bands are one 128-byte line per row, so one x2 load per depth
+// feeds the MOPAs and nothing is packed. With `cap` set the pass also writes the
+// bands out packed ([2][k][16]) for the packed kernel to take the other
+// M-tiles, and prefetches B 16 rows ahead: the SME loads alone keep too few
+// misses in flight (128x8192x4096 1.45 -> 2.05 TF/s; neither the 16-bit kernels
+// nor a one-M-tile pass gain from it). See gemm_f16f16.c's twin.
+// Row-major C, no epilogue.
+__arm_locally_streaming __arm_new("za") static void run_direct(float *dst, long dst_rs,
+                                                               const float *a_pack, const float *b,
+                                                               long b_rs, size_t m, size_t n,
+                                                               size_t k, size_t mt_lo, size_t mt_hi,
+                                                               size_t nt, float *cap, float alpha,
+                                                               float beta, int read_dst) {
+    svbool_t p32 = svptrue_b32();
+    svcount_t pn = svptrue_c32();
+    const svfloat32_t z32 = svdup_n_f32(0.0f);
+    const svfloat32_t va = svdup_n_f32(alpha);
+    const svfloat32_t vb = svdup_n_f32(beta);
+    int pure = (beta == 1.0f && !read_dst);
+    size_t per_tile = ep_cmul(k, 16), kfull = k & ~(size_t)3;
+    const float *bt = b + nt * 32;
+    svcount_t pc = svwhilelt_c32((uint64_t)nt * 32, (uint64_t)n, 2);
+    size_t n0 = nt * 32, nc = n - n0 < 32 ? n - n0 : 32;
+    svbool_t plo = svwhilelt_b32((uint32_t)0, (uint32_t)(nc < 16 ? nc : 16));
+    svbool_t phi = svwhilelt_b32((uint32_t)0, (uint32_t)(nc > 16 ? nc - 16 : 0));
+    for (size_t mt = mt_lo; mt < mt_hi; mt++, cap = NULL) {
+        const float *a_lo = a_pack + 2 * mt * per_tile, *a_hi = a_lo + per_tile;
+        size_t m0 = mt * 32, mr = m - m0 < 32 ? m - m0 : 32;
+        svzero_za();
+#define DIRECT_B(row, d)                                                                           \
+    if (cap) __builtin_prefetch((row) + 16 * b_rs);                                                \
+    svfloat32x2_t B_ = svld1_f32_x2(pc, (row));                                                    \
+    if (cap) {                                                                                     \
+        svst1_f32(p32, cap + (d) * 16, svget2(B_, 0));                                             \
+        svst1_f32(p32, cap + per_tile + (d) * 16, svget2(B_, 1));                                  \
+    }
+#define DIRECT_FULL(al, ah, row, d)                                                                \
+    {                                                                                              \
+        DIRECT_B(row, d)                                                                           \
+        F32_STEP_FULL(al, ah, svget2(B_, 0), svget2(B_, 1));                                       \
+    }
+#define DIRECT_NARROW(al, row, d)                                                                  \
+    {                                                                                              \
+        DIRECT_B(row, d)                                                                           \
+        F32_STEP_NARROW_M(al, svget2(B_, 0), svget2(B_, 1));                                       \
+    }
+        size_t d = 0;
+        if (mr > 16) {
+            for (; d < kfull; d += 4) {
+                svfloat32x4_t AL = svld1_f32_x4(pn, a_lo + d * 16);
+                svfloat32x4_t AH = svld1_f32_x4(pn, a_hi + d * 16);
+                const float *r = bt + (long)d * b_rs;
+                DIRECT_FULL(svget4(AL, 0), svget4(AH, 0), r, d)
+                DIRECT_FULL(svget4(AL, 1), svget4(AH, 1), r + b_rs, d + 1)
+                DIRECT_FULL(svget4(AL, 2), svget4(AH, 2), r + 2 * b_rs, d + 2)
+                DIRECT_FULL(svget4(AL, 3), svget4(AH, 3), r + 3 * b_rs, d + 3)
+            }
+            for (; d < k; d++)
+                DIRECT_FULL(svld1_f32(p32, a_lo + d * 16), svld1_f32(p32, a_hi + d * 16),
+                            bt + (long)d * b_rs, d)
+        } else {
+            for (; d < kfull; d += 4) {
+                svfloat32x4_t AL = svld1_f32_x4(pn, a_lo + d * 16);
+                const float *r = bt + (long)d * b_rs;
+                DIRECT_NARROW(svget4(AL, 0), r, d)
+                DIRECT_NARROW(svget4(AL, 1), r + b_rs, d + 1)
+                DIRECT_NARROW(svget4(AL, 2), r + 2 * b_rs, d + 2)
+                DIRECT_NARROW(svget4(AL, 3), r + 3 * b_rs, d + 3)
+            }
+            for (; d < k; d++)
+                DIRECT_NARROW(svld1_f32(p32, a_lo + d * 16), bt + (long)d * b_rs, d)
+        }
+#undef DIRECT_NARROW
+#undef DIRECT_FULL
+#undef DIRECT_B
+        float *row = dst + (long)m0 * dst_rs + (long)n0;
+        for (size_t r = 0; r < mr; r++, row += dst_rs) {
+            uint32_t s = (uint32_t)(r & 15);
+            if (pure && r < 16) {
+                svst1_hor_za32(0, s, plo, row);
+                svst1_hor_za32(1, s, phi, row + 16);
+            } else if (pure) {
+                svst1_hor_za32(2, s, plo, row);
+                svst1_hor_za32(3, s, phi, row + 16);
+            } else {
+                svfloat32_t lo = r < 16 ? svread_hor_za32_f32_m(z32, p32, 0, s)
+                                        : svread_hor_za32_f32_m(z32, p32, 2, s);
+                svfloat32_t hi = r < 16 ? svread_hor_za32_f32_m(z32, p32, 1, s)
+                                        : svread_hor_za32_f32_m(z32, p32, 3, s);
+                lo = svmul_x(p32, lo, vb);
+                hi = svmul_x(p32, hi, vb);
+                if (read_dst) {
+                    lo = svmla_x(p32, lo, svld1_f32(plo, row), va);
+                    hi = svmla_x(p32, hi, svld1_f32(phi, row + 16), va);
+                }
+                svst1_f32(plo, row, lo);
+                svst1_f32(phi, row + 16, hi);
+            }
+        }
+    }
+}
+
+// Per-worker column items, as gemm_f16f16.c's run_cols: each worker packs its own
+// two super-tiles of B and multiplies them while they are in cache; the first
+// units pack A by M-chunk.
+static int run_cols(float *dst, long dst_cs, long dst_rs, const float *a, long lhs_rs, long lhs_cs,
+                    size_t m, size_t n, size_t k, float alpha, float beta, int read_dst,
+                    const float *b, long rhs_rs, long rhs_cs, const ep_desc_f32 *ep) {
+    size_t per_tile = ep_cmul(k, 16);
+    size_t m_tiles = (m + 31) / 32, n_tiles = (n + 31) / 32;
+    // Row-major B and C, no epilogue: multiply straight from B's rows (run_direct).
+    // Unlike f16 this wins at power-of-two strides too (128x8192x4096: 2.1
+    // against 1.7 TF/s through the pack).
+    int direct = rhs_cs == 1 && dst_cs == 1 && rhs_rs > 0 && !(ep && ep->n_nodes);
+    // Super-tiles per item. Packed, wider items lose 10-50% at small m; direct,
+    // one pass down B per item beats two adjacent ones (0.9-0.95x of packed
+    // against 0.8-0.87x).
+    size_t NC = direct ? 1 : 2;
+    size_t M_CHUNK = 2, n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
+    size_t n_items = (n_tiles + NC - 1) / NC, n_units = n_chunks + n_items;
+    size_t W = n_units < 12 ? n_units : 12;
+    size_t panel = ep_cmul(2 * NC, per_tile);
+    _Atomic size_t *ctr;
+    float *pool = (float *)ring_pool(2 + n_chunks, ep_cmul(ep_cmul(W, panel), sizeof(float)), &ctr);
+    float *a_pack = apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(float)));
+    if (!pool || !a_pack) return -1;
+    _Atomic size_t *cur = ctr, *a_cnt = ctr + 1, *a_done = ctr + 2;
+    dispatch_apply(W, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t w) {
+      float *bt = pool + w * panel;
+      for (size_t i; (i = atomic_fetch_add_explicit(cur, 1, memory_order_relaxed)) < n_units;) {
+          if (i < n_chunks) {
+              size_t mt1 = (i + 1) * M_CHUNK < m_tiles ? (i + 1) * M_CHUNK : m_tiles;
+              pack_a_range(a_pack, a, lhs_rs, lhs_cs, m, k, i * M_CHUNK, mt1);
+              atomic_store_explicit(&a_done[i], 1, memory_order_release);
+              atomic_fetch_add_explicit(a_cnt, 1, memory_order_release);
+              continue;
+          }
+          size_t t0 = (i - n_chunks) * NC, t1 = t0 + NC < n_tiles ? t0 + NC : n_tiles, mt_lo = 0;
+          if (direct) {
+              // M-tile 0 multiplies straight from B's rows, capturing the bands
+              // when more M-tiles follow; those run the packed kernel.
+              while (!atomic_load_explicit(&a_done[0], memory_order_acquire))
+                  __builtin_arm_yield();
+              for (size_t t = t0; t < t1; t++)
+                  run_direct(dst, dst_rs, a_pack, b, rhs_rs, m, n, k, 0, 1, t,
+                             m_tiles > 1 ? bt + 2 * (t - t0) * per_tile : NULL, alpha, beta,
+                             read_dst);
+              mt_lo = 1;
+          } else {
+              pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, t1);
+          }
+          // All of A packed: one pass. Otherwise M-chunk by M-chunk as each lands.
+          int all = atomic_load_explicit(a_cnt, memory_order_acquire) == n_chunks;
+          for (size_t ci = 0; ci < (all ? 1 : n_chunks); ci++) {
+              size_t mt0 = all ? 0 : ci * M_CHUNK;
+              size_t mt1 = all ? m_tiles : (mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
+              if (mt0 < mt_lo) mt0 = mt_lo;
+              if (mt0 >= mt1) continue;
+              if (!all)
+                  while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+                      __builtin_arm_yield();
+              run_streaming(dst, dst_cs, dst_rs, a_pack, bt, m, n, mt0, mt1, t0, t1, k, alpha, beta,
+                            read_dst, ep);
+          }
+      }
+    });
+    return 0;
+}
+
+// Large A: B is built per N-block into a panel ring (panel_ring.h) and shared by
+// every M-chunk, as gemm_f16f16.c's run_panels.
+static int run_panels(float *dst, long dst_cs, long dst_rs, const float *a, long lhs_rs,
+                      long lhs_cs, size_t m, size_t n, size_t k, float alpha, float beta,
+                      int read_dst, const float *b, long rhs_rs, long rhs_cs,
+                      const ep_desc_f32 *ep) {
+    size_t per_tile = ep_cmul(k, 16), tile = 2 * per_tile;
+    size_t m_tiles = (m + 31) / 32, n_tiles = (n + 31) / 32;
+    // 4 MB B-blocks, as f16: three ring slots of the run_packed-sized 12 MB block
+    // overflow L2 (0.93-0.96x at 4096^3 and 4096x11008x4096, against 0.98-0.99).
+    size_t nc_blk = ((size_t)4 << 20) / ep_cmul(tile, sizeof(float));
+    if (nc_blk < 1) nc_blk = 1;
+    if (nc_blk > n_tiles) nc_blk = n_tiles;
+    size_t n_blocks = (n_tiles + nc_blk - 1) / nc_blk;
+    nc_blk = (n_tiles + n_blocks - 1) / n_blocks; // even split
+    size_t M_CHUNK = 2, n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
+    size_t n_sub = (RING_ITEMS + n_chunks - 1) / n_chunks;
+    if (n_sub > nc_blk) n_sub = nc_blk;
+    size_t ns = (nc_blk + n_sub - 1) / n_sub; // super-tiles per subrange
+    n_sub = (nc_blk + ns - 1) / ns;
+    size_t n_slots = n_blocks < RING_SLOTS ? n_blocks : RING_SLOTS;
+    size_t dt = tile ? ((size_t)1 << 16) / tile : 1; // super-tiles per build unit
+    if (dt < 1) dt = 1;
+    if (dt > nc_blk) dt = nc_blk;
+    size_t n_d = (nc_blk + dt - 1) / dt;
+    size_t slot_elems = ep_cmul(nc_blk, tile);
+    _Atomic size_t *ctr;
+    float *pool = (float *)ring_pool(2 * n_blocks + 2 + n_chunks,
+                                     ep_cmul(ep_cmul(n_slots, slot_elems), sizeof(float)), &ctr);
+    float *a_pack = apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(float)));
+    if (!pool || !a_pack) return -1;
+    _Atomic size_t *a_done = ctr + 2 * n_blocks + 2;
+    if (n_chunks <= 1) pack_a_range(a_pack, a, lhs_rs, lhs_cs, m, k, 0, m_tiles);
+
+    ring_run(
+        n_blocks, n_d, n_chunks * n_sub, ctr,
+        ^(size_t sd, size_t j) {
+          size_t lo = sd * nc_blk, hi = lo + nc_blk < n_tiles ? lo + nc_blk : n_tiles;
+          size_t t0 = lo + j * dt, t1 = t0 + dt < hi ? t0 + dt : hi;
+          if (t0 < t1)
+              pack_b_range(pool + (sd % RING_SLOTS) * slot_elems + (t0 - lo) * tile, b, rhs_rs,
+                           rhs_cs, n, k, t0, t1);
+        },
+        ^(size_t sg, size_t j) {
+          size_t lo = sg * nc_blk, hi = lo + nc_blk < n_tiles ? lo + nc_blk : n_tiles;
+          size_t ci = j / n_sub, sj = j % n_sub;
+          size_t mt0 = ci * M_CHUNK, mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
+          size_t n0 = lo + sj * ns < hi ? lo + sj * ns : hi, n1 = n0 + ns < hi ? n0 + ns : hi;
+          // Block 0's first item per M-chunk packs that chunk of A.
+          if (n_chunks > 1 && sg == 0 && sj == 0) {
+              pack_a_range(a_pack, a, lhs_rs, lhs_cs, m, k, mt0, mt1);
+              atomic_store_explicit(&a_done[ci], 1, memory_order_release);
+          } else if (n_chunks > 1) {
+              while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+                  __builtin_arm_yield();
+          }
+          if (n0 < n1)
+              run_streaming(dst, dst_cs, dst_rs, a_pack,
+                            pool + (sg % RING_SLOTS) * slot_elems + (n0 - lo) * tile, m, n, mt0,
+                            mt1, n0, n1, k, alpha, beta, read_dst, ep);
+        });
+    return 0;
+}
+
 int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long dst_rs,
                      int read_dst, const float *lhs, long lhs_cs, long lhs_rs, const float *rhs,
                      long rhs_cs, long rhs_rs, float alpha, float beta, const ep_desc_f32 *ep) {
@@ -682,6 +1101,24 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
 
     size_t m_tiles = (m + 31) / 32;
     size_t per_tile = ep_cmul(k, 16);
+
+    if (m <= GEMV_MAXR && dst_cs == 1 && rhs_cs == 1 && rhs_rs > 0 && !ep_has_reduce(ep)) {
+        // Row-major B: the GEMV reads it in place, nothing to pack.
+        float *abc = bcast_rows(lhs, lhs_rs, lhs_cs, m, k);
+        if (!abc) return -1;
+        size_t n_tiles = (n + 31) / 32, G_CHUNK = 8, g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
+        if (ep_flops(m, n, k) < (1u << 21) || g_chunks < 3) {
+            run_gemv_rm(dst, dst_rs, abc, m, rhs, rhs_rs, n, k, 0, n_tiles, alpha, beta, read_dst,
+                        ep);
+            return 0;
+        }
+        dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
+          size_t nt0 = ci * G_CHUNK, nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
+          run_gemv_rm(dst, dst_rs, abc, m, rhs + nt0 * 32, rhs_rs, n, k, nt0, nt1, alpha, beta,
+                      read_dst, ep);
+        });
+        return 0;
+    }
 
     // Small + row-major B: load B direct (no B pack -- B[d,n0..] is contiguous).
     // Serial when a single chunk; otherwise a light dispatch over both clusters
@@ -763,6 +1200,16 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
     }
 #undef PACKA_SMALL
 
+    // Build B inside the parallel GEMM rather than packing it all first. A
+    // reduction spans all of N, so it keeps the one-block path below.
+    if (m > GEMV_MAXR && !ep_has_reduce(ep) && ep_flops(m, n, k) >= (1u << 21)) {
+        if (use_cols(m, n, ep_cmul(ep_cmul(m, k), sizeof(float))))
+            return run_cols(dst, dst_cs, dst_rs, lhs, lhs_rs, lhs_cs, m, n, k, alpha, beta,
+                            read_dst, rhs, rhs_rs, rhs_cs, ep);
+        return run_panels(dst, dst_cs, dst_rs, lhs, lhs_rs, lhs_cs, m, n, k, alpha, beta, read_dst,
+                          rhs, rhs_rs, rhs_cs, ep);
+    }
+
     // B packed once, shared across chunks (the reused operand).
     float *b_pack = (float *)malloc(ep_cmul(gemm_sme_f32_packed_b_elems(n, k), sizeof(float)));
     if (!b_pack) return -1;
@@ -820,14 +1267,8 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
     int big = ep_flops(m, n, k) >= (1u << 21);
     if (m <= GEMV_MAXR && dst_cs == 1 && !ep_has_reduce(ep)) {
-        float *abc = apack_scratch(ep_cmul(ep_cmul(m, per_tile), sizeof(float)));
+        float *abc = bcast_rows(lhs, lhs_rs, lhs_cs, m, k);
         if (!abc) return -1;
-        for (size_t r = 0; r < m; r++)
-            for (size_t d = 0; d < k; d++) {
-                float32x4_t v = vdupq_n_f32(lhs[(long)r * lhs_rs + (long)d * lhs_cs]);
-                float32x4x4_t q = {{v, v, v, v}};
-                vst1q_f32_x4(abc + r * per_tile + d * 16, q);
-            }
         size_t G_CHUNK = 4; // tiles per chunk
         size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
         if (!big || g_chunks < 3) {
@@ -837,7 +1278,8 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
         dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
           size_t nt0 = ci * G_CHUNK;
           size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
-          run_gemv(dst, dst_rs, abc, m, b_pack, n, k, nt0, nt1, alpha, beta, read_dst, ep);
+          run_gemv(dst, dst_rs, abc, m, b_pack + 2 * nt0 * per_tile, n, k, nt0, nt1, alpha, beta,
+                   read_dst, ep);
         });
         return 0;
     }
@@ -859,8 +1301,8 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
             dispatch_apply(nn_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
               size_t nt0 = ci * N_CHUNK;
               size_t nt1 = nt0 + N_CHUNK < n_tiles ? nt0 + N_CHUNK : n_tiles;
-              run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, 0, m_tiles, nt0, nt1, k, alpha,
-                            beta, read_dst, ep);
+              run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack + 2 * nt0 * per_tile, m, n, 0,
+                            m_tiles, nt0, nt1, k, alpha, beta, read_dst, ep);
             });
             free(a_pack);
             return 0;
@@ -898,8 +1340,8 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
       size_t mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
       size_t jc_end = jc + nc_blk < n_tiles ? jc + nc_blk : n_tiles;
       if (n_blocks == 1) PACKA_RANGE(a_pack, mt0, mt1);
-      run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt0, mt1, jc, jc_end, k, alpha, beta,
-                    read_dst, ep);
+      run_streaming(dst, dst_cs, dst_rs, a_pack, b_pack + 2 * jc * per_tile, m, n, mt0, mt1, jc,
+                    jc_end, k, alpha, beta, read_dst, ep);
     });
 #undef PACKA_RANGE
     free(a_pack);

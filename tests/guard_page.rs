@@ -111,7 +111,7 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (32, 32, 32),
     (65, 65, 97),    // > 2^18, ragged everywhere
     (65, 97, 129),   // > 2^18, ragged everywhere
-    (64, 16, 2048),  // narrow-N decode path
+    (64, 16, 2048),  // narrow-N path
     (16, 1024, 129), // N-heavy, ragged K
 ];
 

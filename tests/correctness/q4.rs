@@ -183,6 +183,84 @@ fn q4_blocks_and_affine_match_eager_dequant() {
     }
 }
 
+// More N-blocks than panel slots (slot reuse), the N-split GEMM items at small m,
+// a K tail off the 4-row unpack group, block < 4 and an odd tile count; f16 and
+// bf16, each exact against eager dequant through the dense kernel.
+#[test]
+fn q4_panel_ring_matches_eager_dequant() {
+    use half::bf16;
+    use sme_gemm::{
+        Q4Params, Q4Weights, dequant_q4_bf16_with, dequant_q4_with, matmul_bf16_packed,
+        matmul_f16_packed, matmul_q4, matmul_q4_bf16,
+    };
+    if !caps().sme_f16f16 {
+        return;
+    }
+    for &(m, n, k, block) in &[
+        (40usize, 4200usize, 2050usize, 2usize),
+        (200, 4100, 2048, 32),
+        (96, 4130, 1027, 1),
+    ] {
+        for affine in [false, true] {
+            let p = if affine {
+                Q4Params::new(block).affine()
+            } else {
+                Q4Params::new(block)
+            };
+            let nbk = k.div_ceil(block);
+            let mut s = 0x5a5a_0001u64 ^ ((m * 131 + n * 17 + k + block) as u64);
+            let mut byte = || {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (s >> 40) as u8
+            };
+            let quants: Vec<u8> = (0..(k * n).div_ceil(2)).map(|_| byte()).collect();
+            let scales: Vec<f16> = (0..n * nbk)
+                .map(|i| f16::from_f32(0.01 + 0.001 * (i % 7) as f32))
+                .collect();
+            let mins: Vec<f16> = (0..n * nbk)
+                .map(|i| f16::from_f32(0.05 * (i % 5) as f32 - 0.1))
+                .collect();
+            let mv = affine.then_some(&mins[..]);
+            let a: Vec<f16> = (0..m * k)
+                .map(|i| f16::from_f32((i % 13) as f32 * 0.05 - 0.3))
+                .collect();
+            let w = Q4Weights::with_params(&quants, &scales, mv, n, k, p);
+            let mut want = vec![f16::ZERO; m * n];
+            matmul_f16_packed(
+                &a,
+                &dequant_q4_with(&quants, &scales, mv, n, k, p),
+                &mut want,
+                m,
+            );
+            let mut got = vec![f16::ZERO; m * n];
+            matmul_q4(&a, &w, &mut got, m);
+            for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "q4 {m}x{n}x{k} block={block} affine={affine} idx={idx}: {g} vs {w}"
+                );
+            }
+            if !caps().sme_b16b16 {
+                continue;
+            }
+            let ab: Vec<bf16> = a.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
+            let mut want = vec![bf16::ZERO; m * n];
+            let bp = dequant_q4_bf16_with(&quants, &scales, mv, n, k, p);
+            matmul_bf16_packed(&ab, &bp, &mut want, m);
+            let mut got = vec![bf16::ZERO; m * n];
+            matmul_q4_bf16(&ab, &w, &mut got, m);
+            for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "q4 bf16 {m}x{n}x{k} block={block} affine={affine} idx={idx}: {g} vs {w}"
+                );
+            }
+        }
+    }
+}
+
 // The bf16 Q4 kernel, over the same block sizes and both code forms: the
 // 4-bit-resident bf16 path must agree with eagerly dequantizing the same
 // weights to bf16 and running the plain bf16 GEMM. The same Q4Weights (f16

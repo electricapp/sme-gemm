@@ -23,6 +23,7 @@ fn main() {
 /// though they are never compiled on their own.
 const CSRC: &[&str] = &[
     "transpose16.h",
+    "panel_ring.h",
     "epilogue.h",
     "epilogue_scalar.h",
     "epilogue_f16.h",

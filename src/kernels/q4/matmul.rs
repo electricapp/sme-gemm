@@ -154,8 +154,8 @@ fn q4_bf16_impl(a: &[bf16], w: &Q4Weights, c: &mut [bf16], m: usize, ep: &Epilog
         } else {
             &raw const desc
         };
-        // The m <= 4 kernel folds the scale per K-block in bf16.
-        let (sb, mb) = if m <= 4 {
+        // The GEMV kernel (m <= 7, Q4_GEMV_MAXR) folds the scale per K-block in bf16.
+        let (sb, mb) = if m <= 7 {
             let (sb, mb) = w.bf16_scales();
             (
                 sb.as_ptr(),

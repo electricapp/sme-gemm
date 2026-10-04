@@ -80,7 +80,7 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p64, const double *b
 // (0=lo-M x lo-N, 1=lo-M x hi-N, 2=hi-M x lo-N, 3=hi-M x hi-N; 8-wide bands).
 // NARROW-N (nc <= 8) leaves the hi-N band all zero-pad -> za1/za3 dead; NARROW-M
 // (mr <= 8) leaves the hi-M band all-pad -> za2/za3 dead. Skipping the dead
-// quadrants halves MOPA issue on decode/GEMV shapes (the store reads ZA by
+// quadrants halves MOPA issue on small-m shapes (the store reads ZA by
 // nc/mr predicates, so it is unaffected); the dispatch is hoisted out of the
 // K-loop. f64 at tiny N is bandwidth-bound, so the win is modest, but the dead
 // work is removed with no downside.

@@ -24,7 +24,7 @@ pub struct Q4Weights {
     /// Tile-major offsets, same shape as `scales`; empty for
     /// [`Q4Form::Scale`](super::Q4Form::Scale).
     pub(super) mins: Vec<u16>,
-    /// `scales` and `mins` as bf16, built on the first bf16 decode call.
+    /// `scales` and `mins` as bf16, built on the first small-m bf16 call.
     pub(super) bf16_scales: OnceLock<(Vec<u16>, Vec<u16>)>,
     pub(super) n: usize,
     pub(super) k: usize,
@@ -147,33 +147,28 @@ impl Q4Weights {
     /// would otherwise shadow it on every M5).
     #[must_use]
     pub(crate) fn dequant_to_rowmajor(&self) -> Vec<f16> {
-        self.dequant_rowmajor_f32()
-            .into_iter()
-            .map(f16::from_f32)
-            .collect()
+        self.dequant_rowmajor(f16::from_f64)
     }
 
     /// [`Q4Weights::dequant_to_rowmajor`] rounded to bf16 instead -- the
-    /// [`matmul_q4_bf16`] fallback. Rounds once from the f32 product, so it is
-    /// not the f16 result re-rounded.
+    /// [`matmul_q4_bf16`] fallback. Rounds through f32, as the bf16 kernel does,
+    /// so it is not the f16 result re-rounded.
     #[must_use]
     pub(crate) fn dequant_to_rowmajor_bf16(&self) -> Vec<bf16> {
-        self.dequant_rowmajor_f32()
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect()
+        #[allow(clippy::cast_possible_truncation)]
+        self.dequant_rowmajor(|w| bf16::from_f32(w as f32))
     }
 
-    /// The unpack itself, before the output rounding: `scale*code (+ min)` in
-    /// f32, row-major `k x n`.
-    fn dequant_rowmajor_f32(&self) -> Vec<f32> {
+    /// The unpack itself: `scale*code (+ min)`, exact in f64, handed to `round`;
+    /// row-major `k x n`.
+    fn dequant_rowmajor<T: Copy + Default>(&self, round: impl Fn(f64) -> T) -> Vec<T> {
         let (n, k) = (self.n, self.k);
         let block = self.params.block;
         let nbk = k.div_ceil(block);
         let n_tiles = n.div_ceil(32);
         let nib_per_tile = k * 16;
         let sc_per_tile = nbk * 32;
-        let mut b = vec![0.0f32; k * n];
+        let mut b = vec![T::default(); k * n];
         for t in 0..n_tiles {
             for d in 0..k {
                 for c in 0..32 {
@@ -189,11 +184,11 @@ impl Q4Weights {
                     };
                     let code = i32::from(nib) - if nib < 8 { 0 } else { 16 };
                     let bi = t * sc_per_tile + (d / block) * 32 + c;
-                    let mut w = f16::from_bits(self.scales[bi]).to_f32() * code as f32;
+                    let mut w = f16::from_bits(self.scales[bi]).to_f64() * f64::from(code);
                     if !self.mins.is_empty() {
-                        w += f16::from_bits(self.mins[bi]).to_f32();
+                        w += f16::from_bits(self.mins[bi]).to_f64();
                     }
-                    b[d * n + j] = w;
+                    b[d * n + j] = round(w);
                 }
             }
         }
@@ -240,11 +235,11 @@ mod tests {
                 };
                 let code = i32::from(nib) - if nib < 8 { 0 } else { 16 };
                 let bi = j * nbk + d / p.block();
-                let mut w = scales[bi].to_f32() * code as f32;
+                let mut w = scales[bi].to_f64() * f64::from(code);
                 if let Some(mv) = mins {
-                    w += mv[bi].to_f32();
+                    w += mv[bi].to_f64();
                 }
-                b[idx] = f16::from_f32(w);
+                b[idx] = f16::from_f64(w);
             }
         }
         b

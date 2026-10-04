@@ -91,7 +91,7 @@ fn flat_m_n_parallel_branch() {
     }
 }
 
-// Narrow-N decode path: n_tiles==1 (n<=32) row-major routes to run_narrow_rowmajor
+// Narrow-N path: n_tiles==1 (n<=32) row-major routes to run_narrow_rowmajor
 // (pairs two M-tiles against the single B-tile). The pure store is covered by the
 // default SIZES; this also covers the node-major EPILOGUE store in the narrow path,
 // for f16 AND bf16. m=96 -> 3 M-tiles: one pair + one unpaired (exercises the
@@ -99,7 +99,7 @@ fn flat_m_n_parallel_branch() {
 // structured reference C[i][j] = k*(i%3-1)*(j%3-1) is exact (and j-dependent, so a
 // column/tile-misindexing bug is caught).
 #[test]
-fn narrow_n_decode() {
+fn narrow_n_rowmajor() {
     use sme_gemm::{Gemm, prepack_bf16, prepack_f16};
     if !caps().sme_f16f16 {
         return;
@@ -184,7 +184,7 @@ fn narrow_n_decode() {
 // M-tiles: one pair + one unpaired), for raw i32 AND dequant. Exact integer
 // reference (|C| <= 128), j-dependent so a column/tile-misindex is caught.
 #[test]
-fn i8_narrow_decode() {
+fn i8_narrow_n() {
     use sme_gemm::{Dequant, matmul_i8_packed, matmul_i8_packed_dequant, prepack_i8};
     if !caps().sme {
         return;

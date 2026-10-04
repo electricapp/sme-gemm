@@ -48,171 +48,101 @@ follow from the differences.
 
 ### 2.1 Multi-cluster dispatch
 
-The kernels parallelize with `dispatch_apply`: M is chunked into tiles and the
-chunks go to `dispatch_get_global_queue`, which runs them on every core. The
-P-cluster unit does almost all of the work; an E thread holding a chunk is a
-straggler (measured per CPU with `pthread_cpu_number_np`: ~0.15 TF/s against
-~1.3 for a P thread when all ten are busy), so no SME loop may carry a dispatch
-barrier per iteration (§2.4).
+The kernels parallelize with `dispatch_apply` on the global queue, which runs
+work on every core of both clusters. Nearly all SME throughput is the P unit:
+with all ten cores busy an E thread runs ~9× slower than a P thread. Two rules
+follow everywhere:
 
-Chunks are finer than pure L2 residency would pick (`M_CHUNK = 2` tiles) so
-`dispatch_apply` can work-steal instead of stalling on the slower E-cluster: ~5%
-geomean, and 9–13% at 256³/512³/4096³, against 4 tiles per chunk. The value must
-stay even, because `run_narrow_rowmajor` pairs M-tiles and an odd chunk would
-idle `za1`.
+- Work is cut into items small enough that an E thread holding one only delays
+  the tail. M-chunks are two tiles (`M_CHUNK = 2`, kept even because
+  `run_narrow_rowmajor` pairs M-tiles).
+- No SME loop carries a dispatch barrier or waits on one specific item. Items
+  are claimed off atomic cursors, so a fast worker takes whatever is ready next
+  (§2.4, §2.9).
 
 ### 2.2 Flat-M parallelism
 
-M is normally the only parallel axis, so a wide flat-M problem — few M-tiles,
-large N and K, the decode and small-batch shape — would run on one cluster. The
-f16f16 and b16b16 packed paths detect this and parallelize over N instead: pack
-all of A once into a shared buffer, then hand even-aligned N-tile-pair chunks
-(`N_CHUNK = 4`) to both clusters. C columns per chunk are disjoint, A and B are
-read-only and shared, and the even alignment keeps a dual-tile pair intact.
-`run_streaming` carries an `[nt_lo, nt_hi)` N-tile range for this.
-
-The split needs at least three chunks to pay. A 2-way split is slower than no
-split: running serially instead measures 1.03–1.15× across n=160..256,
-k=512..16384, m=1..64 on both dtypes, reaching parity by k=32768 where
-B-streaming dominates. With two chunks the makespan is the E-cluster half, which
-exceeds the cost of running everything on the caller's cluster; from three
-chunks up, work-stealing balances the halves. Hence the `nn_chunks >= 3` gate.
-The affected band is narrow: `nn_chunks == 2` means `n_tiles_pad` in [5,8], so n
-in [129,256].
-
-This does not generalize to the M-chunk path, where a 2-way split wins — forcing
-it serial measures 0.78–0.97×. M-chunks pack their own A slice, so a second
-cluster overlaps NEON packing with MOPA issue, while flat-M chunks are pure MOPA
-against an A-pack built up front. The allocator is not the cause either:
-replacing the flat-M `malloc` with the thread-local scratch used by the serial
-path measures 1.00–1.01×.
+When M has too few tiles to split, the f16f16 and b16b16 packed paths
+parallelize over N instead: A is packed once into a shared buffer and
+even-aligned N-tile-pair chunks (`N_CHUNK = 4`) go to both clusters, through the
+`[nt_lo, nt_hi)` range `run_streaming` takes. The split needs at least three
+chunks: with two, the makespan is the E-cluster's half, which costs more than
+running the call on the caller's cluster. The M-chunk path has no such floor,
+because its chunks pack their own A slice and a second cluster overlaps that
+NEON pack with MOPA issue.
 
 ### 2.3 Small- and large-problem paths
 
-`dispatch_apply` entry and exit and the streaming-mode transition cost a few µs
-each, which dominates small problems. Each kernel forks:
+Dispatch and the streaming transition cost a few µs each, so the kernels fork by
+size:
 
-- **Direct-load B.** B is read straight from a row-major `rhs`, skipping the
-  pack entirely — worth more than the packing it saves, since packing reads and
-  writes all of B before a single MOPA issues. The cost is that B is re-read
-  once per M-tile, so the gate is B's own footprint (`n*k*elem`), not the
-  problem size: at equal flop counts a small-B shape prefers this path and a
-  large-B one collapses on it. Blocking the path over N does not raise the
-  limit, because a block still walks K at stride `n` and so covers B's whole
-  address range; making that range contiguous is what packing is for. The f64
-  budget is well under f32's, its N-tile being 8 lanes rather than 32.
-- **Packed B, multi-cluster.** B packed once, a shared `malloc`'d A-pack, and
-  `dispatch_apply` over M-chunks.
+- **Direct-load B** (f32, f64; B under a footprint budget). B is read straight
+  from a row-major `rhs` with no pack. It is re-read once per M-tile, so the
+  gate is B's footprint (`n*k*elem`), not the flop count: packing is what makes
+  a large B's address range contiguous. f64's budget is smaller, its N-tile
+  being 8 lanes.
+- **Packed B.** B pre-packed by the caller or built inside the parallel region
+  (§2.10); A packed per M-chunk.
 
-Within the direct-load path the split is serial vs. `dispatch_apply` over
-M-chunks, on a flop floor rather than a chunk count: below a few MFLOP the
-dispatch costs more than the second cluster returns, and two shapes that chunk
-identically can want opposite answers.
+Direct-load runs serially below a flop floor and dispatches above it. Its chunks
+are claimed off a shared cursor by a pool one worker short of the chunk count,
+so a P worker comes back for the spare instead of the call ending on an E
+worker; below four chunks the pool is the chunk count. Each worker packs the A
+chunk it is about to compute, so the pack overlaps MOPA issue.
 
-When it does dispatch, chunks are **claimed off a shared atomic cursor** rather
-than handed out one per worker, and the pool is deliberately one worker short of
-the chunk count. Give every worker exactly one chunk and the call ends on the
-slowest, which is an E-cluster worker every time; leaving a chunk spare lets a
-P-cluster worker come back for it, so the faster cluster absorbs more of the
-problem. Below four chunks there is nothing left to steal and holding a worker
-back only under-subscribes the machine, so the pool is the chunk count there.
-Each worker packs the chunk it is about to compute, which keeps the pack
-overlapping MOPA issue — hoisting it into its own pass to allow finer scheduling
-costs more than the balance it buys.
+The f32 A-pack goes through ZA while A is cache-resident: a vertical ZA load
+writes a tile column and a horizontal store reads a row, so 32 instructions
+transpose a 16×16 block, where the NEON 4×4 transpose is issue-bound at about
+one instruction per float. Once A is DRAM-sized the NEON path's memory-level
+parallelism wins, so the ZA pack is gated on A's footprint.
 
-The A-pack itself runs through ZA rather than NEON while A is cache-resident. A
-vertical ZA load writes a memory vector into a tile _column_ and a horizontal
-store reads a _row_ back, so sixteen of each transpose a 16×16 block: 32
-instructions per 256 floats, against the NEON 4×4 transpose's 16 loads, 16
-stores and ~32 shuffles. That matters because the NEON transpose is issue-bound
-at about one instruction per float and cannot be tuned past it. Once A is
-DRAM-sized the NEON path's wider memory-level parallelism wins the trade back,
-so the ZA pack is gated on A's footprint.
-
-Rust has an analogous floor. `sme_worth_it(m,n,k)` requires
-`has_sme() && k >= 2` plus a flop minimum that depends on how much of a ZA tile
-the output fills: MOPA accumulates into a 32×32 tile whatever the shape, so a
-1×1 product still pays for 1024 lanes, and vector-shaped work loses to the
-scalar reference no matter how large `k` is. From `m*n >= 8` upward the padding
-is amortized and the floor drops to `1<<12`; below it the original `1<<18`
-stands.
-
-The floor applies only where the fallback costs O(m·n·k). For the pre-packed
-weight types, `Packed<T>` and `Q4Weights`, the fallback must unpack the weights
-first, which costs O(n·k) regardless of m — so gating them makes the small
-shapes the floor protects slower, not faster. Those paths dispatch on capability
-alone (`packed.sme`, `caps().sme_f16f16`) with no flop test. Dropping the gate
-from Q4 measured 2.3–3.9× on decode-shaped calls.
+Rust's `sme_worth_it(m,n,k)` requires `has_sme() && k >= 2` and a flop floor:
+`1<<12` once `m*n >= 8`, `1<<18` below, since a MOPA pays for a whole 32×32 tile
+whatever the output shape. The floor applies only where the fallback is
+O(m·n·k). `Packed<T>` and `Q4Weights` would have to unpack their weights first
+(O(n·k) regardless of m), so they dispatch on capability alone.
 
 ### 2.4 Cache blocking
 
-The large path adds BLIS-style `jc→ic→mt→nt` blocking so each packed panel
-streams from DRAM once rather than once per opposing tile.
+The packed path uses BLIS-style `jc→ic→mt→nt` blocking, so each packed panel
+streams from DRAM once rather than once per opposing tile. The `jc` loop sits
+outside the M-chunks, so one B-block serves every M-chunk while it is
+L2-resident, and the (N-block, M-chunk) pairs run as one flat `dispatch_apply`
+in block-major order (GCD hands out indices in order). A dispatch per block
+would wait on its E-thread chunks every block. A reduction epilogue spans all of
+N and keeps a single block.
 
-In every driver the `jc` loop sits **outside** the M-chunks, so one B-block
-serves every M-chunk while it is still L2-resident. Nested the other way each
-chunk sweeps all of B and B leaves L2 before the next chunk reaches it, so
-packed B is re-streamed from DRAM once per chunk — 1.2–1.5× lost on i16 and the
-native 16-bit kernels at 1024×16384×8192. A reduction epilogue spans all of N
-and so keeps a single block.
-
-The (N-block, M-chunk) pairs run as one flat `dispatch_apply` in block-major
-order (GCD hands out indices in order), with A packed in a pass of its own when
-there is more than one block. A `dispatch_apply` per block instead waits on its
-E-thread chunks every block: 0.45× on f16→f32 1024×16384×8192.
-
-Block sizes come from a per-dtype byte budget: `nc_blk`/`mc_blk` count whole
-32-wide super-tiles, and `tile_bytes` is the full super-tile — two packed
-16-lane bands in the widening/int kernels, or the single tile in f16f16/b16b16
-where the tile is the super-tile — so the budget equals total resident bytes
-(A-block + B-block).
+Block sizes come from a per-dtype byte budget over whole 32-wide super-tiles
+(one tile in f16f16/b16b16, two packed bands in the others), counting A-block
+plus B-block:
 
 | kernels              | budget |
 | -------------------- | ------ |
 | f16f16, b16b16       | 8 MB   |
 | widening 16-bit, int | 16 MB  |
 | f32, f64             | 24 MB  |
-| Q4                   | 16 MB  |
 
-The budget is sized to the smaller cluster. Chunks dispatch to both, and on M5
-the E-cluster L2 is 6 MB against the P-cluster's 16
-(`hw.perflevel1/0.l2cachesize`), so a P-sized block thrashes the E workers. For
-MOPA-bound dense shapes the constant barely matters: sweeping f16f16/b16b16 over
-8/16/24 MB from 2048³ through 1024×8192×8192 moves nothing outside ±3% noise,
-and not monotonically, and f32 behaves the same over 12–24 MB once the `jc` loop
-is hoisted. Q4 is the exception, because there the budget also sets how many
-full dequant passes a shape pays — 16 MB is worth 2–6% for m ≥ 992, where 8 MB
-forces a second M-block and therefore a second dequant of the whole weight set.
-
-When the whole problem fits, the blocks span everything and the outer loops run
-once, at no cost over the flat path.
+Budgets are sized to the smaller cluster, since chunks go to both and the M5
+E-cluster L2 is 6 MB against the P-cluster's 16. Dense MOPA-bound shapes are
+insensitive to the constant. When the problem fits, the outer loops run once.
 
 ### 2.5 Streaming regions contain only MOPA
 
-Streaming-mode SVE is tuned for MOPA, and scalar code inside a streaming region
-runs at roughly a tenth of its normal rate. The measured cost, per site:
-
-| site                            | scalar in streaming | vectorized outside it                      |
-| ------------------------------- | ------------------- | ------------------------------------------ |
-| `softmax_rows`                  | 21 ms / 16.8M f32   | 1.2 ms — parallel NEON, `csrc/attention.c` |
-| batched fused dequant, i8 / i16 | 1678 / 1720 µs      | 52 / 75 µs — vectorized ZA store           |
-| Q4 tile dequant                 | 44.4 ms             | 2.05 ms — hoisted out, NEON, threaded      |
-
-A `__arm_streaming` or `__arm_locally_streaming` function should contain MOPAs,
-ZA reads and writes, and the vectorized store epilogue, and nothing else.
-Per-cell scalar loops (`ep_dequant_cell*`) survive only where no alternative
-exists: streaming mode has no scatter store, so a strided `dst` still needs a
-scalar write, and even there the dequant and op-graph run vectorized into a
-contiguous row first.
-
-Work that cannot be vectorized in place belongs outside the region rather than
-inside it. `run_q4` is an ordinary function that dequantizes a tile pair and
-calls `run_q4_pair`, which is locally-streaming and does only MOPA and store.
-Hoisting it also makes it threadable across independent N-tile pairs.
+Scalar code inside a streaming region runs at roughly a tenth of its normal
+rate, so an `__arm_streaming` or `__arm_locally_streaming` function contains
+MOPAs, ZA reads and writes, and the vectorized store epilogue. Elementwise work
+that does not map onto ZA runs outside the region: the attention softmax is
+parallel NEON in `csrc/attention.c`. Elementwise work that does map onto ZA
+stays in: the Q4 unpack is LUTI4, an FMLA into ZA and a MOVA out (§2.9).
+Per-cell scalar loops (`ep_dequant_cell*`) survive only for a strided `dst`,
+since streaming mode has no scatter store, and even there the dequant and
+op-graph run vectorized into a contiguous row first.
 
 Vectorizing such a loop with SVE in place is not an option: with ZA live across
 the call, Apple clang 21 aborts with
 `Invalid size request on a scalable vector`, and `noinline` does not avoid it.
+The same abort fires on an SVE load from `base + (d >> shift) * 32` in a
+streaming loop; stepping a separate block counter avoids it.
 
 ### 2.6 Operand packing
 
@@ -236,17 +166,10 @@ Two rules hold across the layer:
 
 - **Walk the panel depth-outer.** A store that strides one lane-row is a cache
   line, so a lane-outer loop re-walks the whole `k × lanes` panel once per lane.
-  At m=1 that is 32 passes over a 256 KB panel to place a single row, 31 of them
-  writing zero padding.
 - **Scalar fillers are for edges only** — ragged bands, odd-K slices, and
   layouts with neither stride equal to 1. A fast path gated on the full-band
-  case sends every narrow-M call down the scalar path, which is where latency
-  matters most.
-
-Packing only shows up in a measurement when the packed operand is a large
-fraction of the traffic: probe the A pack with `m ≫ n` and the B pack with
-`n ≫ m`. A square or B-dominated shape reports no change for an A-pack fix worth
-1.4× where it applies.
+  case would send every narrow-M call down the scalar path, which is where
+  latency matters most.
 
 ### 2.7 Flash attention
 
@@ -254,58 +177,117 @@ fraction of the traffic: probe the A pack with `m ≫ n` and the B pack with
 block, loop over key blocks computing `S = QKᵀ` with a strided GEMM, fold `S`
 into the running per-row max and sum, then accumulate `O += P·V` with a second
 GEMM. Only a `block_m × block_n` score tile is live at a time, so traffic is
-O(m·d + n·d + n·dv) rather than O(m·n). The softmax passes live in
-`csrc/attention.c` and are parallel NEON, not streaming SVE (§2.5).
+O(m·d + n·d + n·dv) rather than O(m·n). The softmax passes are parallel NEON
+(§2.5); the row-max sweep hides behind the memory-bound exp pass, so it is not
+fused into the GEMM.
 
 `FlashParams::auto` keeps the whole score matrix in one tile while it fits a 4M
 f32 budget, then uses key tiles of 1024 with as many queries as fit. Query
-tiling is the last thing to give, since it re-reads K and V once per query
-block.
+tiling gives last, since it re-reads K and V once per query block.
 
-The score block and accumulators are thread-local buffers reused across calls.
-At the auto cap the score block is 16 MB, so allocating per call costs an mmap
-and its page faults: 0.09–0.15 ms regardless of shape, which weighs most where
-flash is cheapest (1.04–1.13× at 512²–2048², ~1.01× by 8192²). Requests above
-the cap allocate locally, so a caller cannot pin an arbitrarily large buffer to
-a thread for the process lifetime. The buffer is taken out of its cell rather
-than borrowed, so a re-entrant call allocates instead of panicking.
+The score block and accumulators are thread-local buffers reused across calls,
+because allocating up to 16 MB per call costs an mmap and its page faults.
+Requests above the cap allocate locally, so a caller cannot pin an arbitrarily
+large buffer to a thread. The buffer is taken out of its cell rather than
+borrowed, so a re-entrant call allocates instead of panicking.
 
-The buffers are never cleared, because every element is written before it is
-read. Debug builds poison a reused buffer with all-ones — a NaN for f32, f16 and
-bf16 — to keep that invariant enforced, since the natural way to break it is
-silent: on the first key block `corr` is 0, so `acc = corr*acc + t` discards
-finite garbage and only a non-finite value would surface. Removing the `acc`
-fill passes the suite in release and fails three tests in debug.
+The buffers are never cleared: every element is written before it is read. Debug
+builds poison a reused buffer with all-ones (a NaN in f32, f16 and bf16) to keep
+that invariant enforced, since breaking it is otherwise silent — on the first
+key block `corr` is 0, so `acc = corr*acc + t` discards finite garbage.
 
-Fusing the row-max into the first GEMM does not pay. Skipping the max sweep
-entirely, an upper bound on any fusion, measures 1.00–1.06×, mostly 1.00×: its
-loads are already hidden behind the memory-bound exp pass. For the same reason,
-giving that sweep four accumulators rather than one changes nothing — it is
-bound by load throughput, not by the serial `vmaxnm` chain.
+### 2.8 Small m: ZA-vector GEMV
 
-### 2.8 Decode: ZA-vector GEMV
+With one live row a MOPA spends 1/32 of its work (1/16 for the 16×16 tiles), so
+for m ≤ 4 (m ≤ 2 for f32, m = 1 for f64 and i16, whose MOPA issues twice as
+fast) the drivers use SME2 multi-vector ops into ZA vector groups instead, with
+A broadcast once per call. The B layout picks the form:
 
-With one live row a MOPA spends 1/32 of its work (1/16 for the 16x16 tiles), so
-decode shapes run out of MOPA issue before DRAM bandwidth. For m ≤ 4 (m ≤ 2 for
-f32, m = 1 for f64 and i16, whose MOPA issues twice as fast) the packed drivers
-use SME2 multi-vector ops into ZA vector groups instead: one FMLA (SDOT for the
-ints) takes four consecutive depths of a B band — a single x4 load — against
-four broadcast copies of A, built once per call. Vector group `4r+t` holds row
-r, band t; the store sums its four vectors. That is a quarter of the ZA-unit
-instructions per byte of B, and the large decode shapes now run at the DRAM roof
-(~135 GB/s): 1.3–1.9× on f16/bf16/i8, 2.5–4× where B is cache-resident.
+- **Packed B.** One x4 load is four consecutive depths of a band, taken by a
+  tuple-by-tuple FMLA (SDOT for the ints) against four broadcast depths of A.
+  Group `4r+t` holds row r, band t, one vector per depth phase; the store sums
+  the four.
+- **Row-major B, not pre-packed** (`run_gemv_rm`). B is read in place: one x4
+  load is four adjacent bands at one depth, which takes the tuple-by-vector
+  FMLA, ~25% faster to issue. Group `(r, g, p)` holds band group g's depth phase
+  p, so each band sums the same phases in the same order and the two forms agree
+  bit for bit. Loads go depth-major across up to four column groups, because
+  walking one group down a power-of-two row stride puts every load in the same
+  L2 bank. The row count is a constant in each inlined copy of the loop; a
+  runtime count spills.
 
-Q4 decode decodes nibbles in the streaming region with LUTI4 from a ZT0 table
+Packed B runs at the DRAM roof once B is DRAM-sized. Where B is cache-resident
+it is bound by the tuple-by-tuple FMLA rate of the P-cluster's one SME unit,
+which more threads do not raise, so the in-place form is the faster of the two
+there.
+
+The Q4 GEMV expands nibbles in the streaming region with LUTI4 from a ZT0 table
 (one 64-byte load gives four depths of a 32-column tile, in natural order). The
 scale factors out of each K-block, so the block sums raw codes in groups 0-3
 (and 8-11), folds `acc*scale` (+`min*sum(A)`) into totals in groups 4-7 (and
 12-15) at the block edge, and one `ZERO {za0-3.d}` clears the block sums — a
 vg1x4 group w lies in ZA64 tile w%8. bf16 folds with a bf16 copy of the scales,
-built once per weight set. 7–10× over the dequantize-then-MOPA path.
+built once per weight set. Q4 keeps the GEMV to m ≤ 7, not 4, because its MOPA
+path also pays the panel unpack.
 
-Q4 prefill with a small B (≤ 8 MB as f16) and ≥ ~600³ of work dequantizes all of
-B once in parallel and runs the dense packed driver, whose M-chunks balance the
-clusters; the tile path parallelizes over N-pairs only.
+### 2.9 Q4 MOPA path: one shared unpack per B-block
+
+Above the GEMV rows, Q4 unpacks each N-block of B once into a three-slot ring of
+f16 (or bf16) panels and multiplies it with the dense `run_streaming`, so the
+result is bit for bit eager dequant plus the dense GEMM. The unpack stays in the
+streaming region and is all ZA work: LUTI4 turns a 64-byte load into four depths
+of a tile, one FMLA per four depths adds `code*scale` onto ZA holding zero or
+the min, and MOVA plus a 4-vector store write it out — 32 depths per `ZERO`.
+bf16 must round once from f32, so there FMLAL widens `code*scale` exactly into
+f32 ZA; its layout splits each row into even and odd columns, and BFCVTN
+interleaves them back while rounding. The affine f16 form rounds
+`scale*code + min` once, and the eager `dequant_q4_with` computes it exactly in
+f64 to match. The unpack costs about one 32-row M-tile of MOPA issue per weight
+tile, shared across all of M.
+
+Scheduling lives in `csrc/panel_ring.h` (shared with §2.10). Build units and
+GEMM items are two cursors that persistent workers pull from: a build unit is
+ready once its slot's previous block is fully multiplied, a GEMM item once its
+block is built, and a worker takes whichever is ready (building first while
+fewer than two blocks lead the GEMM cursor). Nothing waits on one specific item,
+because E-core items run 5–47× slower and any P worker parked behind one stalls
+the call. GEMM items are M-chunk × N-subrange, at least 32 per block, so no
+single item is long. Block 0's first item per M-chunk packs that chunk of A.
+
+### 2.10 B not pre-packed
+
+A call that does not pre-pack B (`matmul_f16`, `gemm_f32`, …) builds B inside
+the parallel region rather than packing it all on the calling thread first. The
+f16, bf16, widening and f32 drivers pick one of three schedules:
+
+- **Per-worker columns** (`use_cols`: m ≤ 512, or m ≤ 4096 with ≥ 64 N-tiles and
+  A ≤ 8 MB). The first units pack A by M-chunk; each item then takes a narrow
+  N-chunk and multiplies it while it is in that worker's cache. At small m a B
+  tile meets only a few M-chunks, so a shared panel would cost a cross-core
+  (often cross-cluster) round trip per tile for nothing. Each item re-reads all
+  of A and spans all of M, which is why a large A, or a narrow N that leaves a
+  few long items for E-cores to straggle on, goes to the ring instead.
+  - With row-major B and C the item does not pack: its first M-tile multiplies
+    straight from B's rows (`run_direct`), so fetching B overlaps the MOPAs
+    instead of preceding them on the same core. One load is one 128-byte line —
+    two f16 tiles, one f32 super-tile, or (widening) rows 2p and 2p+1 zipped
+    into the interleaved bands; a half-line load costs as much as a full one.
+    When more M-tiles follow, that pass also writes the line out as packed tiles
+    and the rest run the packed kernel on them, because re-walking B's rows per
+    M-tile at a stride that is a multiple of 8 KB puts every load in one L2
+    bank, and two ZA16 tiles leave no second column to interleave. f16/bf16 pack
+    instead at a power-of-two stride from three M-tiles up; f32 and widening
+    always go direct, and f32 prefetches B 16 rows ahead on the capturing pass.
+  - Otherwise the item NEON-packs its N-chunk into a private panel first.
+- **Panel ring** (the rest): §2.9's schedule with a plain copy in place of the
+  unpack. f32 ring blocks are 4 MB rather than `run_packed`'s 12 MB, so three
+  slots fit L2.
+- **In-place GEMV** (m ≤ 4, f32 m ≤ 2, row-major B; §2.8). Other B layouts pack
+  per worker and run the packed GEMV.
+
+Every route keeps each output's K-order identical to the pre-packed entry, and
+the tests check them against it bit for bit, across transposed, strided and
+column-major layouts.
 
 ---
 
@@ -353,10 +335,11 @@ The split is for navigability, not compilation. Each fragment closes over its
 parent's `static` packing helpers, per-thread scratch and typedefs, so it cannot
 be its own TU without exporting all of that, and each is included at exactly the
 point its code would otherwise occupy, leaving the preprocessed TU and the
-generated code unchanged. `csrc/transpose16.h` is the exception: it is a
-genuinely shared header, included by all four 16-bit drivers. Every fragment
-needs an entry in `build.rs`'s `CSRC` list for rerun tracking, since `cc` never
-sees it.
+generated code unchanged. `csrc/transpose16.h` and `csrc/panel_ring.h` are the
+exceptions: genuinely shared headers, the first included by all four 16-bit
+drivers, the second (the §2.9/§2.10 scheduler) by the f16, bf16, widening and
+f32 drivers. Every fragment needs an entry in `build.rs`'s `CSRC` list for rerun
+tracking, since `cc` never sees it.
 
 ### 3.2 The runtime probe
 
@@ -457,16 +440,16 @@ exceptions:
 
 ### Node-major register-resident store
 
-The store is node-major rather than row-major. A row-major store — a ZA read
-plus an out-of-line interpreted node loop per output row, with jump-table
-dispatch and operands reloaded each row — costs ~500K dispatches for a 4096²
-output, enough to make a fused epilogue 1.7–4.5× the bare GEMM. Node-major
-instead reads a 4-row block of the live ZA tile into Z registers and dispatches
-each node once per block across all its rows, hoisting invariant operands (COL
-vectors, scalars, activation constants) out of the per-row loop with no memory
-bounce. The gelu/silu/tanh rational approximation sits in a `noinline` helper so
-the common add/mul/relu nodes still inline. Fused-vs-bare overhead is roughly
-+2..11% when compute-bound and +35% at the shallowest store-bound K.
+The store is node-major: it reads a 4-row block of the live ZA tile into Z
+registers and dispatches each node once per block across all its rows, hoisting
+invariant operands (COL vectors, scalars, activation constants) out of the
+per-row loop with no memory bounce. Interpreting the graph per output row
+instead — an out-of-line node loop with jump-table dispatch and operands
+reloaded each row — would cost ~500K dispatches for a 4096² output. The
+gelu/silu/tanh rational approximation sits in a `noinline` helper so the common
+add/mul/relu nodes still inline. A fused epilogue costs a few percent over the
+bare GEMM when compute-bound and up to about a third at the shallowest
+store-bound K.
 
 ### Bias-init MOPA fold
 
@@ -525,7 +508,7 @@ regresses the relu store, so bias+activation keeps the in-store add.
 
 | suite                  | count | covers                                                        |
 | ---------------------- | ----- | ------------------------------------------------------------- |
-| `tests/correctness/`   | 114   | dtypes, shapes, layouts, packed/batched, epilogue graphs      |
+| `tests/correctness/`   | 120   | dtypes, shapes, layouts, packed/batched, epilogue graphs      |
 | `tests/validation.rs`  | 19    | pre-FFI footprint asserts and panic contracts                 |
 | `tests/proptest.rs`    | 17    | randomized shapes/strides/operands against the oracle         |
 | `tests/guard_page.rs`  | 13    | reads past the declared footprint fault on a `PROT_NONE` page |
@@ -533,7 +516,7 @@ regresses the relu store, so bias+activation keeps the in-store add.
 | doctests               | 5     | the documented API examples                                   |
 | `tests/concurrency.rs` | 4     | one GEMM from many threads, bit-identical, across branches    |
 
-183 total. `tests/correctness/main.rs` holds the shared oracles and shape
+189 total. `tests/correctness/main.rs` holds the shared oracles and shape
 tables: `SIZES`, and `TAIL_SIZES` for shapes that clear the flop floor and have
 ragged M/N/K tails, where tail-predicate handling is exercised.
 `PROPTEST_CASES=N` widens the random sweep for a soak run.
@@ -562,6 +545,13 @@ under test, so the harnesses are built to control for them.
   ratio measured there reflects the floor rather than the change.
 - **A perturbation that does not fail the tests** can mean the code is dead or
   the probe shape falls below a gate, rather than that the change is safe.
+- **Probe a change with the shape it dominates.** A pack change shows up only
+  where the packed operand is most of the traffic: the A pack with `m ≫ n`, the
+  B pack with `n ≫ m`. A square shape reads 1.00× for a fix worth more
+  elsewhere.
+- **Confirm microbenchmarks in the library, under load.** A one-core,
+  L2-resident kernel can rank layouts in the opposite order to the full machine
+  reading DRAM.
 
 Throughput lives in `examples/bench.rs` (per dtype), `epilogue_bench.rs` (fusion
 overhead), `batched_bench.rs`, `q4_bench.rs`, `attention.rs`, `roofline.rs` and

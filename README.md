@@ -86,7 +86,9 @@ matching f16).
   then any epilogue (`matmul_i8_packed_dequant` / `matmul_i16_dequant`).
 - **Batched** — many small `C_i = A_i @ B_i` in one streaming session
   (`matmul_*_batched` / `_ep`).
-- **Pre-packed weights** — `prepack_*` once, reuse.
+- **Pre-packed weights** — `prepack_*` once, reuse. Calls that skip it pack B
+  inside the parallel GEMM (or, for m ≤ 4, read it in place) and land within a
+  few percent of the pre-packed rate on large shapes.
 - **candle** / **burn** adapters (optional features).
 - Scalar reference fallback off Apple.
 
@@ -104,32 +106,32 @@ MACs/instr):
 | -------- | ---- | ---- | ----- | ----- | ----- | ------------ | ------------- | ------------- |
 | f16      | 2.51 | 4.10 | 4.76  | 4.93  | 4.77  | 4.78         | 4.83          | 0.16          |
 | bf16     | 2.46 | 3.20 | 4.75  | 4.94  | 4.75  | 4.77         | 4.82          | 0.16          |
-| f16/f32  | 1.34 | 1.83 | 2.17  | 2.32  | 2.34  | 2.33         | 2.39          | — ²           |
-| bf16/f32 | 1.38 | 1.84 | 2.19  | 2.32  | 2.30  | 2.34         | 2.39          | — ²           |
-| f32      | 1.36 | 1.93 | 2.36  | 2.33  | 2.31  | 2.34         | 2.33          | 0.06          |
+| f16/f32  | 1.30 | 1.82 | 2.34  | 2.45  | 2.48  | 2.31         | 2.39          | — ²           |
+| bf16/f32 | 1.30 | 1.81 | 2.34  | 2.44  | 2.48  | 2.34         | 2.40          | — ²           |
+| f32      | 1.45 | 2.00 | 2.37  | 2.31  | 2.29  | 2.39         | 2.40          | 0.06          |
 | f64      | 0.41 | 0.58 | 0.60  | 0.56  | 0.58  | 0.61         | 0.61          | 0.03          |
 | i8→i32   | 2.42 | 3.41 | 4.75  | 4.98  | 4.99  | 4.66         | 4.88          | 0.56          |
 | i16→i64  | 1.02 | 2.06 | 2.41  | 2.48  | 2.43  | 2.38         | 2.32          | 0.14          |
-| Q4→f16   | 1.77 | 2.78 | 4.26  | 4.68  | 4.45  | 4.53         | 4.74          | 0.48          |
-| Q4→bf16  | 1.70 | 2.73 | 4.26  | 4.64  | 4.47  | 4.42         | 4.74          | 0.47          |
+| Q4→f16   | 1.80 | 3.63 | 4.65  | 4.83  | 4.93  | 4.65         | 4.79          | 0.50          |
+| Q4→bf16  | 1.98 | 3.52 | 4.52  | 4.83  | 4.92  | 4.72         | 4.79          | 0.47          |
 
 **vs. other backends**, unpacked strided GEMM
 (`examples/vs_{accelerate,candle,burn}`, `inference_value`). Accel has no
-f16/`cblas`; † is upcast + `sgemm` + downcast. f16 here is ~4.3 at 2048³ against
-4.9 pre-packed above. Accelerate leads at 256³ (see dispatch table: the call is
-~20 µs, so streaming entry is a real slice) and at 2048³ f32 (B just outgrew the
-skip-packing footprint):
+f16/`cblas`; † is upcast + `sgemm` + downcast. B is packed inside the parallel
+GEMM (ARCHITECTURE.md §2.10), so f16 here is within ~3% of pre-packed from
+2048³. Accelerate leads only at 256³ f32 (see dispatch table: the call is ~20
+µs, so streaming entry is a real slice):
 
 | shape           | sme f32 | accel | candle | burn | sme f16 | accel † | candle | sme f64 | accel |
 | --------------- | ------- | ----- | ------ | ---- | ------- | ------- | ------ | ------- | ----- |
-| 256³            | 1.50    | 1.67  | 0.24   | 0.11 | 1.21    | —       | 0.31   | 0.46    | 0.44  |
-| 512³            | 1.97    | 1.61  | 0.39   | 0.11 | 1.99    | 0.78    | 0.75   | 0.58    | 0.46  |
-| 1024³           | 2.34    | 2.03  | 0.42   | 0.12 | 3.83    | 1.40    | 0.83   | 0.55    | 0.52  |
-| 2048³           | 2.04    | 2.14  | 0.42   | 0.12 | 4.32    | 1.70    | 0.84   | 0.55    | 0.52  |
-| 4096³           | 2.14    | 2.07  | 0.40   | —    | 4.22    | 1.83    | 0.82   | 0.55    | 0.52  |
-| 4096×512×512    | 2.29    | 1.94  | 0.39   | 0.11 | 3.89    | —       | 0.80   | 0.61    | 0.52  |
-| 16384×512×512   | 2.30    | 2.00  | 0.40   | —    | 4.12    | —       | 0.81   | 0.61    | 0.52  |
-| 4096×11008×4096 | —       | —     | —      | —    | 3.32    | 1.89    | —      | —       | —     |
+| 256³            | 1.50    | 1.64  | 0.24   | 0.11 | 1.56    | —       | 0.31   | 0.46    | 0.45  |
+| 512³            | 1.91    | 1.61  | 0.39   | 0.11 | 3.69    | 0.95    | 0.74   | 0.57    | 0.46  |
+| 1024³           | 2.34    | 2.05  | 0.45   | 0.12 | 4.38    | 1.43    | 0.86   | 0.55    | 0.53  |
+| 2048³           | 2.29    | 2.08  | 0.45   | 0.12 | 4.83    | 1.73    | 0.88   | 0.55    | 0.52  |
+| 4096³           | 2.33    | 2.06  | 0.45   | —    | 4.88    | 1.85    | 0.86   | 0.55    | 0.52  |
+| 4096×512×512    | 2.30    | 1.93  | 0.41   | 0.11 | 4.05    | —       | 0.81   | 0.61    | 0.52  |
+| 16384×512×512   | 2.30    | 2.01  | 0.42   | —    | 4.22    | —       | 0.84   | 0.61    | 0.52  |
+| 4096×11008×4096 | —       | —     | —      | —    | 4.88    | 1.91    | —      | —       | —     |
 
 f16 sme at 256³ / 4096×512 / 16384×512 is the candle adapter (no accel† run
 there); the other f16 sme cells are `inference_value`.
@@ -143,15 +145,17 @@ here:
 
 |                | 8³   | 16³  | 32³  | 64³  | 128³ | 256³ | 1×64×64 | 1×256×256 | 1×1024×1024 | 1×4096×4096 |
 | -------------- | ---- | ---- | ---- | ---- | ---- | ---- | ------- | --------- | ----------- | ----------- |
-| P-core (cblas) | 0.07 | 0.20 | 0.23 | 0.51 | 3.2  | 20.5 | 0.05    | 0.37      | 4.8         | 836         |
-| SME (packed)   | 0.45 | 0.38 | 0.42 | 1.5  | 7.9  | 24.9 | 1.2     | 3.6       | 36.9        | 634         |
-| GPU (MPS)      | 187  | 188  | 200  | 158  | 156  | 294  | 188     | 208       | 187         | 805         |
-| ANE (MLC)      | 70   | 79   | 70   | 61   | 64   | 73   | 72      | 62        | 164         | 1981        |
+| P-core (cblas) | 0.05 | 0.19 | 0.27 | 0.49 | 3.3  | 20.2 | 0.05    | 0.35      | 4.5         | 804         |
+| SME (packed)   | 0.37 | 0.42 | 0.61 | 1.8  | 7.6  | 24.8 | 1.1     | 1.3       | 9.9         | 523         |
+| GPU (MPS)      | 195  | 194  | 191  | 203  | 189  | 202  | 194     | 196       | 225         | 751         |
+| ANE (MLC)      | 59   | 77   | 61   | 57   | 66   | 66   | 77      | 61        | 169         | 1685        |
 
-CPU/SME dispatch is sub-µs until the math shows up (~128³). GPU's floor is ~180
-µs of command-buffer + `waitUntilCompleted` (256³ jittered up). ANE's floor is
-~60–80 µs. Decode (`1×4096×4096`, resident B) is bandwidth: packed SME beats
-both Accelerate and a round-trip MPS GEMM.
+CPU/SME dispatch is sub-µs until the math shows up (~128³). GPU's floor is ~190
+µs of command-buffer + `waitUntilCompleted`; ANE's is ~60–80 µs. At
+`1×4096×4096` (one row, resident B) it is bandwidth: packed SME beats both
+Accelerate and a round-trip MPS GEMM. At `1×1024×1024` B is cache-resident and
+the packed f32 GEMV is bound by the one SME unit's FMLA rate (ARCHITECTURE.md
+§2.8); a row-major B that was not pre-packed runs it in ~7 µs.
 
 **Flash attention** (`examples/attention`, `m×n×d`). vs materialized is a
 footprint win (`O(m·d + n·d + n·dv)`), not a speed win, until 4096²:
@@ -174,11 +178,14 @@ footprint win (`O(m·d + n·d + n·dv)`), not a speed win, until 4096²:
 
 |                | m=1 ×4096² | m=16 | m=128 | m=256 | 1024³ |
 | -------------- | ---------- | ---- | ----- | ----- | ----- |
-| q4-resident ms | 0.08       | 0.52 | 1.13  | 2.02  | 0.53  |
-| eager-f16 ms   | 0.36       | 0.35 | 1.06  | 2.01  | 0.46  |
+| q4-resident ms | 0.08       | 0.49 | 1.08  | 1.93  | 0.47  |
+| eager-f16 ms   | 0.25       | 0.35 | 0.93  | 1.78  | 0.46  |
 
-Q4 trades throughput for a 4× smaller resident weight set. On-the-fly dequant is
-`O(n·k)`, so `m=1` is ~1.7× eager; from `m=128` they match.
+Q4 holds a 4× smaller resident weight set. Up to `m=7` it runs the LUTI4 GEMV
+and reads a quarter of eager's bytes (3× at `m=1`). Above that it unpacks each
+weight block once into ZA-built panels, an `O(n·k)` cost whatever `m`: it trails
+eager by 8–40% at `m=16..256`, where eager's 32 MB of f16 stays cache-resident
+between calls, and matches it by 1024³.
 
 |                  | 16³×256 | 32³×128 | 64³×64 | 32×128×64 ×64 | 96³×32 |
 | ---------------- | ------- | ------- | ------ | ------------- | ------ |
@@ -195,9 +202,9 @@ is the floor, not streaming-entry amortization.
 
 Fused i8/i16→f32 dequant + bias + gelu (`examples/dequant_bench`).
 
-- ¹ Decode: one row vs a resident weight set, bandwidth-bound. m ≤ 4 runs a
-  ZA-vector GEMV (SME2 multi-vector FMLA/SDOT, LUTI4 for Q4) at ~130 GB/s of
-  DRAM; the TF/s column understates that.
+- ¹ m = 1: one row vs a resident weight set, bandwidth-bound. m ≤ 4 (Q4: m ≤ 7)
+  runs a ZA-vector GEMV (SME2 multi-vector FMLA/SDOT, LUTI4 for Q4) at ~130 GB/s
+  of DRAM; the TF/s column understates that.
 - ² No pre-packed entry point — the call would re-pack the whole weight set.
 - † No native f16 GEMM; f16 inputs run through f32.
 

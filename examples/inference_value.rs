@@ -49,6 +49,15 @@ fn best<F: FnMut()>(big: bool, mut f: F) -> f64 {
 }
 
 fn main() {
+    // Bring the clocks up first, or the first shape reads ~20% low.
+    let (a, b, mut c) = (
+        vec![f16::ZERO; 1 << 20],
+        vec![f16::ZERO; 1 << 20],
+        vec![f16::ZERO; 1 << 20],
+    );
+    for _ in 0..300 {
+        matmul_f16(&a, &b, &mut c, 1024, 1024, 1024, Accum::F16);
+    }
     // FFN-style GEMM shapes (tokens x hidden).
     let sizes: &[(usize, usize, usize)] = &[
         (512, 512, 512),

@@ -192,7 +192,7 @@ fn time_shape(m: usize, n: usize, k: usize, gpu_ok: bool, ane_ok: bool) -> Shape
     };
 
     // Sequential, not interleaved: a Metal waitUntilCompleted in the same
-    // round disturbs the CPU backends, and the 1×K×K decode numbers would
+    // round disturbs the CPU backends, and the 1×K×K numbers would
     // not match the throughput tables.
     let n_iters = iters(m, n, k);
     let pcore = best_us(n_iters, &mut pcore_fn);

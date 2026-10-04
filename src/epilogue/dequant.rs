@@ -24,7 +24,7 @@ use super::{
 /// post-dequant domain). Order of method calls = order of nodes.
 ///
 /// The op-graph is a read-only view of its operand slices, so it is
-/// `Send + Sync`: one dequant graph can be shared by concurrent decode threads.
+/// `Send + Sync`: one dequant graph can be shared by concurrent threads.
 #[derive(Clone, Debug, Default)]
 pub struct Dequant<'a> {
     pub(crate) scale: f32,
@@ -39,7 +39,7 @@ pub struct Dequant<'a> {
 // SAFETY: same argument as `Epilogue` above -- the node pointers all come from
 // caller-provided `&'a [f32]` operands and are read-only on both sides of the
 // FFI, so sharing a `Dequant` is sharing `&'a [f32]`. This lets one dequant
-// graph (scales/biases) be shared by concurrent decode threads.
+// graph (scales/biases) be shared by concurrent threads.
 // SAFETY: see the argument above -- read-only views of caller f32 slices.
 unsafe impl Send for Dequant<'_> {}
 // SAFETY: as the Send impl above.

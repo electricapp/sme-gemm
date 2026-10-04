@@ -179,25 +179,25 @@ pub fn dequant_q4_with(
     k: usize,
     p: Q4Params,
 ) -> Packed<f16> {
-    let b: Vec<f16> = q4_rowmajor_f32(quants, scales, mins, n, k, p)
-        .into_iter()
-        .map(f16::from_f32)
-        .collect();
+    // `scale*code + min` is exact in f64, so f16 rounds it once.
+    let b = q4_rowmajor(quants, scales, mins, n, k, p, f16::from_f64);
     prepack_f16(&b, n, k)
 }
 
-/// Row-major `k x n` dequant of the caller's Q4 arrays, in f32 before the output
-/// rounding. Shared by the eager f16 and bf16 entry points; validates lengths.
-fn q4_rowmajor_f32(
+/// Row-major `k x n` dequant of the caller's Q4 arrays: each weight is computed
+/// exactly in f64 and handed to `round`. Shared by the eager f16 and bf16 entry
+/// points; validates lengths.
+fn q4_rowmajor<T: Copy + Default>(
     quants: &[u8],
     scales: &[f16],
     mins: Option<&[f16]>,
     n: usize,
     k: usize,
     p: Q4Params,
-) -> Vec<f32> {
+    round: impl Fn(f64) -> T,
+) -> Vec<T> {
     let (kn, nbk) = q4_check(quants, scales, mins, n, k, p);
-    let mut b = vec![0.0f32; kn];
+    let mut b = vec![T::default(); kn];
     for d in 0..k {
         for j in 0..n {
             let idx = d * n + j;
@@ -210,11 +210,11 @@ fn q4_rowmajor_f32(
             // sign-extend the 4-bit code to -8..=7
             let code = i32::from(nib) - if nib < 8 { 0 } else { 16 };
             let bi = j * nbk + d / p.block;
-            let mut w = scales[bi].to_f32() * code as f32;
+            let mut w = scales[bi].to_f64() * f64::from(code);
             if let Some(mv) = mins {
-                w += mv[bi].to_f32();
+                w += mv[bi].to_f64();
             }
-            b[idx] = w;
+            b[idx] = round(w);
         }
     }
     b
@@ -247,9 +247,8 @@ pub fn dequant_q4_bf16_with(
     k: usize,
     p: Q4Params,
 ) -> Packed<bf16> {
-    let b: Vec<bf16> = q4_rowmajor_f32(quants, scales, mins, n, k, p)
-        .into_iter()
-        .map(bf16::from_f32)
-        .collect();
+    // Through f32 first, as the bf16 kernel's f32 unpack rounds.
+    #[allow(clippy::cast_possible_truncation)]
+    let b = q4_rowmajor(quants, scales, mins, n, k, p, |w| bf16::from_f32(w as f32));
     prepack_bf16(&b, n, k)
 }

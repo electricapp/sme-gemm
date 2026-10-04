@@ -60,7 +60,7 @@ static void pack_band(int16_t *dst, const int16_t *src, long lane_stride, long d
 // (0=lo-M x lo-N, 1=lo-M x hi-N, 2=hi-M x lo-N, 3=hi-M x hi-N; 8-wide bands).
 // NARROW-N (nc <= 8) leaves the hi-N band all zero-pad -> za1/za3 dead; NARROW-M
 // (mr <= 8) leaves the hi-M band all-pad -> za2/za3 dead. Issuing only the live
-// quadrants halves SMOPA issue on those decode shapes -- and since i16 SMOPA is
+// quadrants halves SMOPA issue on those small-m shapes -- and since i16 SMOPA is
 // MOPA-issue-bound (unlike the bandwidth-bound f32 path) this is a real win.
 // The store reads ZA by nc/mr predicates, so it is unaffected; the dispatch is
 // hoisted out of the K-loop.
@@ -787,7 +787,7 @@ int gemm_sme_i16i64_run_packed_impl(size_t m, size_t n, size_t k, void *dst, lon
 
     // Flat-M (few M-tiles) but large/wide: M is the only M-chunk axis, so the
     // M-parallel scheme below would run this on ONE cluster -- exactly the
-    // quantized batch-1 decode shape (m small, n/k large). Parallelize over N
+    // quantized small-m shape (n/k large). Parallelize over N
     // instead: pack all of A once (cheap; m_tiles small) into a shared buffer and
     // hand N-tile chunks to both clusters. C columns are disjoint per chunk; A and
     // B (and dq) are read-only and shared. Needs >= 2 chunks to beat serial.
