@@ -97,23 +97,51 @@ static int run_q4_panels_bf16(bf16 *dst, const bf16 *a, const uint8_t *nibbles,
 // time as a 32-row M-tile (measured 1.45x at m=5, 1.06x at 7, 0.96x at 8).
 #define Q4_GEMV_MAXR 7
 
+// As the f16 kernel: with 4 bands or fewer, odd depths go to a second group.
 #define Q4_D1(i, BB)                                                                               \
     for (size_t j = 0; j < (BB); j++)                                                              \
     svmla_lane_za16_bf16_vg1x4(                                                                    \
-        Q4_ACC(j),                                                                                 \
+        Q4_ACC(j + ((BB) <= 4 ? 4 * ((i) & 1) : 0)),                                               \
         svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + j * nib_per_band + (d + (i)) * 64), 0), aq,   \
         (i))
+// Depth pairs from one 128-byte load per band, as the f16 kernel.
+#define Q4_L2(j, BB)                                                                               \
+    if ((BB) > (j)) v##j = svld1_u8_x2(pc, q + (j) * nib_per_band)
+#define Q4_F2(j, i, BB)                                                                            \
+    if ((BB) > (j))                                                                                \
+    svmla_lane_za16_bf16_vg1x4(Q4_ACC((j) + ((BB) <= 4 ? 4 * ((i) & 1) : 0)),                      \
+                               svluti4_lane_zt_bf16_x4(0, svget2(v##j, (i) & 1), 0), aq, (i))
+#define Q4_F2B(i, BB)                                                                              \
+    Q4_F2(0, i, BB);                                                                               \
+    Q4_F2(1, i, BB);                                                                               \
+    Q4_F2(2, i, BB);                                                                               \
+    Q4_F2(3, i, BB);                                                                               \
+    Q4_F2(4, i, BB);                                                                               \
+    Q4_F2(5, i, BB);                                                                               \
+    Q4_F2(6, i, BB);                                                                               \
+    Q4_F2(7, i, BB)
+#define Q4_P2(p, BB)                                                                               \
+    do {                                                                                           \
+        svuint8x2_t v0, v1, v2, v3, v4, v5, v6, v7;                                                \
+        const uint8_t *q = nb + (d + 2 * (p)) * 64;                                                \
+        Q4_L2(0, BB);                                                                              \
+        Q4_L2(1, BB);                                                                              \
+        Q4_L2(2, BB);                                                                              \
+        Q4_L2(3, BB);                                                                              \
+        Q4_L2(4, BB);                                                                              \
+        Q4_L2(5, BB);                                                                              \
+        Q4_L2(6, BB);                                                                              \
+        Q4_L2(7, BB);                                                                              \
+        Q4_F2B(2 * (p), BB);                                                                       \
+        Q4_F2B(2 * (p) + 1, BB);                                                                   \
+    } while (0)
 #define Q4_STEP1(BB)                                                                               \
     do {                                                                                           \
         if (L == 8) {                                                                              \
-            Q4_D1(0, BB);                                                                          \
-            Q4_D1(1, BB);                                                                          \
-            Q4_D1(2, BB);                                                                          \
-            Q4_D1(3, BB);                                                                          \
-            Q4_D1(4, BB);                                                                          \
-            Q4_D1(5, BB);                                                                          \
-            Q4_D1(6, BB);                                                                          \
-            Q4_D1(7, BB);                                                                          \
+            Q4_P2(0, BB);                                                                          \
+            Q4_P2(1, BB);                                                                          \
+            Q4_P2(2, BB);                                                                          \
+            Q4_P2(3, BB);                                                                          \
         } else {                                                                                   \
             Q4_D1(0, BB);                                                                          \
             if (L > 1) Q4_D1(1, BB);                                                               \
@@ -140,7 +168,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
     size_t nib_per_band, size_t sc_per_band, unsigned bshift, const uint32_t *lut,
     const ep_desc16 *ep) {
     svbool_t p8 = svptrue_b8(), p16 = svptrue_b16();
-    svcount_t pn = svptrue_c16();
+    svcount_t pn = svptrue_c16(), pc = svptrue_c8();
     const EpNode *nodes = ep ? ep->nodes : NULL;
     uint32_t n_nodes = ep ? ep->n_nodes : 0;
     svbfloat16_t vb = svdup_n_bf16((bf16)1.0f);
@@ -195,8 +223,10 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
                 for (size_t j = 0; j < B; j++) {
                     uint32_t g = Q4_ACC(r * B + j);
                     size_t s0 = (b0 + j) * sc_per_band + bk * Q4_BAND;
-                    svmla_za16_bf16_vg1x4(g + 4, svread_za16_bf16_vg1x4(g),
-                                          svld1_bf16_x4(pn, scales + s0));
+                    svbfloat16x4_t s4 = svld1_bf16_x4(pn, scales + s0);
+                    svmla_za16_bf16_vg1x4(g + 4, svread_za16_bf16_vg1x4(g), s4);
+                    if (rows == 1 && B <= 4)
+                        svmla_za16_bf16_vg1x4(g + 4, svread_za16_bf16_vg1x4(Q4_ACC(j + 4)), s4);
                     if (mins)
                         svmla_single_za16_bf16_vg1x4(g + 4, svld1_bf16_x4(pn, mins + s0),
                                                      svdup_n_bf16(asum[r * nbk + bk]));
@@ -233,6 +263,10 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
     }
 }
 #undef Q4_D1
+#undef Q4_L2
+#undef Q4_F2
+#undef Q4_F2B
+#undef Q4_P2
 #undef Q4_STEP1
 #undef Q4_DR
 
