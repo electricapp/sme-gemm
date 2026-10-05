@@ -221,7 +221,10 @@ A broadcast once per call. The B layout picks the form:
 - **Packed B.** One x4 load is four consecutive depths of a band, taken by a
   tuple-by-tuple FMLA (SDOT for the ints) against four broadcast depths of A.
   Group `4r+t` holds row r, band t, one vector per depth phase; the store sums
-  the four.
+  the four. When A's rows are contiguous, f16 builds that tuple in registers —
+  one 16-byte replicating load, four lane duplicates — instead of
+  reading a broadcast copy of A from memory; the values, and so the bits, are
+  the same.
 - **Row-major B, not pre-packed** (`run_gemv_rm`). B is read in place: one x4
   load is four adjacent bands at one depth, which takes the tuple-by-vector
   FMLA, ~25% faster to issue. Group `(r, g, p)` holds band group g's depth phase
@@ -243,17 +246,28 @@ the lane-indexed FMLA multiplies by one A value taken from a 16-byte replicating
 load (`LD1RQH`) — so A is never broadcast in memory, and the indexed form issues
 at twice the tuple-by-tuple rate. Two depths of a band are one 128-byte line,
 loaded as one x2 load: an SME half-line load costs as much as a full one. The
-scale factors out of each K-block, so the block sums raw codes in groups 0-3
-(and 8-11), folds `acc*scale` (+`min*sum(A)`) into totals in groups 4-7 (and
-12-15) at the block edge, and one `ZERO {za0-3.d}` clears the block sums — a
-vg1x4 group w lies in ZA64 tile w%8. Rows × bands ≤ 8 sum groups, so a pass
-takes up to 8 bands for one row, spread evenly over passes; a pass of 4 bands
-or fewer sums even and odd depths in separate groups (folded with the same
-scale), because 3-4 FMLA chains do not cover the accumulate latency. That makes
-a column's bits depend on its pass's width, which matters wherever two paths
-must agree (§2.13). bf16 folds with a bf16 copy of the scales, built once per
-weight set. Q4 keeps the GEMV to m ≤ 7, not 4, because its MOPA path also pays
-the panel unpack.
+scale factors out of each K-block, so the block sums raw codes and, at the block
+edge, `acc*scale` (+`min*sum(A)`) folds into totals. A vg1x4 group w lies in
+ZA64 tile w%8, the unit one `ZERO` clears, which bounds what a pass can hold:
+
+- **One f16 row.** Reading a ZA group waits for every FMLA into it to retire, so a
+  fold right after a block's last FMLAs stalls the unit. The block sums are
+  double-buffered instead: block b sums into set b%2 and folds one 8-depth step
+  into block b+1. A pass is either 4 bands with one sum group each, or up to 3
+  bands with even and odd depths in separate groups (folded with the same
+  scale), because 3 FMLA chains do not cover the accumulate latency. Band
+  counts that are a multiple of 4 run in passes of 4, the rest in balanced
+  passes of up to 3.
+- **Several rows, and one bf16 row.** Rows × bands ≤ 8 sum groups in tiles
+  0-3, totals in tiles 4-7, the bands spread evenly over passes; the fold runs
+  at the block edge, and a one-row pass of 4 bands or fewer splits depth parity
+  as above.
+
+Group indices are register arithmetic, never a table: a core-side load inside
+streaming code stalls the unit. A column's bits depend on its pass's layout,
+which matters wherever two paths must agree (§2.13). bf16 folds with a bf16 copy
+of the scales, built once per weight set. Q4 keeps the GEMV to m ≤ 7, not 4,
+because its MOPA path also pays the panel unpack.
 
 A is usually written by the calling core just before the call, and the SME
 unit's first read of each line the core stored waits on that core, one line at
@@ -346,9 +360,11 @@ about what `dispatch_apply` charges to wake its workers. While a `HotPool` is
 alive (`src/pool.rs`), its workers spin, each on its own 128-byte mailbox, and a
 call posts one job to as many of them as it has items to spare, then claims
 items itself. The job lives on the caller's stack: the caller returns only once
-every engaged worker has stored the job's sequence as done, and a worker counts
-a job as pending whenever its posted sequence is ahead of its done one, so a job
-posted before the worker started is still taken. Shutdown takes the pool's
+every engaged worker has counted itself in the job's `finished` counter, which
+sits beside the item cursor so the caller waits on one cache line rather than
+missing on each worker's mailbox. A worker counts a job as pending whenever its
+posted sequence is ahead of its done one, so a job posted before the worker
+started is still taken. Shutdown takes the pool's
 in-use flag before stopping the workers, so a job is never posted to one that is
 leaving. KV attention splits by KV-head group from 64 cached keys, bit for bit
 the one-thread result. Idle workers back off to sleeping after a few
@@ -374,7 +390,10 @@ covers it (`q4_chain` in `csrc/gemm_f16f16_q4.h`, `src/mlp.rs`,
 - Core-side atomics stall streaming code (on M5 a release store ~60 ns while
   the unit's stores drain, a load ~20 ns), so a pass's columns are published one
   K-block into the next pass, the last pass after the streaming code returns,
-  and `ready` is read again only past the depths it last covered.
+  and `ready` is read again only past the depths it last covered. The in-kernel
+  publish is a store barrier and a plain store (~40 ns): a consumer needs only
+  the pass's stores ordered before it, not the earlier loads a release also
+  orders.
 - `SelfAttention` keeps its `qkv` projection with outputs grouped by KV head
   (each group's queries, key and value adjacent: an exact column permutation of
   the 4-bit weights, made once), so the first pass already holds whole groups. A

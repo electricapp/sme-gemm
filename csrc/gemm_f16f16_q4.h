@@ -21,9 +21,9 @@
 #define Q4_BAND 128
 
 // Hooks for a GEMV chained to work on other threads (src/mlp.rs). `done` is
-// raised (release) to the last output column of each pass once its outputs are
-// stored; before each K-block the kernel waits (acquire) until `ready` covers
-// the block's depths of A. Either may be NULL.
+// raised (Q4_PUBLISH) to the last output column of each pass once its outputs
+// are stored; before each K-block the kernel waits (acquire) until `ready`
+// covers the block's depths of A. Either may be NULL.
 typedef struct {
     _Atomic size_t *done;
     const _Atomic size_t *ready;

@@ -323,8 +323,8 @@ Also: `matmul_{bf16,f32,f64,i16}`, `gemm_*`, `matmul_*_batched`,
 **End to end.** `examples/shakespeare` runs nanoGPT shakespeare-char (10.7M
 parameters) from these blocks alone (`SelfAttention`, `Mlp`, `Linear`,
 `nn::layer_norm`, `SmeWarm`, `HotPool`; the model file adds only embeddings and
-sampling) as a CLI that continues a prompt. On an M5 it generates ~24.8k
-characters/s over 256-character windows (~29.6k at short context) with the
+sampling) as a CLI that continues a prompt. On an M5 it generates ~26.7k
+characters/s over 256-character windows (~31.7k at short context) with the
 validation loss of the f32 model:
 
 ```sh
