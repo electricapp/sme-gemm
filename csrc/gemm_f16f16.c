@@ -251,13 +251,25 @@ __arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
 }
 
 // m == 1: SME2 multi-vector FMLA into ZA vector groups (4 depths per op) instead
-// of MOPA, which wastes 31/32 of its work on one row. `abc` is A broadcast [k][32];
-// b_pack points at tile nt_lo.
+// of MOPA, which wastes 31/32 of its work on one row. Each op multiplies four
+// depths of a tile by four broadcast A values: with `a` (rows a_rs apart,
+// contiguous in depth) they come from one 16-byte replicating load and four
+// lane DUPs, else from `abc`, A broadcast [k][32] -- the same values either
+// way, and building `abc` costs a k*64-byte write and re-read a row. b_pack
+// points at tile nt_lo.
 #define GEMV_T 4
 #define GEMV_MAXR 4 // rows; past this the MOPA path does fewer ZA ops
+#define GEMV_DUP4(q)                                                                               \
+    svcreate4(svdup_lane_f16((q), 0), svdup_lane_f16((q), 1), svdup_lane_f16((q), 2),              \
+              svdup_lane_f16((q), 3))
+#define GEMV_A(r, d, pc_)                                                                          \
+    (a ? GEMV_DUP4(                                                                                \
+             svld1rq_f16(svwhilelt_b16((uint64_t)(d), (uint64_t)k), a + (long)(r) * a_rs + (d)))   \
+       : svld1_f16_x4((pc_), abc + (r) * per_tile + (d) * 32))
 __arm_locally_streaming __arm_new("za") static void run_gemv(f16 *dst, long dst_rs, const f16 *abc,
-                                                             size_t rows, const f16 *b_pack, size_t n,
-                                                             size_t k, size_t nt_lo, size_t nt_hi,
+                                                             const f16 *a, long a_rs, size_t rows,
+                                                             const f16 *b_pack, size_t n, size_t k,
+                                                             size_t nt_lo, size_t nt_hi,
                                                              float alpha, float beta, int read_dst,
                                                              const ep_desc16 *ep) {
     svbool_t p16 = svptrue_b16();
@@ -283,7 +295,7 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(f16 *dst, long dst_
                 svfloat16x4_t B2 = svld1_f16_x4(pn, b + 2 * per_tile + d * 32);
                 svfloat16x4_t B3 = svld1_f16_x4(pn, b + 3 * per_tile + d * 32);
                 for (size_t r = 0; r < rows; r++) {
-                    svfloat16x4_t A = svld1_f16_x4(pn, abc + r * per_tile + d * 32);
+                    svfloat16x4_t A = GEMV_A(r, d, pn);
                     uint32_t w = (uint32_t)(4 * r);
                     svmla_za16_f16_vg1x4(w, B0, A);
                     svmla_za16_f16_vg1x4(w + 1, B1, A);
@@ -292,20 +304,26 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(f16 *dst, long dst_
                 }
             }
         } else {
-            for (size_t t = 0; t < T; t++)
-                for (size_t d = 0; d < kfull; d += 4) {
-                    svfloat16x4_t B = svld1_f16_x4(pn, b + t * per_tile + d * 32);
-                    for (size_t r = 0; r < rows; r++)
-                        svmla_za16_f16_vg1x4((uint32_t)(4 * r + t), B,
-                                              svld1_f16_x4(pn, abc + r * per_tile + d * 32));
+            // Depth-outer so a row's A tuple serves all T tiles; each group
+            // still accumulates its depths in order, as before.
+            for (size_t d = 0; d < kfull; d += 4) {
+                svfloat16x4_t B0 = svld1_f16_x4(pn, b + d * 32), B1 = B0, B2 = B0;
+                if (T > 1) B1 = svld1_f16_x4(pn, b + per_tile + d * 32);
+                if (T > 2) B2 = svld1_f16_x4(pn, b + 2 * per_tile + d * 32);
+                for (size_t r = 0; r < rows; r++) {
+                    svfloat16x4_t A = GEMV_A(r, d, pn);
+                    uint32_t w = (uint32_t)(4 * r);
+                    svmla_za16_f16_vg1x4(w, B0, A);
+                    if (T > 1) svmla_za16_f16_vg1x4(w + 1, B1, A);
+                    if (T > 2) svmla_za16_f16_vg1x4(w + 2, B2, A);
                 }
+            }
         }
         if (kfull < k)
             for (size_t t = 0; t < T; t++) {
                 svfloat16x4_t B = svld1_f16_x4(pt, b + t * per_tile + kfull * 32);
                 for (size_t r = 0; r < rows; r++)
-                    svmla_za16_f16_vg1x4((uint32_t)(4 * r + t), B,
-                                          svld1_f16_x4(pt, abc + r * per_tile + kfull * 32));
+                    svmla_za16_f16_vg1x4((uint32_t)(4 * r + t), B, GEMV_A(r, kfull, pt));
             }
         for (size_t r = 0; r < rows; r++)
             for (size_t t = 0; t < T; t++) {
@@ -329,6 +347,8 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(f16 *dst, long dst_
             }
     }
 }
+#undef GEMV_A
+#undef GEMV_DUP4
 
 // Row-major-B GEMV read in place (`b_rm` is column nt_lo*32, row stride b_rs).
 // One load is four tiles at one depth, so it takes the tuple-by-vector FMLA,
@@ -939,20 +959,28 @@ static int run_packed_core(size_t m, size_t n, size_t k, uint16_t *dst, long dst
 
     int big = ep_flops(m, n, k) >= (1u << 21);
     if (m <= GEMV_MAXR && dst_cs == 1) {
-        f16 *abc = apack_scratch(ep_cmul(ep_cmul(m, per_tile), sizeof(f16)));
-        if (!abc) return -1;
-        for (size_t r = 0; r < m; r++) bcast_row(abc + r * per_tile, a + (long)r * lhs_rs, lhs_cs, k);
+        // Rows contiguous in depth feed the kernel directly; others are
+        // broadcast into `abc` first.
+        const f16 *ar = lhs_cs == 1 ? a : NULL;
+        f16 *abc = NULL;
+        if (!ar) {
+            abc = apack_scratch(ep_cmul(ep_cmul(m, per_tile), sizeof(f16)));
+            if (!abc) return -1;
+            for (size_t r = 0; r < m; r++)
+                bcast_row(abc + r * per_tile, a + (long)r * lhs_rs, lhs_cs, k);
+        }
         size_t G_CHUNK = 4; // tiles per chunk
         size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
         if (!big || g_chunks < 3) {
-            run_gemv(d, dst_rs, abc, m, bp, n, k, 0, n_tiles, alpha, beta, read_dst, ep);
+            run_gemv(d, dst_rs, abc, ar, lhs_rs, m, bp, n, k, 0, n_tiles, alpha, beta, read_dst,
+                     ep);
             return 0;
         }
         dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
           size_t nt0 = ci * G_CHUNK;
           size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
-          run_gemv(d, dst_rs, abc, m, bp + nt0 * per_tile, n, k, nt0, nt1, alpha, beta, read_dst,
-                   ep);
+          run_gemv(d, dst_rs, abc, ar, lhs_rs, m, bp + nt0 * per_tile, n, k, nt0, nt1, alpha, beta,
+                   read_dst, ep);
         });
         return 0;
     }
@@ -1328,7 +1356,7 @@ static int run_gemv_cols(f16 *dst, long dst_rs, const f16 *a, long lhs_rs, long 
       for (size_t i; (i = atomic_fetch_add_explicit(cur, 1, memory_order_relaxed)) < n_items;) {
           size_t t0 = i * G, t1 = t0 + G < n_tiles ? t0 + G : n_tiles;
           pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, t1, per_tile);
-          run_gemv(dst, dst_rs, abc, m, bt, n, k, t0, t1, alpha, beta, read_dst, NULL);
+          run_gemv(dst, dst_rs, abc, NULL, 0, m, bt, n, k, t0, t1, alpha, beta, read_dst, NULL);
       }
     });
     return 0;
