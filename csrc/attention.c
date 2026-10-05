@@ -288,7 +288,9 @@ ATTN_FLASH_HALF_IMPL(bf16, uint16_t)
 //
 // Scores take FMLAL (f16 x f16 -> f32): q is rounded to f16 once and every
 // product and sum is exact-to-f32, four key rows at a time with low and high
-// halves in separate accumulators so eight chains overlap. The values widen to
+// halves, and alternate 8-dim chunks, in separate accumulators so sixteen
+// chains overlap; reading K from L2 (~110-125 GB/s a core on M5) is then the
+// limit, not FMLAL, and the same holds for PV. The values widen to
 // f32 and accumulate against f32 probabilities. Row-major keys keep an append a
 // plain row copy; the horizontal sums cost less than the strided writes a
 // transposed cache would need on every append.
@@ -301,6 +303,30 @@ static void kv_scores(float *s, const __fp16 *k, size_t len, size_t ld, const fl
         q16[d / 8] = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
     }
     size_t t = 0;
+    for (; (hd & 15) == 0 && t + 4 <= len; t += 4) {
+        const __fp16 *r0 = k + t * ld, *r1 = r0 + ld, *r2 = r1 + ld, *r3 = r2 + ld;
+        float32x4_t a[8], b[8];
+        for (int i = 0; i < 8; i++)
+            a[i] = vdupq_n_f32(0.0f), b[i] = a[i];
+        for (size_t d = 0; d < hd; d += 16) {
+            float16x8_t q0 = q16[d / 8], q1 = q16[d / 8 + 1];
+#define SC_ROW(i, r)                                                                               \
+    do {                                                                                           \
+        float16x8_t x0 = vld1q_f16((r) + d), x1 = vld1q_f16((r) + d + 8);                          \
+        a[i] = vfmlalq_low_f16(a[i], x0, q0), b[i] = vfmlalq_high_f16(b[i], x0, q0);               \
+        a[i + 4] = vfmlalq_low_f16(a[i + 4], x1, q1),                                              \
+              b[i + 4] = vfmlalq_high_f16(b[i + 4], x1, q1);                                       \
+    } while (0)
+            SC_ROW(0, r0);
+            SC_ROW(1, r1);
+            SC_ROW(2, r2);
+            SC_ROW(3, r3);
+#undef SC_ROW
+        }
+        for (int i = 0; i < 4; i++)
+            a[i] = vaddq_f32(vaddq_f32(a[i], b[i]), vaddq_f32(a[i + 4], b[i + 4]));
+        vst1q_f32(s + t, vpaddq_f32(vpaddq_f32(a[0], a[1]), vpaddq_f32(a[2], a[3])));
+    }
     for (; t + 4 <= len; t += 4) {
         const __fp16 *r0 = k + t * ld, *r1 = r0 + ld, *r2 = r1 + ld, *r3 = r2 + ld;
         float32x4_t a0 = vdupq_n_f32(0.0f), b0 = a0, a1 = a0, b1 = a0, a2 = a0, b2 = a0, a3 = a0,
@@ -329,20 +355,22 @@ static void kv_scores(float *s, const __fp16 *k, size_t len, size_t ld, const fl
     }
 }
 
-// out[0..hd) = inv * sum_t p[t] * v[t*ld + 0..hd). Eight probabilities round to
-// f16 into one register and FMLAL takes each by lane, so a row costs one load
-// and two FMLALs per 8 dims (no per-row widen or broadcast); 32 dims a pass
-// keeps 8 accumulators in flight.
-static void kv_pv(float *out, const __fp16 *v, size_t len, size_t ld, const float *p, size_t hd,
-                      float inv) {
-    for (size_t d0 = 0; d0 < hd; d0 += 32) {
-        size_t w = hd - d0 < 32 ? hd - d0 : 32; // a multiple of 8
-        float32x4_t acc[8];
-        for (int i = 0; i < 8; i++)
+// out[0..w) = inv * sum_t p[t] * v[t*ld + 0..w) for a constant w (8 to 64):
+// eight probabilities round to f16 into one register and FMLAL takes each by
+// lane, so a row costs one load and two FMLALs per 8 dims (no per-row widen or
+// broadcast). Inlined per w so the dims loop unrolls and the accumulators stay
+// in registers; 64 dims a pass is 16 chains, enough to cover FMLAL's latency
+// (32 dims, 8 chains, ran at about half the FMLAL rate on M5).
+__attribute__((always_inline)) static inline void kv_pv_pass(float *out, const __fp16 *v,
+                                                             size_t len, size_t ld, const float *p,
+                                                             float inv, const size_t w) {
+    {
+        float32x4_t acc[16];
+        for (size_t i = 0; i < w / 4; i++)
             acc[i] = vdupq_n_f32(0.0f);
 #define PV_ROW(L)                                                                                  \
     do {                                                                                           \
-        const __fp16 *vr = v + (t + (L)) * ld + d0;                                                \
+        const __fp16 *vr = v + (t + (L)) * ld;                                                     \
         for (size_t i = 0; i < w / 8; i++) {                                                       \
             float16x8_t x = vld1q_f16(vr + 8 * i);                                                 \
             acc[2 * i] = vfmlalq_laneq_low_f16(acc[2 * i], x, p8, L);                              \
@@ -387,8 +415,21 @@ static void kv_pv(float *out, const __fp16 *v, size_t len, size_t ld, const floa
         }
 #undef PV_ROW
         for (size_t i = 0; i < w / 4; i++)
-            vst1q_f32(out + d0 + 4 * i, vmulq_n_f32(acc[i], inv));
+            vst1q_f32(out + 4 * i, vmulq_n_f32(acc[i], inv));
     }
+}
+
+// out[0..hd) = inv * sum_t p[t] * v[t*ld + 0..hd), hd a multiple of 8: 64
+// dims a pass, then what is left in 32- and 8-dim passes.
+static void kv_pv(float *out, const __fp16 *v, size_t len, size_t ld, const float *p, size_t hd,
+                  float inv) {
+    size_t d0 = 0;
+    for (; d0 + 64 <= hd; d0 += 64)
+        kv_pv_pass(out + d0, v + d0, len, ld, p, inv, 64);
+    for (; d0 + 32 <= hd; d0 += 32)
+        kv_pv_pass(out + d0, v + d0, len, ld, p, inv, 32);
+    for (; d0 < hd; d0 += 8)
+        kv_pv_pass(out + d0, v + d0, len, ld, p, inv, 8);
 }
 
 void attn_kv_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v, size_t len,
