@@ -4,14 +4,17 @@
 //! streaming instruction, and the next call pays about a microsecond to wake
 //! it. A loop that alternates short SME calls with NEON work (norms, attention,
 //! activations) pays it on every call: measured on M5, a 1152x384 m=1 Q4 GEMV
-//! takes 2.2 us back to back and 3.0 us after 1 us of NEON work.
+//! takes 1.1 us back to back and 1.8 us after 1 us of NEON work (1.1 us again
+//! with an [`SmeWarm`] alive; `examples/sme_warm.rs`).
 //!
-//! While an [`SmeWarm`] is alive, a helper thread issues a ~0.1 us burst of SME
-//! work whenever no library call is in flight, so the unit never idles. Calls
-//! mark themselves busy (one atomic increment, skipped entirely when no guard
-//! exists) and the helper steps aside, so they do not share the unit with it.
-//! When no call has started for a few milliseconds the helper sleeps, so a
-//! forgotten guard costs a wakeup every 0.2 ms rather than a core.
+//! While an [`SmeWarm`] is alive, a helper thread issues short bursts of
+//! streaming vector work back to back, so the unit never idles. The bursts
+//! leave ZA alone, and a call running on the unit beside them loses nothing
+//! (where a ZA burst halves a one-row Q4 GEMV), so the helper never has to
+//! know when a call is in flight. A call only notes that it happened, with one
+//! relaxed store; any read-modify-write on a line the helper polls costs the
+//! call ~0.1 us. When no call has started for a few milliseconds the helper
+//! sleeps, so a forgotten guard costs a wakeup every 0.2 ms rather than a core.
 //!
 //! `SME_GEMM_TRACE=1` prints every library SME call to stderr with its shape,
 //! time, and the idle gap before it, and flags calls that follow a gap long
@@ -23,17 +26,16 @@
 //! P-cluster it shares the caller's unit. With several P-clusters it helps only
 //! when the scheduler puts both threads in the same one.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Live [`SmeWarm`] guards.
 static REFS: AtomicU32 = AtomicU32::new(0);
-/// Library SME calls in flight (counted only while a guard is alive).
-static BUSY: AtomicU32 = AtomicU32::new(0);
-/// Library SME calls started, so the helper can tell activity from idleness.
-static CALLS: AtomicU64 = AtomicU64::new(0);
+/// Set by every library SME call while a guard is alive; the helper clears it
+/// now and then to tell activity from idleness.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 static HELPER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 /// No call for this long and the helper backs off to sleeping.
@@ -92,8 +94,8 @@ impl Drop for SmeWarm {
     }
 }
 
-/// Marks one library SME call in flight for the helper, and times it for the
-/// trace; held across the call.
+/// One library SME call: noted for the helper's idle check when it starts, and
+/// timed for the trace; held across the call.
 pub(crate) struct Busy {
     warm: bool,
     trace: Option<Trace>,
@@ -126,14 +128,14 @@ fn trace_clock() -> u64 {
 /// End of the last traced call (0: none yet).
 static LAST_END: AtomicU64 = AtomicU64::new(0);
 
-/// The busy mark (and trace record) for the call `name` of shape `m x n x k`,
-/// about to enter a streaming region.
+/// Notes the call `name` of shape `m x n x k`, about to enter a streaming
+/// region, and starts its trace record.
 #[inline]
 pub(crate) fn busy(name: &'static str, m: usize, n: usize, k: usize) -> Busy {
     let warm = REFS.load(Ordering::Relaxed) > 0;
-    if warm {
-        BUSY.fetch_add(1, Ordering::AcqRel);
-        CALLS.fetch_add(1, Ordering::Relaxed);
+    // Read first: the line stays shared with the helper until it clears the flag.
+    if warm && !ACTIVE.load(Ordering::Relaxed) {
+        ACTIVE.store(true, Ordering::Relaxed);
     }
     let trace = trace_on().then(|| {
         let (now, last) = (trace_clock(), LAST_END.load(Ordering::Relaxed));
@@ -150,9 +152,6 @@ pub(crate) fn busy(name: &'static str, m: usize, n: usize, k: usize) -> Busy {
 impl Drop for Busy {
     #[inline]
     fn drop(&mut self) {
-        if self.warm {
-            BUSY.fetch_sub(1, Ordering::Release);
-        }
         if let Some(t) = self.trace.take() {
             report(&t, self.warm);
             LAST_END.store(trace_clock(), Ordering::Relaxed);
@@ -181,25 +180,17 @@ fn report(t: &Trace, warm: bool) {
 
 fn run_helper() {
     set_user_interactive();
-    let mut seen = CALLS.load(Ordering::Relaxed);
     let mut last = Instant::now();
     let mut n: u32 = 0;
     while REFS.load(Ordering::Acquire) > 0 {
-        if BUSY.load(Ordering::Acquire) <= neon_phase() {
-            tick();
-        } else {
-            std::hint::spin_loop();
-        }
+        tick();
         n = n.wrapping_add(1);
         if n.is_multiple_of(64) {
-            let c = CALLS.load(Ordering::Relaxed);
-            if c == seen {
-                if last.elapsed() > IDLE_AFTER {
-                    std::thread::sleep(IDLE_SLEEP);
-                }
-            } else {
-                seen = c;
+            if ACTIVE.load(Ordering::Relaxed) {
+                ACTIVE.store(false, Ordering::Relaxed);
                 last = Instant::now();
+            } else if last.elapsed() > IDLE_AFTER {
+                std::thread::sleep(IDLE_SLEEP);
             }
         }
     }
@@ -219,25 +210,11 @@ pub(crate) fn set_user_interactive() {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) const fn set_user_interactive() {}
 
-/// Busy calls that are in a NEON phase (`csrc/neon_act.h`), so idle for SME.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn neon_phase() -> u32 {
-    unsafe extern "C" {
-        safe static sme_warm_neon: AtomicU32;
-    }
-    sme_warm_neon.load(Ordering::Acquire)
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-const fn neon_phase() -> u32 {
-    0
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn tick() {
-    // SAFETY: a self-contained streaming region with its own ZA state; it
-    // touches no memory.
-    unsafe { crate::ffi::sme_warm_tick() };
+    // SAFETY: a self-contained streaming region on vector registers only; it
+    // touches no memory and no ZA state.
+    std::hint::black_box(unsafe { crate::ffi::sme_warm_tick() });
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

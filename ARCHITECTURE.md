@@ -321,13 +321,16 @@ A P-cluster's SME unit idles within a few hundred nanoseconds of its last
 streaming instruction and the next call pays about a microsecond to wake it, so
 a loop of short GEMVs alternating with NEON layernorm, attention and
 activations pays it on every call. While an `SmeWarm` guard is alive, a
-helper thread at user-interactive QoS issues a ~0.1 µs burst of FMLAs into a
-private ZA whenever no library call is in flight (`csrc/sme_warm.c`,
-`src/warm.rs`). Each SME entry point holds a busy mark for its call, and calls
-in a NEON phase (`NA_NEON_PHASE`) count as idle so the helper covers that work
-too. With no call for a few milliseconds the helper sleeps. macOS has no
-affinity control, so on a chip with several P-clusters it helps only when the
-scheduler shares the caller's cluster.
+helper thread at user-interactive QoS issues short bursts of streaming vector
+FMLAs back to back (`csrc/sme_warm.c`, `src/warm.rs`). The bursts leave ZA
+alone, which is what lets them run beside a call: a call sharing the unit with
+vector work loses nothing measurable, but sharing it with ZA work halves a
+one-row Q4 GEMV. So the helper never tracks calls in flight; an entry point
+only sets an activity flag (a relaxed load and, when clear, a store), since
+any read-modify-write on a line the helper polls adds ~0.1 µs to the call.
+With no call for a few milliseconds the helper sleeps. macOS has no affinity
+control, so on a chip with several P-clusters it helps only when the scheduler
+shares the caller's cluster.
 
 ### 2.12 Spinning workers for short NEON passes
 
@@ -437,8 +440,8 @@ the matching flag before dispatching to an M5 kernel.
   worth-it check, the FFI call and the scalar fallback. `attention.rs` and
   `attention_half.rs` hold the flash-attention drivers, `kv_attention.rs` the
   KV-cache attention (§2.7).
-- **`warm.rs`** — `SmeWarm`, the per-call busy mark (§2.11), and the
-  `SME_GEMM_TRACE` per-call report, which hangs off the same mark.
+- **`warm.rs`** — `SmeWarm`, the per-call activity flag (§2.11), and the
+  `SME_GEMM_TRACE` per-call report, which hangs off the same per-call hook.
 - **`pool.rs`** — `HotPool`, the spinning workers for short NEON passes (§2.12).
 - **`linear.rs`, `layout.rs`, `nn.rs`** — the model-level layer over the
   kernels. `Linear` holds a layer's weights (Q4 with a lazily built f16 panel,

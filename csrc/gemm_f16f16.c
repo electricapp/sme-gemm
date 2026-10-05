@@ -1102,7 +1102,7 @@ int gemm_sme_f16f16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
     const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
     int rc = run_packed_core(m, n, k, dst, dst_cs, dst_rs, read_dst, lhs, lhs_cs, lhs_rs, b_pack,
                              alpha_bits, beta_bits, kep);
-    if (rc == 0 && act) NA_NEON_PHASE(na_post_f16(dst, m, n, dst_rs, dst_cs, act));
+    if (rc == 0 && act) na_post_f16(dst, m, n, dst_rs, dst_cs, act);
     return rc;
 }
 

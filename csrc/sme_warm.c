@@ -1,21 +1,20 @@
-// A short burst of SME work for the keep-awake helper (src/warm.rs): enough to
-// stop the cluster's SME unit idling between a caller's calls, short enough
-// that a call arriving mid-burst waits at most ~0.1 us for the unit.
+// A short burst of streaming-mode work for the keep-awake helper (src/warm.rs):
+// enough to stop the cluster's SME unit idling between a caller's calls.
+// Vector FMLAs only, no ZA: they share the unit with a call in flight without
+// slowing it, so the helper never has to stand aside. (A ZA burst does slow
+// it, by 2x on a one-row Q4 GEMV, measured on M5.)
 #include <arm_sme.h>
-#include <stdatomic.h>
-#include <stdint.h>
 
-#include "neon_act.h"
+float sme_warm_tick(void);
 
-void sme_warm_tick(void);
-
-// Library calls currently in a NEON phase (e.g. neon_act.h's post-pass) while
-// their busy mark is held; the helper counts those calls as idle.
-_Atomic uint32_t sme_warm_neon;
-
-__arm_locally_streaming __arm_new("za") void sme_warm_tick(void) {
-    svfloat32_t x = svdup_n_f32(1.0f);
-    svfloat32x4_t x4 = svcreate4(x, x, x, x);
-    for (uint32_t i = 0; i < 32; i++)
-        svmla_single_za32_f32_vg1x4(i & 7, x4, x);
+__arm_locally_streaming float sme_warm_tick(void) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t h = svdup_n_f32(0.5f), a = svdup_n_f32(1.0f), b = a, c = a, d = a;
+    for (int i = 0; i < 8; i++) {
+        a = svmla_f32_x(pg, a, a, h);
+        b = svmla_f32_x(pg, b, b, h);
+        c = svmla_f32_x(pg, c, c, h);
+        d = svmla_f32_x(pg, d, d, h);
+    }
+    return svaddv_f32(pg, svadd_f32_x(pg, svadd_f32_x(pg, a, b), svadd_f32_x(pg, c, d)));
 }

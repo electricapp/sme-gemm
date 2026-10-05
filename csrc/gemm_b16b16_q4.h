@@ -355,7 +355,7 @@ int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16
     const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
     int rc =
         q4_bf16_core(m, n, k, dst, lhs, nibbles, scales, mins, scales_bf16, mins_bf16, block, kep);
-    if (rc == 0 && act) NA_NEON_PHASE(na_post_bf16(dst, m, n, (long)n, 1, act));
+    if (rc == 0 && act) na_post_bf16(dst, m, n, (long)n, 1, act);
     return rc;
 }
 

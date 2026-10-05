@@ -85,8 +85,9 @@ unsafe extern "C" {
     /// `out = act(gate) * up` over rows of gate/up interleaved 32 columns at a
     /// time (`neon_ops.c`); `act` is an `EP_ACT_*` kind.
     pub(crate) fn neon_glu_f16(out: *mut u16, input: *const u16, m: usize, n: usize, act: u32);
-    /// ~0.1 us of streaming-mode work for the keep-awake helper (`warm.rs`).
-    pub(crate) fn sme_warm_tick();
+    /// A short burst of streaming vector work for the keep-awake helper
+    /// (`warm.rs`); the result only keeps the work from being optimized out.
+    pub(crate) fn sme_warm_tick() -> f32;
     pub(crate) fn gemm_sme_f16f16_run(
         m: usize,
         n: usize,

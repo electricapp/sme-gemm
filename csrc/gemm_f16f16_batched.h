@@ -110,7 +110,7 @@ int gemm_sme_f16f16_batched_ep(size_t count, size_t m, size_t n, size_t k, uint1
     uint32_t act = na_split(ep, &rest);
     const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
     int rc = batched_ep_core(count, m, n, k, dst, lhs, rhs, kep);
-    if (rc == 0 && act) NA_NEON_PHASE(na_post_f16(dst, count * m, n, (long)n, 1, act));
+    if (rc == 0 && act) na_post_f16(dst, count * m, n, (long)n, 1, act);
     return rc;
 }
 

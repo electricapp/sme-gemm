@@ -13,22 +13,10 @@
 
 #include <arm_neon.h>
 #include <dispatch/dispatch.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "epilogue.h"
-
-// sme_warm.c: calls in a NEON phase. A call's busy mark (src/warm.rs) spans
-// the whole C call, so without this the keep-awake helper would stand down for
-// the post-pass and the unit would idle into the next call.
-extern _Atomic uint32_t sme_warm_neon;
-#define NA_NEON_PHASE(stmt)                                                                        \
-    do {                                                                                           \
-        atomic_fetch_add_explicit(&sme_warm_neon, 1, memory_order_release);                        \
-        stmt;                                                                                      \
-        atomic_fetch_sub_explicit(&sme_warm_neon, 1, memory_order_release);                        \
-    } while (0)
 
 // If ep ends in an activation worth moving out of the streaming region, return
 // its kind and set *rest to the nodes before it; else EP_ACT_NONE.
