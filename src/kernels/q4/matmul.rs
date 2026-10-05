@@ -42,7 +42,7 @@ fn q4_f16_impl(a: &[f16], w: &Q4Weights, c: &mut [f16], m: usize, ep: &Epilogue<
     if m == 0 || n == 0 {
         return;
     }
-    // No flop gate: the fallback has to unpack the whole tile-major weight set
+    // No flop gate: the fallback has to unpack the whole band-major weight set
     // scalar-wise, which costs O(n*k) no matter how small m is, so gating on
     // m*n*k makes the small shapes it is meant to protect slower, not faster.
     // Same rule as the other pre-packed paths (see `packed_ep_impl`).
@@ -62,7 +62,7 @@ fn q4_f16_impl(a: &[f16], w: &Q4Weights, c: &mut [f16], m: usize, ep: &Epilogue<
         };
         let _busy = crate::warm::busy("gemm_sme_f16f16_q4", m, n, k);
         // SAFETY: a / c are row-major m*k / m*n; nibbles/scales describe the
-        // weights' (n, k) in the tile-major resident layout the kernel expects;
+        // weights' (n, k) in the band-major resident layout the kernel expects;
         // the node operands are length-validated above and outlive the call.
         let rc = unsafe {
             gemm_sme_f16f16_q4(
@@ -88,7 +88,7 @@ fn q4_f16_impl(a: &[f16], w: &Q4Weights, c: &mut [f16], m: usize, ep: &Epilogue<
             return;
         }
     }
-    // Fallback: dequantize the tile-major weights to row-major f16, then the
+    // Fallback: dequantize the band-major weights to row-major f16, then the
     // dense packed path, which carries the same op-graph.
     let b = w.dequant_to_rowmajor();
     crate::kernels::f16::f16_packed_ep_impl(
@@ -171,7 +171,7 @@ fn q4_bf16_impl(a: &[bf16], w: &Q4Weights, c: &mut [bf16], m: usize, ep: &Epilog
         };
         let _busy = crate::warm::busy("gemm_sme_b16b16_q4", m, n, k);
         // SAFETY: as `q4_f16_impl`, with bf16 activations/output -- the kernel
-        // reads the same tile-major nibbles and f16 scales; the bf16 copies have
+        // reads the same band-major nibbles and f16 scales; the bf16 copies have
         // the same shape.
         let rc = unsafe {
             gemm_sme_b16b16_q4(

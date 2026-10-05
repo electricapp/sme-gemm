@@ -1,4 +1,4 @@
-//! The 4-bit-resident weight set: the tile-major pack the kernels read, plus the
+//! The 4-bit-resident weight set: the band-major pack the kernels read, plus the
 //! row-major unpack their fallbacks use.
 
 use std::sync::OnceLock;
@@ -7,21 +7,27 @@ use half::{bf16, f16};
 
 use super::{Q4Params, q4_check};
 
+/// Columns in a band of the resident layout (`Q4_BAND` in `csrc/gemm_*_q4.h`):
+/// per depth, a band's 64 bytes of nibbles hold its 128 columns, which one
+/// LUTI4 expands as four 32-column tiles.
+const BAND: usize = 128;
+
 /// 4-bit weights kept **4-bit resident** for on-the-fly dequant ([`matmul_q4`]).
 ///
 /// Unlike [`dequant_q4`] (which dequantizes to f16 up front), this stores the
-/// nibbles tile-major plus per-(column, K-block) scales; the kernel dequantizes
-/// one tile to f16 at a time, so the resident weight set stays 4x smaller during
-/// compute -- the llama.cpp inner-loop approach.
+/// nibbles band-major (128 columns of one depth per 64 bytes) plus
+/// per-(column, K-block) scales, and the kernels expand them as they go, so the
+/// resident weight set stays 4x smaller during compute -- the llama.cpp
+/// inner-loop approach.
 ///
 /// [`matmul_q4`]: crate::matmul_q4
 /// [`dequant_q4`]: crate::dequant_q4
 #[derive(Debug)]
 pub struct Q4Weights {
-    /// The tile-major arrays cross the FFI from `matmul`, hence `pub(super)`.
+    /// The band-major arrays cross the FFI from `matmul`, hence `pub(super)`.
     pub(super) nibbles: Vec<u8>,
     pub(super) scales: Vec<u16>,
-    /// Tile-major offsets, same shape as `scales`; empty for
+    /// Band-major offsets, same shape as `scales`; empty for
     /// [`Q4Form::Scale`](super::Q4Form::Scale).
     pub(super) mins: Vec<u16>,
     /// `scales` and `mins` as bf16, built on the first small-m bf16 call.
@@ -33,7 +39,7 @@ pub struct Q4Weights {
 
 impl Q4Weights {
     /// Repack row-major 4-bit weights (same input layout as [`dequant_q4`]) into
-    /// the tile-major resident format, as `Q4_0`: 32-value K-blocks, scale-only.
+    /// the band-major resident format, as `Q4_0`: 32-value K-blocks, scale-only.
     /// `quants` is `ceil(k*n/2)` bytes; `scales` is `n * ceil(k/Q4_BLOCK)`.
     ///
     /// # Panics
@@ -63,18 +69,18 @@ impl Q4Weights {
         p: Q4Params,
     ) -> Self {
         let (_, nbk) = q4_check(quants, scales, mins, n, k, p);
-        let n_tiles = n.div_ceil(32);
-        let nib_per_tile = k
-            .checked_mul(16)
-            .expect("q4 nibble tile size k*16 overflows usize");
-        let sc_per_tile = nbk
-            .checked_mul(32)
-            .expect("q4 scale tile size nbk*32 overflows usize");
-        let nib_len = n_tiles
-            .checked_mul(nib_per_tile)
+        let n_bands = n.div_ceil(BAND);
+        let nib_per_band = k
+            .checked_mul(BAND / 2)
+            .expect("q4 nibble band size k*64 overflows usize");
+        let sc_per_band = nbk
+            .checked_mul(BAND)
+            .expect("q4 scale band size nbk*128 overflows usize");
+        let nib_len = n_bands
+            .checked_mul(nib_per_band)
             .expect("q4 nibble buffer size overflows usize");
-        let sc_len = n_tiles
-            .checked_mul(sc_per_tile)
+        let sc_len = n_bands
+            .checked_mul(sc_per_band)
             .expect("q4 scale buffer size overflows usize");
         let mut nibbles = vec![0u8; nib_len];
         let mut sc = vec![0u16; sc_len];
@@ -83,31 +89,25 @@ impl Q4Weights {
         } else {
             Vec::new()
         };
-        for t in 0..n_tiles {
-            for d in 0..k {
-                for c in 0..32 {
-                    let j = t * 32 + c;
-                    if j >= n {
-                        continue;
-                    }
-                    let idx = d * n + j;
-                    let nib = if idx.is_multiple_of(2) {
-                        quants[idx / 2] & 0x0f
-                    } else {
-                        quants[idx / 2] >> 4
-                    };
-                    let bi = t * nib_per_tile + d * 16 + c / 2;
-                    if c.is_multiple_of(2) {
-                        nibbles[bi] |= nib & 0x0f;
-                    } else {
-                        nibbles[bi] |= (nib & 0x0f) << 4;
-                    }
-                    let src = j * nbk + d / p.block;
-                    let dst = t * sc_per_tile + (d / p.block) * 32 + c;
-                    sc[dst] = scales[src].to_bits();
-                    if let Some(mv) = mins {
-                        mn[dst] = mv[src].to_bits();
-                    }
+        for d in 0..k {
+            for j in 0..n {
+                let idx = d * n + j;
+                let nib = if idx.is_multiple_of(2) {
+                    quants[idx / 2] & 0x0f
+                } else {
+                    quants[idx / 2] >> 4
+                };
+                let (b, c) = (j / BAND, j % BAND);
+                nibbles[b * nib_per_band + d * (BAND / 2) + c / 2] |= nib << (4 * (c % 2));
+            }
+        }
+        for j in 0..n {
+            let (b, c) = (j / BAND, j % BAND);
+            for blk in 0..nbk {
+                let (src, dst) = (j * nbk + blk, b * sc_per_band + blk * BAND + c);
+                sc[dst] = scales[src].to_bits();
+                if let Some(mv) = mins {
+                    mn[dst] = mv[src].to_bits();
                 }
             }
         }
@@ -122,7 +122,7 @@ impl Q4Weights {
         }
     }
 
-    /// Tile-major scales and mins converted to bf16 bits.
+    /// Band-major scales and mins converted to bf16 bits.
     pub(super) fn bf16_scales(&self) -> &(Vec<u16>, Vec<u16>) {
         self.bf16_scales.get_or_init(|| {
             let cvt = |v: &[u16]| -> Vec<u16> {
@@ -140,7 +140,7 @@ impl Q4Weights {
         self.params
     }
 
-    /// Dequantize the tile-major resident weights back to a row-major `k x n`
+    /// Dequantize the band-major resident weights back to a row-major `k x n`
     /// f16 buffer (the exact inverse of [`Q4Weights::new`]'s pack). Used by the
     /// [`matmul_q4`] OOM/non-SME fallback; factored out so it has a single
     /// definition and can be unit-tested without an SME machine (the kernel path
@@ -194,20 +194,20 @@ impl Q4Weights {
             return;
         }
         let block = self.params.block;
-        let sc_per_tile = k.div_ceil(block) * 32;
-        let nib_per_tile = k * 16;
+        let sc_per_band = k.div_ceil(block) * BAND;
+        let nib_per_band = k * (BAND / 2);
         for (r, row) in out.chunks_exact_mut(n).enumerate() {
             let d = d0 + r;
             for (j, w) in row.iter_mut().enumerate() {
-                let (t, c) = (j / 32, j % 32);
-                let byte = self.nibbles[t * nib_per_tile + d * 16 + c / 2];
+                let (b, c) = (j / BAND, j % BAND);
+                let byte = self.nibbles[b * nib_per_band + d * (BAND / 2) + c / 2];
                 let nib = if c.is_multiple_of(2) {
                     byte & 0x0f
                 } else {
                     byte >> 4
                 };
                 let code = i32::from(nib) - if nib < 8 { 0 } else { 16 };
-                let bi = t * sc_per_tile + (d / block) * 32 + c;
+                let bi = b * sc_per_band + (d / block) * BAND + c;
                 let mut v = f16::from_bits(self.scales[bi]).to_f64() * f64::from(code);
                 if !self.mins.is_empty() {
                     v += f16::from_bits(self.mins[bi]).to_f64();
@@ -236,7 +236,7 @@ mod tests {
     use half::f16;
 
     /// Canonical row-major dequant for an arbitrary block size / code form --
-    /// the reference the tile-major pack and unpack must both reproduce.
+    /// the reference the band-major pack and unpack must both reproduce.
     fn rowmajor_dequant_with(
         quants: &[u8],
         scales: &[f16],
@@ -267,7 +267,7 @@ mod tests {
         b
     }
 
-    /// The tile-major resident round-trip must reproduce the canonical dequant
+    /// The band-major resident round-trip must reproduce the canonical dequant
     /// for every supported block size and for the affine (`Q4_1`) form, not just
     /// the scale-only 32-block default.
     #[test]
@@ -376,7 +376,7 @@ mod tests {
         b
     }
 
-    /// The tile-major resident round-trip (`Q4Weights::new` then
+    /// The band-major resident round-trip (`Q4Weights::new` then
     /// `dequant_to_rowmajor`) must reproduce the canonical row-major dequant
     /// bit-for-bit. This exercises the `matmul_q4` OOM/non-SME fallback's unpack
     /// on every platform -- the integration tests skip it whenever the SME
