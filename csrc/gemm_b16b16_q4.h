@@ -6,6 +6,8 @@
 #ifndef SME_GEMM_B16B16_Q4_H
 #define SME_GEMM_B16B16_Q4_H
 
+#include "neon_act.h"
+
 // Code c -> f16(sign-extended c), for unpack_q4_bf16's 16-bit LUTI4 (low half
 // of each 32-bit entry).
 static uint32_t g_q4_lut_h[16] __attribute__((aligned(64)));
@@ -236,6 +238,110 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
     }
 }
 
+// Depths d..d+3 of one A row, each broadcast across a vector: one 16-byte
+// replicating load and four indexed DUPs. Lanes at or past k load as zero,
+// which the K tail relies on.
+#define Q4_A4(ar, d, k)                                                                            \
+    ({                                                                                             \
+        svbfloat16_t q_ = svld1rq_bf16(svwhilelt_b16((uint64_t)(d), (uint64_t)(k)), (ar) + (d));   \
+        svcreate4(svdup_lane_bf16(q_, 0), svdup_lane_bf16(q_, 1), svdup_lane_bf16(q_, 2),          \
+                  svdup_lane_bf16(q_, 3));                                                         \
+    })
+// One-row Q4 GEMV (run_q4_gemv_bf16 at m = 1). It builds A's broadcasts in the kernel
+// (Q4_A4) instead of reading a [k][32] broadcast, whose build and per-pass
+// reloads dominate small calls (~1.5-1.8x at 1024^2 and under). The DUPs are
+// streaming ALU work, so they only pay shared across a pass of 8 tiles; m > 1
+// passes fewer tiles per broadcast and keeps the materialized form.
+__arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv1_bf16(
+    bf16 *dst, const bf16 *a, const bf16 *asum, const uint8_t *nibbles, const bf16 *scales,
+    const bf16 *mins, size_t n, size_t k, size_t nt_lo, size_t nt_hi, size_t nib_per_tile,
+    size_t sc_per_tile, unsigned bshift, const uint32_t *lut, const ep_desc16 *ep) {
+    svbool_t p16 = svptrue_b16();
+    svbool_t p8 = svptrue_b8();
+    const svbfloat16_t z16 = svdup_n_bf16((bf16)0.0f);
+    const svbfloat16x4_t zero4 = svcreate4(z16, z16, z16, z16);
+    const EpNode *nodes = ep ? ep->nodes : NULL;
+    uint32_t n_nodes = ep ? ep->n_nodes : 0;
+    svbfloat16_t vb = svdup_n_bf16((bf16)1.0f);
+    svbfloat16_t va = svdup_n_bf16((bf16)0.0f);
+    svldr_zt(0, lut);
+    size_t block = (size_t)1 << bshift;
+    size_t nbk = (k + block - 1) >> bshift;
+    // One row takes 8 tiles a pass (block sums in groups 0-3 and 8-11, totals 4
+    // above each), so each Q4_A4 is shared by all 8.
+    const size_t TT = 8;
+    for (size_t nt = nt_lo; nt < nt_hi; nt += TT) {
+        size_t T = nt_hi - nt < TT ? nt_hi - nt : TT;
+        const uint8_t *nb = nibbles + nt * nib_per_tile;
+        const bf16 *sc = scales + nt * sc_per_tile;
+        const bf16 *mn = mins ? mins + nt * sc_per_tile : NULL;
+        svzero_za();
+        for (size_t bk = 0; bk < nbk; bk++) {
+            size_t d = bk << bshift;
+            size_t d1 = d + block < k ? d + block : k;
+            if (T == 8) {
+                for (; d + 4 <= d1; d += 4) {
+                    svbfloat16x4_t A = Q4_A4(a, d, k);
+#define Q4_T1(t)                                                                                   \
+    svmla_za16_bf16_vg1x4(                                                                         \
+        Q4_ACC(t), svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + (t) * nib_per_tile + d * 16), 0),  \
+        A)
+                    Q4_T1(0), Q4_T1(1), Q4_T1(2), Q4_T1(3);
+                    Q4_T1(4), Q4_T1(5), Q4_T1(6), Q4_T1(7);
+#undef Q4_T1
+                }
+            } else {
+                for (; d + 4 <= d1; d += 4) {
+                    svbfloat16x4_t A = Q4_A4(a, d, k);
+                    for (size_t t = 0; t < T; t++)
+                        svmla_za16_bf16_vg1x4(
+                            Q4_ACC(t),
+                            svluti4_lane_zt_bf16_x4(0, svld1_u8(p8, nb + t * nib_per_tile + d * 16),
+                                                    0),
+                            A);
+                }
+            }
+            if (d < d1) {
+                // K tail: nibble 0 maps to 0 and A is zero past k.
+                svbool_t pb = svwhilelt_b8((uint64_t)0, (uint64_t)((d1 - d) * 16));
+                for (size_t t = 0; t < T; t++) {
+                    svbfloat16x4_t C =
+                        svluti4_lane_zt_bf16_x4(0, svld1_u8(pb, nb + t * nib_per_tile + d * 16), 0);
+                    svmla_za16_bf16_vg1x4(Q4_ACC(t), C, Q4_A4(a, d, k));
+                }
+            }
+            for (size_t t = 0; t < T; t++) {
+                uint32_t g = Q4_ACC(t);
+                svmla_single_za16_bf16_vg1x4(g + 4, svread_za16_bf16_vg1x4(g),
+                                             svld1_bf16(p16, sc + t * sc_per_tile + bk * 32));
+                if (mn)
+                    svmla_single_za16_bf16_vg1x4(
+                        g + 4,
+                        svset4_bf16(zero4, 0, svld1_bf16(p16, mn + t * sc_per_tile + bk * 32)),
+                        svdup_n_bf16(asum[bk]));
+            }
+            svzero_mask_za(0x0F);
+        }
+        for (size_t t = 0; t < T; t++) {
+            size_t n0 = (nt + t) * 32;
+            size_t ncols = n - n0 < 32 ? n - n0 : 32;
+            svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)ncols);
+            svbfloat16x4_t q = svread_za16_bf16_vg1x4(Q4_ACC(t) + 4);
+            svbfloat16_t acc = svadd_bf16_x(p16, svadd_bf16_x(p16, svget4(q, 0), svget4(q, 1)),
+                                            svadd_bf16_x(p16, svget4(q, 2), svget4(q, 3)));
+            bf16 *out = dst + n0;
+            if (!n_nodes) {
+                svst1_bf16(pst, out, acc);
+            } else {
+#define EP_Q4G_RD(s) acc
+                EP_STORE_TILE_ROWMAJOR_BF16(p16, pst, out, (long)n, EP_Q4G_RD, 1, vb, va, 0, nodes,
+                                            n_nodes, 0, n0);
+#undef EP_Q4G_RD
+            }
+        }
+    }
+}
+
 // Code c -> bf16(sign-extended c); 16-bit LUTI4 reads the low half of 32-bit entries.
 static uint32_t g_q4_lut_bf16[16] __attribute__((aligned(64)));
 static void q4_lut_bf16_init(void) {
@@ -253,10 +359,10 @@ static void q4_lut_bf16_init(void) {
 // ([n_tiles][ceil(k/block)][32]). `block` is the K-block size (power of two; 32 =
 // Q4_0/Q4_1). `mins` is NULL for the scale-only form, else the matching offsets:
 // w = scale*code + min. `scales_bf16`/`mins_bf16` are bf16 copies for m <= 4.
-int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
-                       const uint8_t *nibbles, const uint16_t *scales, const uint16_t *mins,
-                       const uint16_t *scales_bf16, const uint16_t *mins_bf16, size_t block,
-                       const ep_desc16 *ep) {
+static int q4_bf16_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
+                        const uint8_t *nibbles, const uint16_t *scales, const uint16_t *mins,
+                        const uint16_t *scales_bf16, const uint16_t *mins_bf16, size_t block,
+                        const ep_desc16 *ep) {
     if (m == 0 || n == 0) return 0;
     if (block == 0 || (block & (block - 1)) != 0) return -1; // power of two only
     unsigned bshift = 0;
@@ -270,12 +376,15 @@ int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16
         static dispatch_once_t lut_once;
         dispatch_once_f(&lut_once, NULL, (dispatch_function_t)q4_lut_bf16_init);
         size_t nbk_s = mins ? m * nbk : 0;
-        // [m][k][32] broadcast A, then the per-row, per-block sums of A.
-        size_t per_row = ep_cmul(k, 32);
+        // [m][k][32] broadcast A (m > 1; one row broadcasts in the kernel), then
+        // the per-row, per-block sums of A.
+        size_t per_row = m > 1 ? ep_cmul(k, 32) : 0;
         bf16 *abc = apack_scratch(ep_cmul(ep_cmul(m, per_row) + nbk_s + 1, sizeof(bf16)));
         if (!abc) return -1;
         const bf16 *a = (const bf16 *)lhs;
-        for (size_t r = 0; r < m; r++) bcast_row(abc + r * per_row, a + r * k, 1, k);
+        if (m > 1)
+            for (size_t r = 0; r < m; r++)
+                bcast_row(abc + r * per_row, a + r * k, 1, k);
         bf16 *asum = abc + m * per_row;
         for (size_t i = 0; i < nbk_s; i++) {
             size_t r = i / nbk, b = i % nbk;
@@ -286,18 +395,26 @@ int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16
         }
         const bf16 *sc = (const bf16 *)scales_bf16;
         const bf16 *mn = mins ? (const bf16 *)mins_bf16 : NULL;
-        size_t G_CHUNK = 4;
+        size_t G_CHUNK = m == 1 ? 8 : 4; // tiles per chunk: one GEMV pass
         size_t g_chunks = (n_tiles + G_CHUNK - 1) / G_CHUNK;
         if (ep_flops(m, n, k) < (1u << 21) || g_chunks < 3) {
-            run_q4_gemv_bf16((bf16 *)dst, abc, asum, m, nibbles, sc, mn, n, k, 0, n_tiles,
-                             nib_per_tile, sc_per_tile, bshift, g_q4_lut_bf16, ep);
+            if (m == 1)
+                run_q4_gemv1_bf16((bf16 *)dst, a, asum, nibbles, sc, mn, n, k, 0, n_tiles,
+                                  nib_per_tile, sc_per_tile, bshift, g_q4_lut_bf16, ep);
+            else
+                run_q4_gemv_bf16((bf16 *)dst, abc, asum, m, nibbles, sc, mn, n, k, 0, n_tiles,
+                                 nib_per_tile, sc_per_tile, bshift, g_q4_lut_bf16, ep);
             return 0;
         }
         dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
           size_t nt0 = ci * G_CHUNK;
           size_t nt1 = nt0 + G_CHUNK < n_tiles ? nt0 + G_CHUNK : n_tiles;
-          run_q4_gemv_bf16((bf16 *)dst, abc, asum, m, nibbles, sc, mn, n, k, nt0, nt1, nib_per_tile,
-                           sc_per_tile, bshift, g_q4_lut_bf16, ep);
+          if (m == 1)
+              run_q4_gemv1_bf16((bf16 *)dst, a, asum, nibbles, sc, mn, n, k, nt0, nt1, nib_per_tile,
+                                sc_per_tile, bshift, g_q4_lut_bf16, ep);
+          else
+              run_q4_gemv_bf16((bf16 *)dst, abc, asum, m, nibbles, sc, mn, n, k, nt0, nt1,
+                               nib_per_tile, sc_per_tile, bshift, g_q4_lut_bf16, ep);
         });
         return 0;
     }
@@ -306,6 +423,21 @@ int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16
     dispatch_once_f(&luth_once, NULL, (dispatch_function_t)q4_lut_h_init);
     return run_q4_panels_bf16((bf16 *)dst, (const bf16 *)lhs, nibbles, (const ep_f16 *)scales,
                               (const ep_f16 *)mins, m, n, k, bshift, ep);
+}
+
+// A trailing gelu/silu/sigmoid/tanh runs as a NEON pass over the output after
+// the kernel (neon_act.h): in a streaming epilogue it costs ~2.5 ns an output.
+int gemm_sme_b16b16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
+                       const uint8_t *nibbles, const uint16_t *scales, const uint16_t *mins,
+                       const uint16_t *scales_bf16, const uint16_t *mins_bf16, size_t block,
+                       const ep_desc16 *ep) {
+    ep_desc16 rest;
+    uint32_t act = na_split(ep, &rest);
+    const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
+    int rc =
+        q4_bf16_core(m, n, k, dst, lhs, nibbles, scales, mins, scales_bf16, mins_bf16, block, kep);
+    if (rc == 0 && act) NA_NEON_PHASE(na_post_bf16(dst, m, n, (long)n, 1, act));
+    return rc;
 }
 
 #endif // SME_GEMM_B16B16_Q4_H

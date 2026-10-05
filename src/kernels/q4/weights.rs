@@ -159,40 +159,62 @@ impl Q4Weights {
         self.dequant_rowmajor(|w| bf16::from_f32(w as f32))
     }
 
+    /// [`Q4Weights::dequant_to_rowmajor`] split into row bands across cores:
+    /// `Linear` builds its f16 panel with it, where one thread takes tens of
+    /// milliseconds on a model-sized weight set.
+    #[must_use]
+    pub(crate) fn dequant_to_rowmajor_par(&self) -> Vec<f16> {
+        let (n, k) = (self.n, self.k);
+        let mut b = vec![f16::ZERO; k * n];
+        if n == 0 || k == 0 {
+            return b;
+        }
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let rows = k.div_ceil(threads.min(k));
+        std::thread::scope(|s| {
+            for (i, band) in b.chunks_mut(rows * n).enumerate() {
+                s.spawn(move || self.dequant_rows(i * rows, band, f16::from_f64));
+            }
+        });
+        b
+    }
+
     /// The unpack itself: `scale*code (+ min)`, exact in f64, handed to `round`;
     /// row-major `k x n`.
     fn dequant_rowmajor<T: Copy + Default>(&self, round: impl Fn(f64) -> T) -> Vec<T> {
+        let mut b = vec![T::default(); self.k * self.n];
+        self.dequant_rows(0, &mut b, round);
+        b
+    }
+
+    /// Whole rows `d0..` of the row-major `k x n` unpack, into `out`.
+    fn dequant_rows<T: Copy>(&self, d0: usize, out: &mut [T], round: impl Fn(f64) -> T) {
         let (n, k) = (self.n, self.k);
+        if n == 0 {
+            return;
+        }
         let block = self.params.block;
-        let nbk = k.div_ceil(block);
-        let n_tiles = n.div_ceil(32);
+        let sc_per_tile = k.div_ceil(block) * 32;
         let nib_per_tile = k * 16;
-        let sc_per_tile = nbk * 32;
-        let mut b = vec![T::default(); k * n];
-        for t in 0..n_tiles {
-            for d in 0..k {
-                for c in 0..32 {
-                    let j = t * 32 + c;
-                    if j >= n {
-                        continue;
-                    }
-                    let byte = self.nibbles[t * nib_per_tile + d * 16 + c / 2];
-                    let nib = if c.is_multiple_of(2) {
-                        byte & 0x0f
-                    } else {
-                        byte >> 4
-                    };
-                    let code = i32::from(nib) - if nib < 8 { 0 } else { 16 };
-                    let bi = t * sc_per_tile + (d / block) * 32 + c;
-                    let mut w = f16::from_bits(self.scales[bi]).to_f64() * f64::from(code);
-                    if !self.mins.is_empty() {
-                        w += f16::from_bits(self.mins[bi]).to_f64();
-                    }
-                    b[d * n + j] = round(w);
+        for (r, row) in out.chunks_exact_mut(n).enumerate() {
+            let d = d0 + r;
+            for (j, w) in row.iter_mut().enumerate() {
+                let (t, c) = (j / 32, j % 32);
+                let byte = self.nibbles[t * nib_per_tile + d * 16 + c / 2];
+                let nib = if c.is_multiple_of(2) {
+                    byte & 0x0f
+                } else {
+                    byte >> 4
+                };
+                let code = i32::from(nib) - if nib < 8 { 0 } else { 16 };
+                let bi = t * sc_per_tile + (d / block) * 32 + c;
+                let mut v = f16::from_bits(self.scales[bi]).to_f64() * f64::from(code);
+                if !self.mins.is_empty() {
+                    v += f16::from_bits(self.mins[bi]).to_f64();
                 }
+                *w = round(v);
             }
         }
-        b
     }
 
     /// Columns (`n`) of the weight matrix.

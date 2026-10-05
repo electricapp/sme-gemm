@@ -79,7 +79,7 @@ fn max_rel_f64(got: &[f64], want: &[f64]) -> f64 {
 // f16/bf16 accumulation error grows roughly with sqrt(k): a defensible bound is
 // base * max(1, sqrt(k)/4) -- 4 cancels the typical sqrt(k) at the small-k
 // shapes where `base` already dominates, and lets the tolerance widen on deep K.
-// This mirrors the `(c * sqrt(k)/4).max(c)` pattern used in tests/correctness.rs.
+// This mirrors the `(c * sqrt(k)/4).max(c)` pattern used in tests/correctness/basic.rs.
 fn half_tol(base: f64, k: usize) -> f64 {
     (base * (k as f64).sqrt() / 4.0).max(base)
 }
@@ -98,7 +98,7 @@ proptest! {
     })]
 
     // f32 row-major matmul vs f64 oracle. f32 single-pass accumulation -> ~1e-4
-    // relative (same bound as tests/correctness.rs `f32_full`).
+    // relative (same bound as tests/correctness/basic.rs `f32_full`).
     #[test]
     fn prop_matmul_f32(
         (m, n, k) in (tail_dim(), tail_dim(), tail_dim()),

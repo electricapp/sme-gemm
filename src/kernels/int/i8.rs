@@ -46,6 +46,7 @@ pub fn matmul_i8_batched(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, 
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if has_sme() {
+        let _busy = crate::warm::busy("gemm_sme_i8i32_batched", m, n, k);
         // SAFETY: as in `matmul_f16_batched`, i8 in / i32 out.
         let rc = unsafe {
             gemm_sme_i8i32_batched(count, m, n, k, c.as_mut_ptr(), a.as_ptr(), b.as_ptr())
@@ -110,6 +111,7 @@ pub fn matmul_i8_batched_dequant(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if has_sme() {
         let fnodes = resolve_nodes(&dq.nodes, dq.act, n);
+        let _busy = crate::warm::busy("gemm_sme_i8i32_batched_dequant", m, n, k);
         // SAFETY: contiguous batches of `count` items, item strides m*k / k*n /
         // m*n; i8 in / f32 out. The shared scale vector and node operands (if set)
         // point at f32 the kernel only reads and outlive the call.
@@ -206,6 +208,7 @@ pub fn gemm_i8(
     crate::exec::check_strided("b", b.len(), k, b_row_stride, n, b_col_stride);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if sme_worth_it(m, n, k) {
+        let _busy = crate::warm::busy("gemm_sme_i8i32_run", m, n, k);
         // SAFETY: see `gemm_f16`; i8/i32 pointers cross directly.
         let rc = unsafe {
             gemm_sme_i8i32_run(
@@ -258,6 +261,7 @@ pub fn prepack_i8(b: &[i8], n: usize, k: usize) -> Packed<i8> {
         // SAFETY: pure size arithmetic on n/k; touches no memory.
         let elems = unsafe { gemm_sme_i8i32_packed_b_elems(n, k) };
         let mut data = vec![0i8; elems];
+        let _busy = crate::warm::busy("gemm_sme_i8i32_packb", 0, n, k);
         // row-major B: rhs_rs = n, rhs_cs = 1
         // SAFETY: `data` was sized by the call above; `b` is the caller's k*n
         // row-major B that packb only reads.
@@ -295,6 +299,7 @@ pub fn matmul_i8_packed(a: &[i8], packed: &Packed<i8>, c: &mut [i32], m: usize) 
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme {
+        let _busy = crate::warm::busy("gemm_sme_i8i32_packb", 0, n, k);
         // SAFETY: `packed.data` was produced by `gemm_sme_i8i32_packb` for
         // these (n, k); a / c are row-major m*k / m*n.
         let rc = unsafe {
@@ -357,6 +362,7 @@ pub fn matmul_i8_packed_dequant(
     let fnodes = resolve_nodes(&dq.nodes, dq.act, n);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme {
+        let _busy = crate::warm::busy("gemm_sme_i8i32_run_packed_dequant", m, n, k);
         // SAFETY: as in `matmul_i8_packed`; scale_per_n / node operands (if set)
         // point at f32 the kernel only reads. Output c is row-major f32. The node
         // array outlives the call (owned by `fnodes`).

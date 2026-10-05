@@ -57,6 +57,7 @@ pub fn gemm_i16(
     crate::exec::check_strided("b", b.len(), k, b_row_stride, n, b_col_stride);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_i16i64 && sme_worth_it(m, n, k) {
+        let _busy = crate::warm::busy("gemm_sme_i16i64_run", m, n, k);
         // SAFETY: see `gemm_i8`; i16/i64 pointers cross directly.
         let rc = unsafe {
             gemm_sme_i16i64_run(
@@ -135,6 +136,7 @@ pub fn matmul_i16_dequant(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_i16i64 && sme_worth_it(m, n, k) {
         let fnodes = resolve_nodes(&dq.nodes, dq.act, n);
+        let _busy = crate::warm::busy("gemm_sme_i16i64_run_dequant", m, n, k);
         // SAFETY: row-major i16 in (lhs_rs=k, lhs_cs=1; rhs_rs=n, rhs_cs=1),
         // row-major f32 out (dst_rs=n, dst_cs=1). scale_per_n / node operands (if
         // set) point at f32 the kernel only reads; the node array outlives the
@@ -211,6 +213,7 @@ pub fn matmul_i16_batched(a: &[i16], b: &[i16], c: &mut [i64], m: usize, n: usiz
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_i16i64 {
+        let _busy = crate::warm::busy("gemm_sme_i16i64_batched", m, n, k);
         // SAFETY: contiguous row-major batches of `count` items, item strides
         // m*k / k*n / m*n; i16 in / i64 out, written within bounds.
         let rc = unsafe {
@@ -280,6 +283,7 @@ pub fn matmul_i16_batched_dequant(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_i16i64 {
         let fnodes = resolve_nodes(&dq.nodes, dq.act, n);
+        let _busy = crate::warm::busy("gemm_sme_i16i64_batched_dequant", m, n, k);
         // SAFETY: contiguous batches of `count` items, item strides m*k / k*n /
         // m*n; i16 in / f32 out. The shared scale vector and node operands (if set)
         // point at f32 the kernel only reads and outlive the call.
@@ -351,6 +355,7 @@ pub fn prepack_i16(b: &[i16], n: usize, k: usize) -> Packed<i16> {
         // SAFETY: pure size arithmetic on n/k; touches no memory.
         let elems = unsafe { gemm_sme_i16i64_packed_b_elems(n, k) };
         let mut data = vec![0i16; elems];
+        let _busy = crate::warm::busy("gemm_sme_i16i64_packb", 0, n, k);
         // SAFETY: `data` was sized by the call above, and `b` is the caller's
         // k*n row-major B (rhs_rs = n, rhs_cs = 1) that packb only reads.
         unsafe {
@@ -387,6 +392,7 @@ pub fn matmul_i16_packed(a: &[i16], packed: &Packed<i16>, c: &mut [i64], m: usiz
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme {
+        let _busy = crate::warm::busy("gemm_sme_i16i64_packb", 0, n, k);
         // SAFETY: `packed.data` was produced by `gemm_sme_i16i64_packb` for these
         // (n, k); a / c are row-major m*k / m*n. Null dq => the i64 store.
         let rc = unsafe {
@@ -451,6 +457,7 @@ pub fn matmul_i16_packed_dequant(
             n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
             nodes: fnodes.as_ptr(),
         };
+        let _busy = crate::warm::busy("gemm_sme_i16i64_run_packed_impl", m, n, k);
         // SAFETY: as in `matmul_i16_packed`, with an f32 output and a dq
         // descriptor whose operand slices are length-validated and outlive it.
         let rc = unsafe {

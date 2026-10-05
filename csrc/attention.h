@@ -31,4 +31,16 @@ void attn_flash_finish_f32(float *o, size_t m, size_t dv, long o_rs, const float
 ATTN_FLASH_HALF_DECLS(f16, __fp16)
 ATTN_FLASH_HALF_DECLS(bf16, uint16_t)
 
+// One query row against an f16 KV cache (see attention.c). hd % 8 == 0,
+// hd <= 256, len >= 1, n_heads a multiple of n_kv_heads; scores holds len floats.
+void attn_kv_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v, size_t len,
+                     size_t ld, size_t n_heads, size_t n_kv_heads, size_t hd, float scale,
+                     float *scores);
+
+// A block of query rows at positions start..start+rows against the cache
+// (row i sees keys 0..start+i); rows spread across cores. 0, or -1 on OOM.
+int attn_kv_causal_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v, size_t start,
+                    size_t rows, size_t ld, size_t n_heads, size_t n_kv_heads, size_t hd,
+                    float scale);
+
 #endif // SME_GEMM_ATTENTION_H

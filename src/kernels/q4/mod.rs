@@ -21,6 +21,7 @@ use crate::kernels::bf16::prepack_bf16;
 use crate::kernels::f16::prepack_f16;
 
 mod matmul;
+mod quantize;
 mod weights;
 
 pub use matmul::{matmul_q4, matmul_q4_bf16, matmul_q4_bf16_ep, matmul_q4_ep};

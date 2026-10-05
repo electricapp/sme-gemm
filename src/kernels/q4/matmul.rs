@@ -60,6 +60,7 @@ fn q4_f16_impl(a: &[f16], w: &Q4Weights, c: &mut [f16], m: usize, ep: &Epilogue<
         } else {
             &raw const desc
         };
+        let _busy = crate::warm::busy("gemm_sme_f16f16_q4", m, n, k);
         // SAFETY: a / c are row-major m*k / m*n; nibbles/scales describe the
         // weights' (n, k) in the tile-major resident layout the kernel expects;
         // the node operands are length-validated above and outlive the call.
@@ -168,6 +169,7 @@ fn q4_bf16_impl(a: &[bf16], w: &Q4Weights, c: &mut [bf16], m: usize, ep: &Epilog
         } else {
             (core::ptr::null(), core::ptr::null())
         };
+        let _busy = crate::warm::busy("gemm_sme_b16b16_q4", m, n, k);
         // SAFETY: as `q4_f16_impl`, with bf16 activations/output -- the kernel
         // reads the same tile-major nibbles and f16 scales; the bf16 copies have
         // the same shape.

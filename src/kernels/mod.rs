@@ -8,4 +8,5 @@ pub(crate) mod f16;
 pub(crate) mod f32;
 pub(crate) mod f64;
 pub(crate) mod int;
+pub(crate) mod kv_attention;
 pub(crate) mod q4;

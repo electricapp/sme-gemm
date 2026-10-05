@@ -7,7 +7,7 @@
 //! right after one (underrun traps). An unpredicated load/store even one
 //! element past a buffer edge faults the process immediately rather than
 //! silently corrupting the heap. Results are not checked here -- correctness
-//! is tests/correctness.rs' job; this suite only has to survive.
+//! belongs to tests/correctness/; this suite only has to survive.
 //!
 //! On non-SME hosts the same calls run the bounds-checked Rust reference, so
 //! the suite is cheap there and the guard pages are exercised for real on M4+.

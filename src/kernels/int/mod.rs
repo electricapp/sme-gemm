@@ -85,6 +85,7 @@ mod strided_dequant_tests {
 
         // Column-major output: dst_cs = m (stride between columns), dst_rs = 1.
         let mut c = vec![0.0f32; m * n];
+        let _busy = crate::warm::busy("gemm_sme_i8i32_run_packed_dequant", m, n, k);
         // SAFETY: b_pack is sized by the kernel's own packed_b_elems and filled
         // by its packb; a is row-major m*k; c is m*n and the (m, 1) strides
         // describe it column-major, which is exactly the arm under test.
@@ -147,6 +148,7 @@ mod strided_dequant_tests {
         };
 
         let mut c = vec![0.0f32; m * n];
+        let _busy = crate::warm::busy("gemm_sme_i16i64_run_packed_impl", m, n, k);
         // SAFETY: as the i8 case, with the i16 packb and its void-typed dst.
         let rc = unsafe {
             let elems = gemm_sme_i16i64_packed_b_elems(n, k);

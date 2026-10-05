@@ -76,7 +76,9 @@ matching f16).
   tanh, softplus, mish, elu, selu, hardswish, hardsigmoid, softsign; unary abs,
   neg, sign, square, sqrt, rsqrt, recip, exp, log; clamp. Full op parity across
   f16/bf16/f32/f64 and i8/i16→f32 dequant (bf16 runs the graph in f32, then
-  rounds). A leading per-column bias folds into the accumulator. `.beta(b)`
+  rounds). On the 16-bit paths a trailing gelu/silu/sigmoid/tanh runs as a NEON
+  pass after the kernel, since streaming mode is slow at it (ARCHITECTURE.md
+  §2.5). A leading per-column bias folds into the accumulator. `.beta(b)`
   scales the product; `.col_major_output()` stores C column-major.
   `epilogue_map` is the non-fused escape hatch.
 - **Strided GEMM** — `gemm_{f16,bf16,f32,f64,i8,i16}`: `C = αC + β(A @ B)` with
@@ -89,6 +91,33 @@ matching f16).
 - **Pre-packed weights** — `prepack_*` once, reuse. Calls that skip it pack B
   inside the parallel GEMM (or, for m ≤ 4, read it in place) and land within a
   few percent of the pre-packed rate on large shapes.
+- **Model building blocks** — the pieces between "a GEMM" and "a model":
+  - `Linear`: a layer's weights, 4-bit (`Linear::quantize`, from f32) or f16,
+    from either `WeightLayout` (`OutIn` is PyTorch's `[out][in]`), with an
+    optional bias. It takes f32 or f16 rows, writes f16, f32, or adds into an f32
+    residual stream (`accumulate`), and picks the kernel by row count: the Q4
+    GEMV under 8 rows, an f16 panel built once on first use from 8.
+  - `GatedLinear`: the gate and up projections of a SwiGLU / GeGLU MLP as one
+    matmul (interleaved 32 columns at a time) plus one NEON `act(g)·u` pass.
+  - An input RMSNorm folds into the layer after it: `WeightLayout::scale_inputs`
+    multiplies the norm's weight into W once, and `.rms_norm_input(eps)` applies
+    the per-row `1/rms(x)` as the epilogue's first step, so no normalized copy of
+    `x` is written.
+  - `Q4Weights::quantize` (`Q4_0` / `Q4_1`, any block) and `prepack(w, layout,
+    n, k)` for every dtype, so weights go in as they are stored.
+  - `KvCache`: an f16 key/value cache with `push` / `attend` / `attend_causal`
+    (grouped-query aware; NEON, since one row has no GEMM in it), over
+    `attention_kv_f16` / `attention_kv_causal_f16`.
+  - `nn::layer_norm` / `nn::rms_norm`, writing f16 straight for the next matmul.
+  - `SmeWarm` keeps the SME unit awake between calls: it idles within a few
+    hundred ns, and a loop alternating short SME calls with NEON work otherwise
+    pays ~1 µs per call to wake it. `SME_GEMM_TRACE=1` prints every SME call
+    with its shape, time and the idle gap before it, flagging those that paid
+    the wake.
+  - `HotPool::new(workers)` keeps worker threads spinning so short NEON passes
+    can split across cores without GCD's microseconds of wake-up: `KvCache`
+    attention splits its heads across them from 64 cached keys (2x at 128 keys,
+    2.9x at 1024 on M5).
 - **candle** / **burn** adapters (optional features).
 - Scalar reference fallback off Apple.
 
@@ -178,8 +207,8 @@ footprint win (`O(m·d + n·d + n·dv)`), not a speed win, until 4096²:
 
 |                | m=1 ×4096² | m=16 | m=128 | m=256 | 1024³ |
 | -------------- | ---------- | ---- | ----- | ----- | ----- |
-| q4-resident ms | 0.08       | 0.49 | 1.08  | 1.93  | 0.47  |
-| eager-f16 ms   | 0.25       | 0.35 | 0.93  | 1.78  | 0.46  |
+| q4-resident ms | 0.07       | 0.47 | 1.10  | 1.99  | 0.47  |
+| eager-f16 ms   | 0.26       | 0.35 | 0.94  | 1.78  | 0.46  |
 
 Q4 holds a 4× smaller resident weight set. Up to `m=7` it runs the LUTI4 GEMV
 and reads a quarter of eager's bytes (3× at `m=1`). Above that it unpacks each
@@ -203,8 +232,9 @@ is the floor, not streaming-entry amortization.
 Fused i8/i16→f32 dequant + bias + gelu (`examples/dequant_bench`).
 
 - ¹ m = 1: one row vs a resident weight set, bandwidth-bound. m ≤ 4 (Q4: m ≤ 7)
-  runs a ZA-vector GEMV (SME2 multi-vector FMLA/SDOT, LUTI4 for Q4) at ~130 GB/s
-  of DRAM; the TF/s column understates that.
+  runs a ZA-vector GEMV (SME2 multi-vector FMLA/SDOT, LUTI4 for Q4); Q4 at m = 1
+  reads ~135 GB/s with the weights in L2 and ~80 GB/s from DRAM. The TF/s column
+  understates that.
 - ² No pre-packed entry point — the call would re-pack the whole weight set.
 - † No native f16 GEMM; f16 inputs run through f32.
 
@@ -248,9 +278,54 @@ gemm_f32(m, n, k, &mut cf, /*c_row*/ n, /*c_col*/ 1,
     &bf, /*b_row*/ n, /*b_col*/ 1, /*alpha*/ 1.0, /*beta*/ 1.0);
 ```
 
+A transformer block from the building blocks (weights as PyTorch stores them):
+
+```rust
+use half::f16;
+use sme_gemm::{Epilogue, KvCache, Linear, SmeWarm, WeightLayout, nn};
+
+let (d, heads) = (384, 6);
+let w_qkv = vec![0.01f32; 3 * d * d]; // [out][in]
+let w_fc = vec![0.01f32; 4 * d * d];
+let qkv = Linear::quantize(&w_qkv, WeightLayout::OutIn, 3 * d, d);
+let proj = Linear::quantize(&vec![0.01; d * d], WeightLayout::OutIn, d, d);
+let fc = Linear::quantize(&w_fc, WeightLayout::OutIn, 4 * d, d);
+let fc2 = Linear::quantize(&vec![0.01; d * 4 * d], WeightLayout::OutIn, d, 4 * d);
+let (ln1, ln2) = (vec![1.0f32; d], vec![1.0f32; d]);
+let mut cache = KvCache::new(heads, heads, d / heads, 256);
+let _warm = SmeWarm::new(); // keep the SME unit awake across the NEON work
+
+let mut x = vec![0.1f32; d]; // one position's residual stream, f32
+let (mut h, mut t) = (vec![f16::ZERO; d], vec![f16::ZERO; 3 * d]);
+let (mut y, mut ff) = (vec![0.0f32; d], vec![f16::ZERO; 4 * d]);
+nn::layer_norm(&x, &ln1, None, 1e-5, &mut h);
+qkv.forward(&h, &mut t, 1);
+cache.push(&t[d..2 * d], &t[2 * d..]);
+cache.attend(&t[..d], &mut y);
+proj.accumulate(&y, &mut x, 1); // x += y @ W
+nn::layer_norm(&x, &ln2, None, 1e-5, &mut h);
+fc.forward_ep(&h, &mut ff, 1, &Epilogue::new().gelu());
+fc2.accumulate(&ff, &mut x, 1);
+```
+
 Also: `matmul_{bf16,f32,f64,i16}`, `gemm_*`, `matmul_*_batched`,
 `matmul_i16_dequant`, `dequant_q4` / `matmul_q4`, optional
 `sme_gemm::candle::sme_matmul`. Caps: `sme_gemm::caps()`.
+
+**End to end.** `examples/shakespeare` runs nanoGPT shakespeare-char (10.7M
+parameters) from these blocks alone (`Linear`, `KvCache`, `nn::layer_norm`,
+`SmeWarm`, `HotPool`; the model file adds only embeddings and sampling) as a
+CLI that continues a prompt. On an M5 it generates ~12k characters/s (~13.5k
+at short context) with the validation loss of the f32 model:
+
+```sh
+examples/shakespeare/fetch.sh             # once: checkpoint + text, ~45 MB (curl, python3)
+cargo run --release --example shakespeare -- "ROMEO:"
+cargo run --release --example shakespeare -- --bench   # accuracy vs f32, speed
+cargo install --path . --example shakespeare           # optional: `shakespeare` on PATH
+```
+
+`examples/sme_warm` shows the wake cost `SmeWarm` removes.
 
 ## Design
 

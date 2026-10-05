@@ -165,6 +165,7 @@ pub fn gemm_bf16(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if sme_worth_it(m, n, k) {
         let b16b16 = accum.is_bf16() && caps().sme_b16b16;
+        let _busy = crate::warm::busy("gemm_sme_b16b16_run", m, n, k);
         // SAFETY: see `gemm_f16`. bf16 is a transparent u16.
         let rc = unsafe {
             if b16b16 {
@@ -243,6 +244,7 @@ pub fn prepack_bf16(b: &[bf16], n: usize, k: usize) -> Packed<bf16> {
         // SAFETY: pure size arithmetic on n/k; touches no memory.
         let elems = unsafe { gemm_sme_b16b16_packed_b_elems(n, k) };
         let mut data = vec![0u16; elems];
+        let _busy = crate::warm::busy("gemm_sme_b16b16_packb", 0, n, k);
         // row-major B: rhs_rs = n, rhs_cs = 1
         // SAFETY: `data` was sized by the call above, and `b` is the caller's
         // k*n row-major B (rhs_rs = n, rhs_cs = 1) that packb only reads.
@@ -287,6 +289,7 @@ pub fn matmul_bf16_packed(a: &[bf16], packed: &Packed<bf16>, c: &mut [bf16], m: 
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme {
+        let _busy = crate::warm::busy("gemm_sme_b16b16_packb", 0, n, k);
         // SAFETY: `packed.data` was produced by `gemm_sme_b16b16_packb` for
         // these (n, k); a / c are row-major m*k / m*n.
         let rc = unsafe {
@@ -402,6 +405,7 @@ pub fn matmul_bf16_batched(a: &[bf16], b: &[bf16], c: &mut [bf16], m: usize, n: 
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_b16b16 {
+        let _busy = crate::warm::busy("gemm_sme_b16b16_batched", m, n, k);
         // SAFETY: as in `matmul_f16_batched`, bf16 buffers.
         let rc = unsafe {
             crate::ffi::gemm_sme_b16b16_batched(

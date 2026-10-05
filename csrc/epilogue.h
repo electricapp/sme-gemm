@@ -26,7 +26,7 @@
 // =============================================================================
 //
 // CONCEPT. This file is the op-graph INTERPRETER that every gemm_*.c kernel
-// includes. The Rust side (src/epilogue.rs) builds an array of EpNode and hands
+// includes. The Rust side (src/epilogue/mod.rs) builds an array of EpNode and hands
 // it across FFI in an ep_desc{16,_f32,_f64}. At the ZA->C store, the kernel reads
 // the live accumulator slice into registers and walks the node list, mutating the
 // running value x in order, then stores. No separate pass over C.
@@ -230,7 +230,7 @@ typedef struct {
     size_t ld;
 } EpNode;
 
-// Pin the layout the Rust #[repr(C)] mirror (src/epilogue.rs) asserts against:
+// Pin the layout the Rust #[repr(C)] mirror (src/epilogue/mod.rs) asserts against:
 // 32 bytes on arm64, with the 4-byte hole before `ptr`. Drift = silent FFI UB.
 _Static_assert(sizeof(EpNode) == 32, "EpNode must match the Rust mirror (32 bytes)");
 _Static_assert(offsetof(EpNode, op) == 0, "EpNode.op offset must match the Rust mirror");

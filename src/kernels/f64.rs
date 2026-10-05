@@ -61,6 +61,7 @@ pub fn gemm_f64(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_f64f64 && sme_worth_it(m, n, k) {
+        let _busy = crate::warm::busy("gemm_sme_f64_run", m, n, k);
         // SAFETY: see `gemm_f32`; f64 pointers/scalars cross directly.
         let rc = unsafe {
             gemm_sme_f64_run(
@@ -140,6 +141,7 @@ pub fn matmul_f64_batched(a: &[f64], b: &[f64], c: &mut [f64], m: usize, n: usiz
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_f64f64 {
+        let _busy = crate::warm::busy("gemm_sme_f64_batched", m, n, k);
         // SAFETY: contiguous row-major batches of count items, item strides
         // m*k / k*n / m*n; the kernel reads a/b and writes c within bounds.
         let rc =
@@ -209,6 +211,7 @@ pub fn matmul_f64_batched_ep(
             n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
             nodes: fnodes.as_ptr(),
         };
+        let _busy = crate::warm::busy("gemm_sme_f64_batched_ep", m, n, k);
         // SAFETY: contiguous row-major batches of `count` items, item strides
         // m*k / k*n / m*n; the kernel reads a/b and writes c in bounds. The
         // shared node array (and its operand slices) outlive the call. Operands
@@ -251,6 +254,7 @@ pub fn prepack_f64(b: &[f64], n: usize, k: usize) -> Packed<f64> {
         // B (rhs_rs = n, rhs_cs = 1) into a buffer of exactly that many elements.
         let elems = unsafe { gemm_sme_f64_packed_b_elems(n, k) };
         let mut data = vec![0f64; elems];
+        let _busy = crate::warm::busy("gemm_sme_f64_packb", 0, n, k);
         // SAFETY: `data` was sized by the call above; `b` is the caller's k*n
         // row-major B that packb only reads.
         unsafe {

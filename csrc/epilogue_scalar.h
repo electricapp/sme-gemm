@@ -17,7 +17,7 @@
 // paths, but it is NOT free -- do not route a hot store through here.
 //
 // NaN SEMANTICS (unified across SIMD / C scalar / Rust; pinned by
-// tests/correctness.rs):
+// tests/correctness/nan.rs):
 //   - MAX/MIN nodes and the standalone ReLU are maxNum/minNum. Lowering them to
 //     FMAX/FMIN instead makes the paths disagree -- those PROPAGATE NaN, so the
 //     answer would depend on the output layout. FMAXNM costs the same as FMAX

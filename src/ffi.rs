@@ -82,6 +82,11 @@ const _: () = {
 
 // ---- C kernels (Apple aarch64 only) ----------------------------------------
 unsafe extern "C" {
+    /// `out = act(gate) * up` over rows of gate/up interleaved 32 columns at a
+    /// time (`neon_ops.c`); `act` is an `EP_ACT_*` kind.
+    pub(crate) fn neon_glu_f16(out: *mut u16, input: *const u16, m: usize, n: usize, act: u32);
+    /// ~0.1 us of streaming-mode work for the keep-awake helper (`warm.rs`).
+    pub(crate) fn sme_warm_tick();
     pub(crate) fn gemm_sme_f16f16_run(
         m: usize,
         n: usize,
@@ -365,6 +370,34 @@ unsafe extern "C" {
         dv: usize,
         o_rs: isize,
         row_sum: *const f32,
+    );
+    /// A block of query rows against an f16 KV cache, rows across cores.
+    pub(crate) fn attn_kv_causal_f16(
+        out: *mut f32,
+        q: *const f32,
+        k: *const u16,
+        v: *const u16,
+        start: usize,
+        rows: usize,
+        ld: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        hd: usize,
+        scale: f32,
+    ) -> i32;
+    /// One query row against an f16 KV cache (`attention.c`).
+    pub(crate) fn attn_kv_f16(
+        out: *mut f32,
+        q: *const f32,
+        k: *const u16,
+        v: *const u16,
+        len: usize,
+        ld: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        hd: usize,
+        scale: f32,
+        scores: *mut f32,
     );
     pub(crate) fn attn_flash_block_f16(
         s: *mut u16,

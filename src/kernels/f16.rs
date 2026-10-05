@@ -216,6 +216,7 @@ pub fn prepack_f16(b: &[f16], n: usize, k: usize) -> Packed<f16> {
         // SAFETY: pure size arithmetic on n/k; touches no memory.
         let elems = unsafe { gemm_sme_f16f16_packed_b_elems(n, k) };
         let mut data = vec![0u16; elems];
+        let _busy = crate::warm::busy("gemm_sme_f16f16_packb", 0, n, k);
         // row-major B: rhs_rs = n, rhs_cs = 1
         // SAFETY: `data` was sized by the call above, and `b` is the caller's
         // k*n row-major B (rhs_rs = n, rhs_cs = 1) that packb only reads.
@@ -260,6 +261,7 @@ pub fn matmul_f16_packed(a: &[f16], packed: &Packed<f16>, c: &mut [f16], m: usiz
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme {
+        let _busy = crate::warm::busy("gemm_sme_f16f16_packb", 0, n, k);
         // SAFETY: `packed.data` was produced by `gemm_sme_f16f16_packb` for
         // these (n, k); a / c are row-major m*k / m*n.
         let rc = unsafe {
@@ -366,6 +368,7 @@ pub fn matmul_f16_batched(a: &[f16], b: &[f16], c: &mut [f16], m: usize, n: usiz
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if caps().sme_f16f16 {
+        let _busy = crate::warm::busy("gemm_sme_f16f16_batched", m, n, k);
         // SAFETY: contiguous row-major batches of count items, item strides
         // m*k / k*n / m*n; the kernel reads a/b and writes c within bounds.
         let rc = unsafe {

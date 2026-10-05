@@ -30,8 +30,11 @@ const CSRC: &[&str] = &[
     "epilogue_bf16.h",
     "epilogue_f32.h",
     "epilogue_f64.h",
+    "neon_act.h",
     "sme_probe.c",
     "sme_runtime_shims.c",
+    "sme_warm.c",
+    "neon_ops.c",
     "attention.c",
     "attention.h",
     "gemm_f16f32.c",
@@ -127,7 +130,9 @@ fn compile_sme_kernels() {
     let mut sme = cc::Build::new();
     base(&mut sme);
     sme.file("csrc/sme_runtime_shims.c")
-        .file("csrc/sme_probe.c");
+        .file("csrc/sme_probe.c")
+        .file("csrc/sme_warm.c")
+        .file("csrc/neon_ops.c");
     for f in [
         "gemm_f16f32.c",
         "gemm_bf16f32.c",

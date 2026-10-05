@@ -62,6 +62,7 @@ pub(crate) fn f32_packed_ep_impl(
         } else {
             core::ptr::null()
         };
+        let _busy = crate::warm::busy("gemm_sme_f32_run_packed", m, n, k);
         // SAFETY: a is row-major m*k; `packed.data` is either the packb panel for
         // these (n, k) or a row-major k*n copy, matched to the entry point called
         // below; c strides describe the chosen layout; operands were validated.
@@ -149,6 +150,7 @@ pub fn softmax_gemm_f32(a: &[f32], packed: &Packed<f32>, c: &mut [f32], m: usize
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme {
         let mut row_max = vec![0.0f32; m];
+        let _busy = crate::warm::busy("gemm_sme_f32_softmax", m, n, k);
         // SAFETY: a is row-major m*k, c row-major m*n, `packed.data` is the packb
         // panel for these (n, k), and row_max is the length-m scratch the kernel
         // fills before consuming it.
@@ -219,6 +221,7 @@ pub(crate) fn f32_packed_ep_reduce(
                 .as_deref_mut()
                 .map_or(core::ptr::null_mut(), <[f32]>::as_mut_ptr),
         };
+        let _busy = crate::warm::busy("gemm_sme_f32_run_packed", m, n, k);
         // SAFETY: as `f32_packed_ep_impl`, plus two length-m `&mut [f32]` outputs
         // the kernel writes one row at a time. The driver keeps every N-tile of a
         // row on one thread (its N-parallel branch is disabled when a reduction
@@ -474,6 +477,7 @@ pub(crate) fn f64_packed_ep_impl(
         } else {
             core::ptr::null()
         };
+        let _busy = crate::warm::busy("gemm_sme_f64_run_packed", m, n, k);
         // SAFETY: a is row-major m*k; `packed.data` is either the packb panel for
         // these (n, k) or a row-major k*n copy, matched to the entry point called
         // below; c strides describe the chosen layout; operands were validated.

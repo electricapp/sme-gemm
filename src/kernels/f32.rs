@@ -60,6 +60,7 @@ pub fn gemm_f32(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if sme_worth_it(m, n, k) {
+        let _busy = crate::warm::busy("gemm_sme_f32_run", m, n, k);
         // SAFETY: see `gemm_f16`; f32 pointers/scalars cross directly.
         let rc = unsafe {
             gemm_sme_f32_run(
@@ -140,6 +141,7 @@ pub fn matmul_f32_batched(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usiz
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if has_sme() {
+        let _busy = crate::warm::busy("gemm_sme_f32_batched", m, n, k);
         // SAFETY: contiguous row-major batches of count items, item strides
         // m*k / k*n / m*n; the kernel reads a/b and writes c within bounds.
         let rc =
@@ -208,6 +210,7 @@ pub fn matmul_f32_batched_ep(
             u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
             fnodes.as_ptr(),
         );
+        let _busy = crate::warm::busy("gemm_sme_f32_batched_ep", m, n, k);
         // SAFETY: contiguous row-major batches of `count` items, item strides
         // m*k / k*n / m*n; the kernel reads a/b and writes c in bounds. The
         // shared node array (and its operand slices) outlive the call. Operands
@@ -250,6 +253,7 @@ pub fn prepack_f32(b: &[f32], n: usize, k: usize) -> Packed<f32> {
         // B (rhs_rs = n, rhs_cs = 1) into a buffer of exactly that many elements.
         let elems = unsafe { gemm_sme_f32_packed_b_elems(n, k) };
         let mut data = vec![0f32; elems];
+        let _busy = crate::warm::busy("gemm_sme_f32_packb", 0, n, k);
         // SAFETY: `data` was sized by the call above; `b` is the caller's k*n
         // row-major B that packb only reads.
         unsafe {
@@ -286,6 +290,7 @@ pub fn matmul_f32_packed(a: &[f32], packed: &Packed<f32>, c: &mut [f32], m: usiz
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme {
+        let _busy = crate::warm::busy("gemm_sme_f32_packb", 0, n, k);
         // SAFETY: `packed.data` was produced by `gemm_sme_f32_packb` for these
         // (n, k); a / c are row-major m*k / m*n.
         let rc = unsafe {

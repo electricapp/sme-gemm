@@ -134,6 +134,11 @@ MOPAs, ZA reads and writes, and the vectorized store epilogue. Elementwise work
 that does not map onto ZA runs outside the region: the attention softmax is
 parallel NEON in `csrc/attention.c`. Elementwise work that does map onto ZA
 stays in: the Q4 unpack is LUTI4, an FMLA into ZA and a MOVA out (§2.9).
+The same holds for a trailing gelu, silu, sigmoid or tanh on the 16-bit paths:
+in a streaming epilogue they cost ~2.5 ns an output, so the entry points split
+them off the op-graph and run them as a NEON pass over C after the kernel
+(`csrc/neon_act.h`, row chunks across cores when C is large), computing in f32
+on the stored value. Cheap nodes (bias, scale, clamp, relu) stay fused.
 Per-cell scalar loops (`ep_dequant_cell*`) survive only for a strided `dst`,
 since streaming mode has no scatter store, and even there the dequant and
 op-graph run vectorized into a contiguous row first.
@@ -196,6 +201,16 @@ builds poison a reused buffer with all-ones (a NaN in f32, f16 and bf16) to keep
 that invariant enforced, since breaking it is otherwise silent — on the first
 key block `corr` is 0, so `acc = corr*acc + t` discards finite garbage.
 
+One query row against a KV cache has no GEMM in it: `attention_kv_f16` is NEON
+on the calling thread over an f16 cache of row-major
+`[position][kv_heads * head_dim]` rows, so appending a key/value row is a row
+copy. Scores take FMLAL (f16 × f16 → f32) four key rows at a time with low and
+high halves in separate accumulators; the values take FMLAL against f16-rounded
+probabilities selected by lane. A transposed key layout would drop the
+horizontal sums but cost a strided write per element on every append.
+`attention_kv_causal_f16` runs a block of query rows (row i sees keys
+`0..=start+i`) as independent rows of the same kernel, spread across cores.
+
 ### 2.8 Small m: ZA-vector GEMV
 
 With one live row a MOPA spends 1/32 of its work (1/16 for the 16×16 tiles), so
@@ -229,6 +244,15 @@ scale factors out of each K-block, so the block sums raw codes in groups 0-3
 vg1x4 group w lies in ZA64 tile w%8. bf16 folds with a bf16 copy of the scales,
 built once per weight set. Q4 keeps the GEMV to m ≤ 7, not 4, because its MOPA
 path also pays the panel unpack.
+
+One row (`run_q4_gemv1`) builds A's broadcasts in the kernel instead: per four
+depths, one 16-byte replicating load (`LD1RQH`) and four indexed `DUP`s, shared
+by a pass of 8 tiles (one row leaves ZA room for 8 block sums and 8 totals). The
+materialized `[k][32]` broadcast is written on the calling core and re-read by
+the SME unit on every pass at four times the bytes of the nibbles it multiplies,
+which dominates calls at 1024² and under. The `DUP`s are streaming ALU work, so
+they only pay shared across many tiles; with more rows each broadcast serves
+fewer tiles, and m > 1 keeps the materialized form.
 
 ### 2.9 Q4 MOPA path: one shared unpack per B-block
 
@@ -290,6 +314,35 @@ the tests check them against it bit for bit, across transposed, strided and
 column-major layouts.
 
 ---
+
+### 2.11 Keeping the SME unit awake
+
+A P-cluster's SME unit idles within a few hundred nanoseconds of its last
+streaming instruction and the next call pays about a microsecond to wake it, so
+a loop of short GEMVs alternating with NEON layernorm, attention and
+activations pays it on every call. While an `SmeWarm` guard is alive, a
+helper thread at user-interactive QoS issues a ~0.1 µs burst of FMLAs into a
+private ZA whenever no library call is in flight (`csrc/sme_warm.c`,
+`src/warm.rs`). Each SME entry point holds a busy mark for its call, and calls
+in a NEON phase (`NA_NEON_PHASE`) count as idle so the helper covers that work
+too. With no call for a few milliseconds the helper sleeps. macOS has no
+affinity control, so on a chip with several P-clusters it helps only when the
+scheduler shares the caller's cluster.
+
+### 2.12 Spinning workers for short NEON passes
+
+One layer's KV attention over a short cache is a few microseconds on one core,
+about what `dispatch_apply` charges to wake its workers. While a `HotPool` is
+alive (`src/pool.rs`), its workers spin, each on its own 128-byte mailbox, and a
+call posts one job to as many of them as it has items to spare, then claims
+items itself. The job lives on the caller's stack: the caller returns only once
+every engaged worker has stored the job's sequence as done, and a worker counts
+a job as pending whenever its posted sequence is ahead of its done one, so a job
+posted before the worker started is still taken. Shutdown takes the pool's
+in-use flag before stopping the workers, so a job is never posted to one that is
+leaving. KV attention splits by KV-head group from 64 cached keys, bit for bit
+the one-thread result. Idle workers back off to sleeping after a few
+milliseconds.
 
 ## 3. Translation units and feature gating
 
@@ -382,7 +435,30 @@ the matching flag before dispatching to an M5 kernel.
   `f64.rs`, `int/` (`i8.rs`, `i16.rs`), and `q4/` (`weights.rs` builds and
   dequantizes `Q4Weights`, `matmul.rs` the GEMM entry points). Each wires the
   worth-it check, the FFI call and the scalar fallback. `attention.rs` and
-  `attention_half.rs` hold the flash-attention drivers (§2.7).
+  `attention_half.rs` hold the flash-attention drivers, `kv_attention.rs` the
+  KV-cache attention (§2.7).
+- **`warm.rs`** — `SmeWarm`, the per-call busy mark (§2.11), and the
+  `SME_GEMM_TRACE` per-call report, which hangs off the same mark.
+- **`pool.rs`** — `HotPool`, the spinning workers for short NEON passes (§2.12).
+- **`linear.rs`, `layout.rs`, `nn.rs`** — the model-level layer over the
+  kernels. `Linear` holds a layer's weights (Q4 with a lazily built f16 panel,
+  or f16) and an optional bias, and routes each call by row count: the Q4 GEMV
+  below 8 rows, where reading the weights is the cost, and the dense f16 GEMM on
+  the panel from 8, where the Q4 MOPA path would unpack every block again per
+  call (the two agree bit for bit). Its bias goes in front of any caller
+  epilogue, where it folds into the accumulator; with `rms_norm_input` a per-row
+  `1/rms(x)` goes in front of that (the norm's weight is folded into W by
+  `WeightLayout::scale_inputs`). `GatedLinear` stores gate and up interleaved
+  in whole 32-column tiles of one `Linear`, so each column quantizes and
+  accumulates exactly as it would alone, then runs the gated activation as a
+  NEON pass (`csrc/neon_ops.c`, with `neon_act.h`'s activations). `ModelFloat`
+  lets the helpers
+  take f32 or f16 and convert at their edges in thread-local scratch.
+  `WeightLayout` / `prepack` accept weights as checkpoints store them;
+  `Q4Weights::quantize` lives with the Q4 kernels (`q4/quantize.rs`).
+  `KvCache` (in `kernels/kv_attention.rs`) wraps the KV-cache attention.
+  `nn` is plain Rust that LLVM vectorizes: one row is too little work to
+  thread or to stream.
 - **`reference.rs`** — the portable scalar GEMM oracle (§6).
 - **`probe.rs`** — runtime capability detection (§3.2).
 - **`burn.rs`, `candle.rs`** — optional framework adapters, feature-gated.

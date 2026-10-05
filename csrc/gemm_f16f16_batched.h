@@ -87,8 +87,8 @@ __arm_locally_streaming __arm_new("za") static void run_batched(
 // NULL or n_nodes==0 is the raw-store path (bit-identical to the no-ep ABI).
 // `count` independent row-major C_i = A_i @ B_i (same shape), one streaming-mode
 // session. lhs/rhs/dst are contiguous batches (item strides m*k / k*n / m*n).
-int gemm_sme_f16f16_batched_ep(size_t count, size_t m, size_t n, size_t k, uint16_t *dst,
-                               const uint16_t *lhs, const uint16_t *rhs, const ep_desc16 *ep) {
+static int batched_ep_core(size_t count, size_t m, size_t n, size_t k, uint16_t *dst,
+                           const uint16_t *lhs, const uint16_t *rhs, const ep_desc16 *ep) {
     if (count == 0 || m == 0 || n == 0) return 0;
     int has_ep = ep && ep->n_nodes > 0;
     const EpNode *nodes = has_ep ? ep->nodes : NULL;
@@ -100,6 +100,18 @@ int gemm_sme_f16f16_batched_ep(size_t count, size_t m, size_t n, size_t k, uint1
     run_batched(count, (f16 *)dst, (const f16 *)lhs, (const f16 *)rhs, a_scr, m, n, k, n_tiles,
                 nodes, n_nodes);
     return 0;
+}
+
+// A trailing gelu/silu/sigmoid/tanh runs as a NEON pass over the output after
+// the kernel (neon_act.h): in a streaming epilogue it costs ~2.5 ns an output.
+int gemm_sme_f16f16_batched_ep(size_t count, size_t m, size_t n, size_t k, uint16_t *dst,
+                               const uint16_t *lhs, const uint16_t *rhs, const ep_desc16 *ep) {
+    ep_desc16 rest;
+    uint32_t act = na_split(ep, &rest);
+    const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
+    int rc = batched_ep_core(count, m, n, k, dst, lhs, rhs, kep);
+    if (rc == 0 && act) NA_NEON_PHASE(na_post_f16(dst, count * m, n, (long)n, 1, act));
+    return rc;
 }
 
 // Raw batched f16f16 (no epilogue) -- unchanged ABI, thin wrapper.

@@ -143,6 +143,18 @@ impl<'a, T: Element + PackedEpilogue> Epilogue<'a, T> {
     pub fn add_col(self, col: &'a [T]) -> Self {
         self.push_vec(EpOp::AddCol, col, 0)
     }
+
+    /// `lead`'s nodes ahead of this graph's (and this graph's activation): a
+    /// layer's own row scale and bias in front of a caller's epilogue.
+    pub(crate) fn with_leading<'b>(&self, mut lead: Epilogue<'b, T>) -> Epilogue<'b, T>
+    where
+        'a: 'b,
+    {
+        lead.nodes.extend_from_slice(&self.nodes);
+        lead.lens.extend_from_slice(&self.lens);
+        lead.act = self.act;
+        lead
+    }
     /// `x *= col[j]` (per-N vector, length `n`).
     #[must_use]
     pub fn mul_col(self, col: &'a [T]) -> Self {

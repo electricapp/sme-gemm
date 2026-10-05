@@ -16,6 +16,15 @@
 //! `flash_attention_{f32,f16,bf16}` compute `softmax(scale*Q@K^T)@V` a key
 //! block at a time, so the `m x n` score matrix is never materialized.
 //!
+//! Above the kernels sit the pieces a model is built from: [`Linear`] (a
+//! layer's 4-bit or f16 weights, quantized from either [`WeightLayout`], with
+//! the kernel picked by row count and an optional folded input `RMSNorm`),
+//! [`GatedLinear`] (a `SwiGLU` / `GeGLU` MLP's gate and up as one matmul),
+//! [`KvCache`] (f16 key/value cache and its attention), [`nn`] (layer and RMS
+//! norm), [`SmeWarm`] (keeps the SME unit awake between calls) and [`HotPool`]
+//! (spinning workers for short NEON passes). `SME_GEMM_TRACE=1` prints every
+//! SME call with its shape, time, and the idle gap before it.
+//!
 //! Every dtype has a real `prepack_*` that builds the kernel's packed weight
 //! panel, so `*_packed` reuse works across f16, bf16, f32, f64, i8 and i16.
 //! `*_batched` (and `*_batched_ep`) exist for f16, bf16, i8, f32, and f64. The
@@ -36,8 +45,17 @@ mod exec;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
 mod kernels;
+mod layout;
+mod linear;
+pub mod nn;
+mod pool;
+mod warm;
 
+pub use layout::{Prepack, WeightLayout, prepack};
+pub use linear::{Gate, GatedLinear, Linear, ModelFloat};
+pub use pool::HotPool;
 pub use probe::{Caps, caps, has_sme};
+pub use warm::SmeWarm;
 
 pub use element::{Accum, Element, Packed};
 pub use epilogue::{Dequant, Epilogue};
@@ -68,6 +86,7 @@ pub use kernels::int::{
     matmul_i8_packed_dequant, matmul_i16, matmul_i16_batched, matmul_i16_batched_dequant,
     matmul_i16_dequant, matmul_i16_packed, matmul_i16_packed_dequant, prepack_i8, prepack_i16,
 };
+pub use kernels::kv_attention::{KvCache, attention_kv_causal_f16, attention_kv_f16};
 pub use kernels::q4::{
     Q4_BLOCK, Q4Form, Q4Params, Q4Weights, dequant_q4, dequant_q4_bf16, dequant_q4_bf16_with,
     dequant_q4_with, matmul_q4, matmul_q4_bf16, matmul_q4_bf16_ep, matmul_q4_ep,

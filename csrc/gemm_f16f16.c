@@ -8,6 +8,7 @@
 // combine. Single pass over K, single-threaded per cluster.
 
 #include "epilogue.h"
+#include "neon_act.h"
 #include "panel_ring.h"
 #include "transpose16.h"
 #include <arm_neon.h>
@@ -919,10 +920,10 @@ static f16 *apack_scratch(size_t bytes) {
 
 // Packed-B GEMM: caller supplies B pre-packed via gemm_sme_f16f16_packb. Only
 // A is packed here -- the inference pattern (weights packed once, reused).
-int gemm_sme_f16f16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs,
-                               long dst_rs, int read_dst, const uint16_t *lhs, long lhs_cs,
-                               long lhs_rs, const uint16_t *b_pack, uint16_t alpha_bits,
-                               uint16_t beta_bits, const ep_desc16 *ep) {
+static int run_packed_core(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs, long dst_rs,
+                           int read_dst, const uint16_t *lhs, long lhs_cs, long lhs_rs,
+                           const uint16_t *b_pack, uint16_t alpha_bits, uint16_t beta_bits,
+                           const ep_desc16 *ep) {
     if (m == 0 || n == 0) return 0;
     float alpha = read_dst ? (float)f16_from_bits(alpha_bits) : 0.0f;
     float beta = (float)f16_from_bits(beta_bits);
@@ -1088,6 +1089,21 @@ int gemm_sme_f16f16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
     });
     free(a_pack);
     return 0;
+}
+
+// A trailing gelu/silu/sigmoid/tanh runs as a NEON pass over the output after
+// the kernel (neon_act.h): in a streaming epilogue it costs ~2.5 ns an output.
+int gemm_sme_f16f16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs,
+                               long dst_rs, int read_dst, const uint16_t *lhs, long lhs_cs,
+                               long lhs_rs, const uint16_t *b_pack, uint16_t alpha_bits,
+                               uint16_t beta_bits, const ep_desc16 *ep) {
+    ep_desc16 rest;
+    uint32_t act = (dst_cs != 1 && dst_rs != 1) ? EP_ACT_NONE : na_split(ep, &rest);
+    const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
+    int rc = run_packed_core(m, n, k, dst, dst_cs, dst_rs, read_dst, lhs, lhs_cs, lhs_rs, b_pack,
+                             alpha_bits, beta_bits, kep);
+    if (rc == 0 && act) NA_NEON_PHASE(na_post_f16(dst, m, n, dst_rs, dst_cs, act));
+    return rc;
 }
 
 // Pack B once into a caller-allocated, zeroed buffer of

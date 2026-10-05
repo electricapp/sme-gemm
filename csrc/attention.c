@@ -17,8 +17,10 @@
 #include <arm_neon.h>
 #include <dispatch/dispatch.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "attention.h"
 
@@ -277,3 +279,159 @@ static inline void st1_bf16(uint16_t *p, float x) {
 
 ATTN_FLASH_HALF_IMPL(f16, __fp16)
 ATTN_FLASH_HALF_IMPL(bf16, uint16_t)
+
+// Single-query attention over an f16 KV cache: one query row's heads against
+// `len` cached keys, grouped-query aware (query head h reads KV head
+// h / (n_heads / n_kv_heads)). q is [n_heads][hd] f32, k and v are [len] rows
+// of f16 with stride ld (KV head kh at kh*hd), out is [n_heads][hd] f32;
+// scores is scratch for `len` floats. hd must be a multiple of 8.
+//
+// Scores take FMLAL (f16 x f16 -> f32): q is rounded to f16 once and every
+// product and sum is exact-to-f32, four key rows at a time with low and high
+// halves in separate accumulators so eight chains overlap. The values widen to
+// f32 and accumulate against f32 probabilities. Row-major keys keep an append a
+// plain row copy; the horizontal sums cost less than the strided writes a
+// transposed cache would need on every append.
+static void kv_scores(float *s, const __fp16 *k, size_t len, size_t ld, const float *q,
+                          size_t hd, float scale) {
+    float16x8_t q16[32]; // hd <= 256
+    for (size_t d = 0; d < hd; d += 8) {
+        float32x4_t lo = vmulq_n_f32(vld1q_f32(q + d), scale);
+        float32x4_t hi = vmulq_n_f32(vld1q_f32(q + d + 4), scale);
+        q16[d / 8] = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
+    }
+    size_t t = 0;
+    for (; t + 4 <= len; t += 4) {
+        const __fp16 *r0 = k + t * ld, *r1 = r0 + ld, *r2 = r1 + ld, *r3 = r2 + ld;
+        float32x4_t a0 = vdupq_n_f32(0.0f), b0 = a0, a1 = a0, b1 = a0, a2 = a0, b2 = a0, a3 = a0,
+                    b3 = a0;
+        for (size_t d = 0; d < hd; d += 8) {
+            float16x8_t qv = q16[d / 8];
+            float16x8_t k0 = vld1q_f16(r0 + d), k1 = vld1q_f16(r1 + d);
+            float16x8_t k2 = vld1q_f16(r2 + d), k3 = vld1q_f16(r3 + d);
+            a0 = vfmlalq_low_f16(a0, k0, qv), b0 = vfmlalq_high_f16(b0, k0, qv);
+            a1 = vfmlalq_low_f16(a1, k1, qv), b1 = vfmlalq_high_f16(b1, k1, qv);
+            a2 = vfmlalq_low_f16(a2, k2, qv), b2 = vfmlalq_high_f16(b2, k2, qv);
+            a3 = vfmlalq_low_f16(a3, k3, qv), b3 = vfmlalq_high_f16(b3, k3, qv);
+        }
+        float32x4_t s01 = vpaddq_f32(vaddq_f32(a0, b0), vaddq_f32(a1, b1));
+        float32x4_t s23 = vpaddq_f32(vaddq_f32(a2, b2), vaddq_f32(a3, b3));
+        vst1q_f32(s + t, vpaddq_f32(s01, s23));
+    }
+    for (; t < len; t++) {
+        const __fp16 *r = k + t * ld;
+        float32x4_t a = vdupq_n_f32(0.0f), b = a;
+        for (size_t d = 0; d < hd; d += 8) {
+            float16x8_t kv = vld1q_f16(r + d);
+            a = vfmlalq_low_f16(a, kv, q16[d / 8]), b = vfmlalq_high_f16(b, kv, q16[d / 8]);
+        }
+        s[t] = vaddvq_f32(vaddq_f32(a, b));
+    }
+}
+
+// out[0..hd) = inv * sum_t p[t] * v[t*ld + 0..hd). Eight probabilities round to
+// f16 into one register and FMLAL takes each by lane, so a row costs one load
+// and two FMLALs per 8 dims (no per-row widen or broadcast); 32 dims a pass
+// keeps 8 accumulators in flight.
+static void kv_pv(float *out, const __fp16 *v, size_t len, size_t ld, const float *p, size_t hd,
+                      float inv) {
+    for (size_t d0 = 0; d0 < hd; d0 += 32) {
+        size_t w = hd - d0 < 32 ? hd - d0 : 32; // a multiple of 8
+        float32x4_t acc[8];
+        for (int i = 0; i < 8; i++)
+            acc[i] = vdupq_n_f32(0.0f);
+#define PV_ROW(L)                                                                                  \
+    do {                                                                                           \
+        const __fp16 *vr = v + (t + (L)) * ld + d0;                                                \
+        for (size_t i = 0; i < w / 8; i++) {                                                       \
+            float16x8_t x = vld1q_f16(vr + 8 * i);                                                 \
+            acc[2 * i] = vfmlalq_laneq_low_f16(acc[2 * i], x, p8, L);                              \
+            acc[2 * i + 1] = vfmlalq_laneq_high_f16(acc[2 * i + 1], x, p8, L);                     \
+        }                                                                                          \
+    } while (0)
+        size_t t = 0;
+        for (; t + 8 <= len; t += 8) {
+            float16x8_t p8 =
+                vcombine_f16(vcvt_f16_f32(vld1q_f32(p + t)), vcvt_f16_f32(vld1q_f32(p + t + 4)));
+            PV_ROW(0);
+            PV_ROW(1);
+            PV_ROW(2);
+            PV_ROW(3);
+            PV_ROW(4);
+            PV_ROW(5);
+            PV_ROW(6);
+            PV_ROW(7);
+        }
+        if (t < len) {
+            float tail[8] = {0};
+            for (size_t i = 0; t + i < len; i++)
+                tail[i] = p[t + i];
+            float16x8_t p8 =
+                vcombine_f16(vcvt_f16_f32(vld1q_f32(tail)), vcvt_f16_f32(vld1q_f32(tail + 4)));
+            switch (len - t) {
+                case 7:
+                    PV_ROW(6); // fallthrough
+                case 6:
+                    PV_ROW(5); // fallthrough
+                case 5:
+                    PV_ROW(4); // fallthrough
+                case 4:
+                    PV_ROW(3); // fallthrough
+                case 3:
+                    PV_ROW(2); // fallthrough
+                case 2:
+                    PV_ROW(1); // fallthrough
+                default:
+                    PV_ROW(0);
+            }
+        }
+#undef PV_ROW
+        for (size_t i = 0; i < w / 4; i++)
+            vst1q_f32(out + d0 + 4 * i, vmulq_n_f32(acc[i], inv));
+    }
+}
+
+void attn_kv_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v, size_t len,
+                     size_t ld, size_t n_heads, size_t n_kv_heads, size_t hd, float scale,
+                     float *scores) {
+    size_t group = n_heads / n_kv_heads;
+    for (size_t h = 0; h < n_heads; h++) {
+        size_t kh = h / group;
+        kv_scores(scores, k + kh * hd, len, ld, q + h * hd, hd, scale);
+        float mx = row_maxv(scores, len);
+        float sum = row_exp_sum(scores, len, mx);
+        kv_pv(out + h * hd, v + kh * hd, len, ld, scores, hd, 1.0f / sum);
+    }
+}
+
+// Causal attention for a block of query rows: row i (position start + i)
+// attends to cached keys 0..start+i, so row i is attn_kv_f16 over the first
+// start+i+1 keys. Rows are independent, so large blocks split across cores
+// (dispatch_apply); each chunk mallocs its own score row. q and out are
+// [rows][n_heads*hd]. Returns -1 if a scratch allocation fails.
+int attn_kv_causal_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v, size_t start,
+                    size_t rows, size_t ld, size_t n_heads, size_t n_kv_heads, size_t hd,
+                    float scale) {
+    size_t qd = n_heads * hd;
+    // Work ~ head-keys at ~3.5 ns each; below ~16K (~60 us) one thread does it.
+    size_t work = n_heads * (rows * start + rows * (rows + 1) / 2);
+    size_t chunks = work < (1u << 14) ? 1 : rows < ATTN_MAX_CHUNKS ? rows : ATTN_MAX_CHUNKS;
+    __block atomic_int failed = 0;
+    void (^body)(size_t) = ^(size_t ci) {
+      // Later rows hold more keys: interleave rows across chunks to balance.
+      float *scores = malloc((start + rows) * sizeof(float));
+      if (!scores) {
+          atomic_store_explicit(&failed, 1, memory_order_relaxed);
+          return;
+      }
+      for (size_t i = ci; i < rows; i += chunks)
+          attn_kv_f16(out + i * qd, q + i * qd, k, v, start + i + 1, ld, n_heads, n_kv_heads,
+                          hd, scale, scores);
+      free(scores);
+    };
+    if (chunks == 1)
+        body(0);
+    else
+        dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), body);
+    return atomic_load_explicit(&failed, memory_order_relaxed) ? -1 : 0;
+}
