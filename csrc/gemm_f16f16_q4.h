@@ -29,6 +29,16 @@ typedef struct {
     const _Atomic size_t *ready;
 } q4_chain;
 
+// Raises `done` from streaming code, ordered after every store before it (the
+// pass's outputs) -- all a consumer that acquires `done` and then reads them
+// needs. A store barrier and a plain store cost ~42 ns there on M5, a release
+// store ~61: the release also orders earlier loads, which nothing here needs.
+#define Q4_PUBLISH(flag, v)                                                                        \
+    do {                                                                                           \
+        __asm__ volatile("dmb ishst" ::: "memory");                                                \
+        atomic_store_explicit((flag), (v), memory_order_relaxed);                                  \
+    } while (0)
+
 // Code c -> f16(sign-extended c); 16-bit LUTI4 reads the low half of 32-bit entries.
 static uint32_t g_q4_lut[16] __attribute__((aligned(64)));
 static void q4_lut_init(void) {
@@ -287,7 +297,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv1(
             while (avail < d1)
                 avail = atomic_load_explicit(ready, memory_order_acquire);
             if (bk == 1 && pending) {
-                atomic_store_explicit(done, pending, memory_order_release);
+                Q4_PUBLISH(done, pending);
                 pending = 0;
             }
             uint32_t s = (uint32_t)(bk & 1), base = par ? 2 + 3 * s : 2 + 2 * s;
@@ -384,7 +394,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
             while (avail < d1)
                 avail = atomic_load_explicit(ready, memory_order_acquire);
             if (bk == 1 && pending) {
-                atomic_store_explicit(done, pending, memory_order_release);
+                Q4_PUBLISH(done, pending);
                 pending = 0;
             }
             for (size_t d = bk << bshift; d < d1; d += 8) {
