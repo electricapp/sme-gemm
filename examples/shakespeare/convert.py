@@ -1,8 +1,8 @@
-# Unpickle a torch zip checkpoint without torch; write weights.f32 + index.txt
-# (name offset_floats dims...), row-major contiguous float32. Both land under
-# their final names only once complete, so an interrupted run leaves nothing
-# that fetch.sh would mistake for a finished conversion.
-import pickle, zipfile, collections, os
+# Unpickle a torch zip checkpoint without torch and write its tensors to
+# model.safetensors (float32, row-major). The file lands under its final name
+# only once complete, so an interrupted run leaves nothing that fetch.sh would
+# mistake for a finished conversion.
+import pickle, zipfile, collections, json, os, struct
 
 zf = zipfile.ZipFile("pytorch_model.bin")
 root = [n for n in zf.namelist() if n.endswith("data.pkl")][0].rsplit("/", 1)[0]
@@ -22,7 +22,7 @@ class Unp(pickle.Unpickler):
         return Storage(key, stype)
 
 sd = Unp(zf.open(f"{root}/data.pkl")).load()
-out = open("weights.f32.part", "wb"); idx = open("index.txt.part", "w"); pos = 0
+header, parts, pos = {}, [], 0
 for name, (_, st, off, size, stride) in sd.items():
     assert st.dtype == "FloatStorage", (name, st.dtype)
     n = 1
@@ -30,8 +30,13 @@ for name, (_, st, off, size, stride) in sd.items():
     exp, acc = [], 1
     for s in reversed(size): exp.insert(0, acc); acc *= s
     assert list(stride) == exp or n == 1, (name, size, stride)
-    raw = zf.read(f"{root}/data/{st.key}")[off * 4:(off + n) * 4]
-    out.write(raw); idx.write(f"{name} {pos} {' '.join(map(str, size))}\n"); pos += n
-out.close(); idx.close()
-os.replace("weights.f32.part", "weights.f32"); os.replace("index.txt.part", "index.txt")
-print(f"converted: {pos} floats")
+    header[name] = {"dtype": "F32", "shape": list(size), "data_offsets": [pos, pos + 4 * n]}
+    parts.append((st.key, off, n)); pos += 4 * n
+head = json.dumps(header).encode()
+head += b" " * (-len(head) % 8)
+with open("model.safetensors.part", "wb") as out:
+    out.write(struct.pack("<Q", len(head))); out.write(head)
+    for key, off, n in parts:
+        out.write(zf.read(f"{root}/data/{key}")[off * 4:(off + n) * 4])
+os.replace("model.safetensors.part", "model.safetensors")
+print(f"converted: {pos // 4} floats")

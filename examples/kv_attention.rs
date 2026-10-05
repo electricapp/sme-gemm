@@ -1,5 +1,6 @@
 //! `KvCache::attend` cost by cached length, on the calling thread and split
-//! across a `HotPool` (with an `SmeWarm` alive, as in a model loop).
+//! across a `HotPool` sized for this machine (with the SME unit kept awake
+//! throughout, as in a model loop).
 //!   cargo run --release --example `kv_attention`
 
 use std::time::Instant;
@@ -29,7 +30,7 @@ fn main() {
         .collect();
     let mut out = vec![0.0f32; row];
     println!("{heads} heads x {hd}: us per attend");
-    println!("  len | 1 thread | HotPool(2)");
+    println!("  len | 1 thread | HotPool::new()");
     for len in [16, 64, 128, 256, 512, 1024] {
         let mut cache = KvCache::new(heads, heads, hd, len);
         for t in 0..len {
@@ -42,7 +43,7 @@ fn main() {
             cache.push(&k, &v);
         }
         let one = median_us(&cache, &q, &mut out);
-        let pool = HotPool::new(2);
+        let pool = HotPool::new();
         let many = median_us(&cache, &q, &mut out);
         drop(pool);
         println!("{len:>5} | {one:>8.2} | {many:>10.2}");

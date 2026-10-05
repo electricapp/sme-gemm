@@ -375,6 +375,11 @@ to give it up. A job can also run *alongside* the caller (`pool::alongside`):
 posted to the workers only, while the caller does SME work, the caller draining
 whatever is still unclaimed when it gets there (a worker may be asleep).
 
+A pool also holds an `SmeWarm` (§2.11): the loops it serves are the ones whose
+SME calls follow NEON work. `HotPool::new` starts one worker per P-core left
+after the calling thread and that helper (`hw.perflevel0.physicalcpu`, two on a
+4-P-core M5); a worker beyond that would share a core with one of them.
+
 ### 2.13 Chained GEMVs: `Mlp` and `SelfAttention`
 
 In a transformer block the SME unit idles while NEON runs the activation
@@ -477,7 +482,8 @@ the `hw.optional.arm.FEAT_SME*` flags, cached once in a `OnceLock`. `Caps` holds
 one bool per group: `sme` (base, M4+), and `sme_f16f16`, `sme_b16b16`,
 `sme_i16i64`, `sme_f64f64` (M5+). On non-Apple targets every flag is false and
 everything falls back to the scalar reference. Per-dtype entry points consult
-the matching flag before dispatching to an M5 kernel.
+the matching flag before dispatching to an M5 kernel. The same probe reads the
+P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
 
 ---
 
@@ -519,6 +525,11 @@ the matching flag before dispatching to an M5 kernel.
   jobs that run alongside the caller (§2.12).
 - **`mlp.rs`, `self_attention.rs`** — `Mlp` and `SelfAttention`, transformer
   blocks that chain their GEMVs with the NEON work between them (§2.13).
+- **`block.rs`** — `Block`, the pre-norm layer: each half normalizes the f32
+  residual stream into thread-local f16 scratch, as the next matmul takes it,
+  and adds `SelfAttention` or `Mlp` back in. It holds no state of its own
+  beyond the parts, so a layer of another shape is the same parts in another
+  order.
 - **`convert.rs`** — f16↔f32 slice conversion at a model's edges, NEON (the
   `half` crate converts one value per inline-asm `FCVT`).
 - **`linear.rs`, `layout.rs`, `nn.rs`** — the model-level layer over the
@@ -538,9 +549,9 @@ the matching flag before dispatching to an M5 kernel.
   `Q4Weights::quantize` lives with the Q4 kernels (`q4/quantize.rs`). `KvCache`
   (in `kernels/kv_attention.rs`) wraps the KV-cache attention. `nn`'s norms run
   a row in NEON on the calling thread: one row is too little work to thread or
-  to stream.
+  to stream. `nn::Norm` is the layer form, holding weight, bias and eps.
 - **`reference.rs`** — the portable scalar GEMM oracle (§6).
-- **`probe.rs`** — runtime capability detection (§3.2).
+- **`probe.rs`** — runtime capability detection and the P-core count (§3.2).
 - **`burn.rs`, `candle.rs`** — optional framework adapters, feature-gated.
 
 ---

@@ -24,6 +24,7 @@ pub struct Caps {
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(miri)))]
 unsafe extern "C" {
     fn sme_sysctl_flag(name: *const core::ffi::c_char) -> i32;
+    fn sme_sysctl_int(name: *const core::ffi::c_char) -> i64;
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(miri)))]
@@ -51,6 +52,23 @@ fn detect() -> Caps {
     {
         Caps::default()
     }
+}
+
+/// Performance cores across all P-clusters (`hw.perflevel0.physicalcpu` on
+/// Apple, the available parallelism elsewhere), at least 1; probed once.
+pub(crate) fn p_cores() -> usize {
+    static P: OnceLock<usize> = OnceLock::new();
+    *P.get_or_init(|| {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(miri)))]
+        {
+            // SAFETY: a nul-terminated name; the C side only reads it.
+            let n = unsafe { sme_sysctl_int(c"hw.perflevel0.physicalcpu".as_ptr()) };
+            if let Ok(n @ 1..) = usize::try_from(n) {
+                return n;
+            }
+        }
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+    })
 }
 
 /// Detected SME capabilities for this process (probed once, cached).

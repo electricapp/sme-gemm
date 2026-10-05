@@ -1,16 +1,17 @@
 //! nanoGPT shakespeare-char (6 layers, 384 wide, 6 heads of 64, 65-character
 //! vocabulary, 256-token context) composed from sme-gemm's model-level pieces:
-//! a [`Linear`] per projection (4-bit, from the checkpoint's `[out][in]`
-//! weights), an [`Mlp`] block per layer, a [`KvCache`] per layer,
-//! [`nn::layer_norm`], an [`SmeWarm`] keeping the SME unit awake across the
-//! work between calls, and a [`HotPool`] splitting attention's heads across two
-//! more cores (and running the MLP's gelu alongside its matmuls). Embeddings
-//! and sampling are the only model code left here.
+//! a [`Block`] per layer (layer norms, [`SelfAttention`] and [`Mlp`] over
+//! 4-bit [`Linear`]s made from the checkpoint's `[out][in]` weights), a
+//! [`KvCache`] per layer, and a [`HotPool`] that keeps the SME unit awake and
+//! runs attention and the MLP's gelu on spare cores beside the matmuls.
+//! Embeddings and sampling are the only model code left here.
 
-use half::f16;
-use sme_gemm::{
-    Gate, HotPool, KvCache, Linear, Mlp, Q4Params, SelfAttention, SmeWarm, WeightLayout, nn,
-};
+use std::collections::HashMap;
+use std::path::Path;
+
+use safetensors::{Dtype, SafeTensors};
+use sme_gemm::nn::Norm;
+use sme_gemm::{Block, Gate, HotPool, KvCache, Linear, Mlp, Q4Params, SelfAttention, WeightLayout};
 
 pub(crate) const D: usize = 384;
 pub(crate) const NL: usize = 6;
@@ -24,76 +25,46 @@ const EPS: f32 = 1e-5;
 /// The model's characters, in token order.
 pub(crate) const VOCAB: &str = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// Checkpoint tensors as f32, torch layout (`[out][in]` for linear weights).
-pub(crate) struct F32Weights {
-    pub(crate) wte: Vec<f32>,
-    pub(crate) wpe: Vec<f32>,
-    pub(crate) lnf: Vec<f32>,
-    pub(crate) layers: Vec<F32Layer>,
-}
+/// The checkpoint's tensors by name, as f32 with their shapes (torch layout,
+/// `[out][in]` for linear weights), from the `model.safetensors` that
+/// `convert.py` writes.
+pub(crate) struct Checkpoint(HashMap<String, (Vec<usize>, Vec<f32>)>);
 
-pub(crate) struct F32Layer {
-    pub(crate) ln1: Vec<f32>,
-    pub(crate) ln2: Vec<f32>,
-    pub(crate) attn: Vec<f32>,
-    pub(crate) proj: Vec<f32>,
-    pub(crate) fc: Vec<f32>,
-    pub(crate) fcp: Vec<f32>,
-}
-
-impl F32Weights {
-    /// Reads `weights.f32` + `index.txt` (written by `convert.py`) from `dir`.
-    pub(crate) fn load(dir: &std::path::Path) -> Result<Self, String> {
-        let raw = std::fs::read(dir.join("weights.f32"))
-            .map_err(|e| format!("{}: {e}", dir.join("weights.f32").display()))?;
-        let all: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        let idx = std::fs::read_to_string(dir.join("index.txt"))
-            .map_err(|e| format!("{}: {e}", dir.join("index.txt").display()))?;
-        let get = |name: &str| -> Result<Vec<f32>, String> {
-            let line = idx
-                .lines()
-                .find(|l| l.split(' ').next() == Some(name))
-                .ok_or_else(|| format!("index.txt has no {name}"))?;
-            let f: Vec<usize> = line
-                .split(' ')
-                .skip(1)
-                .filter_map(|x| x.parse().ok())
-                .collect();
-            let n: usize = f[1..].iter().product();
-            all.get(f[0]..f[0] + n)
-                .map(<[f32]>::to_vec)
-                .ok_or_else(|| format!("{name} is truncated"))
-        };
-        let layers = (0..NL)
-            .map(|i| {
-                let p = |s: &str| get(&format!("transformer.h.{i}.{s}"));
-                Ok(F32Layer {
-                    ln1: p("ln_1.weight")?,
-                    ln2: p("ln_2.weight")?,
-                    attn: p("attn.c_attn.weight")?,
-                    proj: p("attn.c_proj.weight")?,
-                    fc: p("mlp.c_fc.weight")?,
-                    fcp: p("mlp.c_proj.weight")?,
-                })
+impl Checkpoint {
+    pub(crate) fn load(path: &Path) -> Result<Self, String> {
+        let at = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+        let bytes = std::fs::read(path).map_err(|e| at(&e))?;
+        let st = SafeTensors::deserialize(&bytes).map_err(|e| at(&e))?;
+        st.tensors()
+            .into_iter()
+            .map(|(name, t)| {
+                if t.dtype() != Dtype::F32 {
+                    return Err(at(&format!("{name} is {:?}, not F32", t.dtype())));
+                }
+                let data = t.data().chunks_exact(4);
+                let data = data.map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                Ok((name, (t.shape().to_vec(), data.collect())))
             })
-            .collect::<Result<_, String>>()?;
-        Ok(Self {
-            wte: get("transformer.wte.weight")?,
-            wpe: get("transformer.wpe.weight")?,
-            lnf: get("transformer.ln_f.weight")?,
-            layers,
-        })
+            .collect::<Result<_, _>>()
+            .map(Self)
     }
-}
 
-struct Layer {
-    ln1: Vec<f32>,
-    ln2: Vec<f32>,
-    attn: SelfAttention,
-    mlp: Mlp,
+    /// The tensor `name`'s values.
+    pub(crate) fn get(&self, name: &str) -> Result<&[f32], String> {
+        self.0
+            .get(name)
+            .map(|(_, v)| &v[..])
+            .ok_or_else(|| format!("the checkpoint has no {name}"))
+    }
+
+    /// The matrix `name`: its values, rows and columns.
+    pub(crate) fn matrix(&self, name: &str) -> Result<(&[f32], usize, usize), String> {
+        match self.0.get(name) {
+            Some((s, v)) if s.len() == 2 => Ok((v, s[0], s[1])),
+            Some((s, _)) => Err(format!("{name} is {s:?}, not a matrix")),
+            None => Err(format!("the checkpoint has no {name}")),
+        }
+    }
 }
 
 /// The model: projections 4-bit, the tied output head f16, embeddings and norms
@@ -101,38 +72,53 @@ struct Layer {
 pub(crate) struct Model {
     wte: Vec<f32>,
     wpe: Vec<f32>,
-    lnf: Vec<f32>,
+    blocks: Vec<Block>,
+    lnf: Norm,
     head: Linear,
-    layers: Vec<Layer>,
 }
 
 impl Model {
-    /// Quantizes every projection to Q4 with `block`-deep K-blocks (32 = `Q4_0`),
-    /// and builds the f16 panels prompts run on now rather than on the first
-    /// prompt (~8 ms for all 24).
-    pub(crate) fn quantize(w: &F32Weights, block: usize) -> Self {
-        let q = |m: &[f32], n: usize, k: usize| {
-            let l = Linear::quantize_with(m, WeightLayout::OutIn, n, k, Q4Params::new(block));
+    /// Builds the model from the checkpoint, every projection quantized to Q4
+    /// with `q4_block`-deep K-blocks (32 = `Q4_0`), with the f16 panels prompts
+    /// run on built now rather than on the first prompt (~8 ms for all 24).
+    pub(crate) fn load(ck: &Checkpoint, q4_block: usize) -> Result<Self, String> {
+        let linear = |name: &str| -> Result<Linear, String> {
+            let (w, rows, cols) = ck.matrix(name)?;
+            let l =
+                Linear::quantize_with(w, WeightLayout::OutIn, rows, cols, Q4Params::new(q4_block));
             l.build_panel();
-            l
+            Ok(l)
         };
-        let layers = w
-            .layers
-            .iter()
-            .map(|l| Layer {
-                ln1: l.ln1.clone(),
-                ln2: l.ln2.clone(),
-                attn: SelfAttention::new(q(&l.attn, 3 * D, D), q(&l.proj, D, D), NH, NH, HD),
-                mlp: Mlp::new(q(&l.fc, FF, D), Gate::Gelu, q(&l.fcp, D, FF)),
+        let norm = |name: &str| Ok::<_, String>(Norm::layer(ck.get(name)?.to_vec(), None, EPS));
+        let blocks = (0..NL)
+            .map(|i| {
+                let p = |s: &str| format!("transformer.h.{i}.{s}");
+                Ok(Block::new(
+                    norm(&p("ln_1.weight"))?,
+                    SelfAttention::new(
+                        linear(&p("attn.c_attn.weight"))?,
+                        linear(&p("attn.c_proj.weight"))?,
+                        NH,
+                        NH,
+                        HD,
+                    ),
+                    norm(&p("ln_2.weight"))?,
+                    Mlp::new(
+                        linear(&p("mlp.c_fc.weight"))?,
+                        Gate::Gelu,
+                        linear(&p("mlp.c_proj.weight"))?,
+                    ),
+                ))
             })
-            .collect();
-        Self {
-            wte: w.wte.clone(),
-            wpe: w.wpe.clone(),
-            lnf: w.lnf.clone(),
-            head: Linear::f16(&w.wte, WeightLayout::OutIn, V, D),
-            layers,
-        }
+            .collect::<Result<_, String>>()?;
+        let (wte, v, d) = ck.matrix("transformer.wte.weight")?;
+        Ok(Self {
+            wte: wte.to_vec(),
+            wpe: ck.get("transformer.wpe.weight")?.to_vec(),
+            blocks,
+            lnf: norm("transformer.ln_f.weight")?,
+            head: Linear::f16(wte, WeightLayout::OutIn, v, d),
+        })
     }
 }
 
@@ -201,28 +187,19 @@ pub(crate) fn sample(logits: &[f32], s: &Sampler, rng: &mut Rng) -> usize {
 }
 
 /// The stages `--profile` times, in `Session::forward` order.
-pub(crate) const STAGES: [&str; 6] = [
-    "embed",
-    "ln_1",
-    "attention + residual",
-    "ln_2",
-    "mlp + residual",
-    "ln_f + head",
-];
+pub(crate) const STAGES: [&str; 3] = ["embed", "blocks", "ln_f + head"];
 
-/// Generation state: a KV cache per layer, row scratch, and the SME guard.
+/// Generation state: a KV cache per layer, the residual rows, and the pool.
 pub(crate) struct Session<'m> {
     /// Seconds per stage, accumulated while `Some` (`--profile`).
-    pub(crate) prof: Option<[f64; 6]>,
+    pub(crate) prof: Option<[f64; 3]>,
     m: &'m Model,
     caches: Vec<KvCache>,
-    // [rows][...] scratch, sized for a full-context batch.
+    // [rows][D], sized for a full-context batch.
     x: Vec<f32>,
-    h16: Vec<f16>,
     last: Vec<f32>,
     pub(crate) logits: Vec<f32>,
-    _warm: SmeWarm,
-    _pool: Option<HotPool>,
+    _pool: HotPool,
 }
 
 impl<'m> Session<'m> {
@@ -230,16 +207,17 @@ impl<'m> Session<'m> {
         Self {
             prof: None,
             m,
-            caches: m.layers.iter().map(|l| l.attn.cache(CTX)).collect(),
+            caches: m.blocks.iter().map(|b| b.cache(CTX)).collect(),
             x: vec![0.0; CTX * D],
-            h16: vec![f16::ZERO; CTX * D],
             last: vec![0.0; D],
             logits: vec![0.0; V],
-            _warm: SmeWarm::new(),
-            // NO_POOL=1 runs attention on the calling thread alone.
-            _pool: std::env::var_os("NO_POOL")
-                .is_none()
-                .then(|| HotPool::new(2)),
+            // NO_POOL=1 runs everything on the calling thread (still keeping
+            // the SME unit awake).
+            _pool: if std::env::var_os("NO_POOL").is_some() {
+                HotPool::with_workers(0)
+            } else {
+                HotPool::new()
+            },
         }
     }
 
@@ -279,19 +257,13 @@ impl<'m> Session<'m> {
             }
         }
         lap(0);
-        let (x, h16) = (&mut self.x[..r * D], &mut self.h16[..r * D]);
-        for (ly, cache) in m.layers.iter().zip(&mut self.caches) {
-            nn::layer_norm(&*x, &ly.ln1, None, EPS, &mut *h16);
-            lap(1);
-            ly.attn.accumulate(&*h16, cache, &mut *x, r);
-            lap(2);
-            nn::layer_norm(&*x, &ly.ln2, None, EPS, &mut *h16);
-            lap(3);
-            ly.mlp.accumulate(&*h16, &mut *x, r);
-            lap(4);
+        let x = &mut self.x[..r * D];
+        for (b, c) in m.blocks.iter().zip(&mut self.caches) {
+            b.accumulate(x, c, r);
         }
-        nn::layer_norm(&x[(r - 1) * D..], &m.lnf, None, EPS, &mut self.last);
+        lap(1);
+        m.lnf.forward(&x[(r - 1) * D..], &mut self.last);
         m.head.forward_f32(&self.last, &mut self.logits, 1);
-        lap(5);
+        lap(2);
     }
 }

@@ -25,6 +25,8 @@ proptest = "1"
 criterion = "0.8"
 # tests/guard_page.rs: mmap/mprotect guard pages around kernel operands.
 libc = "0.2"
+# examples/shakespeare: reads the checkpoint.
+safetensors = "0.8"
 
 [[bench]]
 name = "gemm"

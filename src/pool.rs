@@ -10,15 +10,18 @@
 //! caller's stack. Workers that see no job for a few milliseconds back off to
 //! sleeping, so a forgotten pool costs a wakeup every 0.1 ms rather than cores.
 //!
-//! Workers run at user-interactive priority, which places them on P-cores. Leave
-//! room for the calling thread and, with an [`SmeWarm`](crate::SmeWarm), its
-//! helper: on a 4-P-core M5 that is two workers.
+//! The loops a pool serves are the ones whose SME calls follow NEON work, so a
+//! pool also holds an [`SmeWarm`]. Workers run at user-interactive priority,
+//! which places them on P-cores; [`HotPool::new`] starts one per P-core left
+//! after the calling thread and the `SmeWarm` helper, two on a 4-P-core M5.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use crate::SmeWarm;
 
 const MAX_WORKERS: usize = HotPool::MAX_WORKERS;
 const IDLE_AFTER: Duration = Duration::from_millis(3);
@@ -88,25 +91,38 @@ impl Job<'_> {
     }
 }
 
-/// Keeps `workers` threads spinning for the library's row-parallel passes while
-/// alive; see the [module docs](self). Guards nest; the first one's worker
-/// count holds until the last is dropped.
+/// Spinning workers for the library's row-parallel passes, and the SME unit
+/// kept awake, while alive.
+///
+/// See the [module docs](self). Guards nest; the first one's worker count
+/// holds until the last is dropped.
 ///
 /// ```
-/// let _pool = sme_gemm::HotPool::new(2);
-/// // ... KvCache::attend now splits its heads across the caller and 2 workers
+/// let _pool = sme_gemm::HotPool::new();
+/// // ... KvCache::attend now splits its heads across the caller and the workers
 /// ```
 #[derive(Debug)]
-pub struct HotPool(());
+pub struct HotPool {
+    _warm: SmeWarm,
+}
 
 impl HotPool {
     /// Workers a pool can hold.
     pub const MAX_WORKERS: usize = 8;
 
-    /// Starts `workers` threads (at most [`HotPool::MAX_WORKERS`]) if no pool
-    /// is alive.
+    /// A pool sized for this machine: one worker per P-core left after the
+    /// calling thread and the [`SmeWarm`] helper.
     #[must_use]
-    pub fn new(workers: usize) -> Self {
+    pub fn new() -> Self {
+        let helper = usize::from(crate::caps().sme);
+        Self::with_workers(crate::probe::p_cores().saturating_sub(1 + helper))
+    }
+
+    /// Starts `workers` threads (at most [`HotPool::MAX_WORKERS`]) if no pool
+    /// is alive; 0 keeps only the SME unit awake.
+    #[must_use]
+    pub fn with_workers(workers: usize) -> Self {
+        let warm = SmeWarm::new();
         let mut handles = HANDLES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -123,7 +139,13 @@ impl HotPool {
             }
         }
         drop(handles);
-        Self(())
+        Self { _warm: warm }
+    }
+}
+
+impl Default for HotPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

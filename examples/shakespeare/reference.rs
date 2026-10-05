@@ -4,8 +4,13 @@
 use std::time::Instant;
 
 use crate::model::{
-    CTX, D, F32Weights, FF, HD, Model, NH, NL, Rng, Sampler, Session, V, encode, sample,
+    CTX, Checkpoint, D, FF, HD, Model, NH, NL, Rng, Sampler, Session, V, encode, sample,
 };
+
+/// A tensor `Model::load` has already found in the checkpoint.
+fn tensor<'a>(ck: &'a Checkpoint, name: &str) -> &'a [f32] {
+    ck.get(name).unwrap_or_else(|e| panic!("{e}"))
+}
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -32,7 +37,7 @@ fn erf(x: f32) -> f32 {
     (s * (1.0 - poly * (-x * x).exp())) as f32
 }
 
-fn step_ref(w: &F32Weights, st: &mut RefState, tok: usize, pos: usize) {
+fn step_ref(ck: &Checkpoint, st: &mut RefState, tok: usize, pos: usize) {
     let mv = |m: &[f32], x: &[f32], n: usize, k: usize, out: &mut [f32]| {
         for j in 0..n {
             out[j] = m[j * k..(j + 1) * k]
@@ -42,8 +47,12 @@ fn step_ref(w: &F32Weights, st: &mut RefState, tok: usize, pos: usize) {
                 .sum();
         }
     };
+    let (wte, wpe) = (
+        tensor(ck, "transformer.wte.weight"),
+        tensor(ck, "transformer.wpe.weight"),
+    );
     let mut x: Vec<f32> = (0..D)
-        .map(|c| w.wte[tok * D + c] + w.wpe[pos * D + c])
+        .map(|c| wte[tok * D + c] + wpe[pos * D + c])
         .collect();
     let (mut h, mut qkv, mut y, mut o, mut f) = (
         vec![0.0; D],
@@ -52,9 +61,10 @@ fn step_ref(w: &F32Weights, st: &mut RefState, tok: usize, pos: usize) {
         vec![0.0; D],
         vec![0.0; FF],
     );
-    for (l, ly) in w.layers.iter().enumerate() {
-        layernorm(&x, &ly.ln1, &mut h);
-        mv(&ly.attn, &h, 3 * D, D, &mut qkv);
+    for l in 0..NL {
+        let p = |s: &str| tensor(ck, &format!("transformer.h.{l}.{s}"));
+        layernorm(&x, p("ln_1.weight"), &mut h);
+        mv(p("attn.c_attn.weight"), &h, 3 * D, D, &mut qkv);
         let base = l * CTX * D;
         st.k[base + pos * D..base + (pos + 1) * D].copy_from_slice(&qkv[D..2 * D]);
         st.v[base + pos * D..base + (pos + 1) * D].copy_from_slice(&qkv[2 * D..]);
@@ -80,23 +90,23 @@ fn step_ref(w: &F32Weights, st: &mut RefState, tok: usize, pos: usize) {
                 }
             }
         }
-        mv(&ly.proj, &y, D, D, &mut o);
+        mv(p("attn.c_proj.weight"), &y, D, D, &mut o);
         for (a, b) in x.iter_mut().zip(&o) {
             *a += b;
         }
-        layernorm(&x, &ly.ln2, &mut h);
-        mv(&ly.fc, &h, FF, D, &mut f);
+        layernorm(&x, p("ln_2.weight"), &mut h);
+        mv(p("mlp.c_fc.weight"), &h, FF, D, &mut f);
         for v in &mut f {
             *v = 0.5 * *v * (1.0 + erf(*v / std::f32::consts::SQRT_2));
         }
-        mv(&ly.fcp, &f, D, FF, &mut o);
+        mv(p("mlp.c_proj.weight"), &f, D, FF, &mut o);
         for (a, b) in x.iter_mut().zip(&o) {
             *a += b;
         }
     }
-    layernorm(&x.clone(), &w.lnf, &mut x);
+    layernorm(&x.clone(), tensor(ck, "transformer.ln_f.weight"), &mut x);
     for c in 0..V {
-        st.logits[c] = dot(&x, &w.wte[c * D..(c + 1) * D]);
+        st.logits[c] = dot(&x, &wte[c * D..(c + 1) * D]);
     }
 }
 
@@ -143,7 +153,7 @@ pub(crate) fn profile(m: &Model) {
         t0.elapsed().as_secs_f64() / (windows * CTX) as f64 * 1e6
     };
     run(&mut sess, &mut rng);
-    sess.prof = Some([0.0; 6]);
+    sess.prof = Some([0.0; 3]);
     let timed = run(&mut sess, &mut rng);
     let p = sess.prof.take().unwrap_or_default();
     let plain = run(&mut sess, &mut rng);
@@ -161,7 +171,7 @@ pub(crate) fn profile(m: &Model) {
     let _ = timed;
 }
 
-pub(crate) fn bench(w: &F32Weights, m: &Model, text: &str) {
+pub(crate) fn bench(ck: &Checkpoint, m: &Model, text: &str) {
     let toks: Vec<usize> = text.chars().filter_map(encode).collect();
     let val = &toks[toks.len() * 9 / 10..];
     let mut sess = Session::new(m);
@@ -175,7 +185,7 @@ pub(crate) fn bench(w: &F32Weights, m: &Model, text: &str) {
         let off = c * 1300;
         sess.reset();
         for pos in 0..CTX {
-            step_ref(w, &mut rs, val[off + pos], pos);
+            step_ref(ck, &mut rs, val[off + pos], pos);
             sess.forward(&[val[off + pos]]);
             lr += xent(&rs.logits, val[off + pos + 1]);
             lq += xent(&sess.logits, val[off + pos + 1]);
@@ -189,11 +199,11 @@ pub(crate) fn bench(w: &F32Weights, m: &Model, text: &str) {
         lq / n as f64,
         100.0 * agree as f64 / n as f64
     );
-    speed(w, val, &mut sess, &mut rs);
+    speed(ck, val, &mut sess, &mut rs);
 }
 
 /// Generation and prompt throughput, and batched vs token-by-token logits.
-fn speed(w: &F32Weights, val: &[usize], sess: &mut Session<'_>, rs: &mut RefState) {
+fn speed(ck: &Checkpoint, val: &[usize], sess: &mut Session<'_>, rs: &mut RefState) {
     // Generation: full 256-token windows from "\n", median of 50.
     let s = Sampler {
         temperature: 0.8,
@@ -282,7 +292,7 @@ fn speed(w: &F32Weights, val: &[usize], sess: &mut Session<'_>, rs: &mut RefStat
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         for (pos, &t) in p.iter().enumerate() {
-            step_ref(w, rs, t, pos);
+            step_ref(ck, rs, t, pos);
         }
         let d = |a: &[f32]| {
             a.iter()

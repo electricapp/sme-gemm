@@ -1,5 +1,8 @@
-//! The row-wise passes that sit between matmuls in a model, writing f32 or
-//! straight to f16 for the next [`Linear`](crate::Linear).
+//! The row-wise passes that sit between matmuls in a model.
+//!
+//! The norms, as functions and as the [`Norm`] layer that holds its
+//! parameters, write f32 or straight to f16 for the next
+//! [`Linear`](crate::Linear).
 //!
 //! NEON on the calling thread (`csrc/neon_ops.c`; plain Rust elsewhere): one
 //! row is tens of nanoseconds of work, far below what spreading it across
@@ -155,6 +158,75 @@ fn norm_row(out: &mut [f32], x: &[f32], weight: &[f32], bias: Option<&[f32]>, ep
 /// shape of `x`.
 pub fn rms_norm<X: ModelFloat, Y: ModelFloat>(x: &[X], weight: &[f32], eps: f32, y: &mut [Y]) {
     norm(x, weight, None, eps, true, y);
+}
+
+/// A norm layer with its parameters: [`layer_norm`] ([`Norm::layer`], GPT-2's
+/// `LayerNorm`) or [`rms_norm`] ([`Norm::rms`], Llama's `RMSNorm`).
+///
+/// ```
+/// use half::f16;
+/// use sme_gemm::nn::Norm;
+/// let ln = Norm::layer(vec![1.0; 4], None, 1e-5);
+/// let mut y = vec![f16::ZERO; 4];
+/// ln.forward(&[1.0f32, 2.0, 3.0, 4.0], &mut y);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Norm {
+    weight: Vec<f32>,
+    bias: Option<Vec<f32>>,
+    eps: f32,
+    rms: bool,
+}
+
+impl Norm {
+    /// `(x - mean) / sqrt(var + eps) * weight + bias`.
+    ///
+    /// # Panics
+    /// Panics if `weight` is empty or `bias` is not `weight.len()` long.
+    #[must_use]
+    pub fn layer(weight: Vec<f32>, bias: Option<Vec<f32>>, eps: f32) -> Self {
+        assert!(!weight.is_empty(), "a norm needs at least one feature");
+        if let Some(b) = &bias {
+            assert_eq!(b.len(), weight.len(), "bias holds weight.len() values");
+        }
+        Self {
+            weight,
+            bias,
+            eps,
+            rms: false,
+        }
+    }
+
+    /// `x / sqrt(mean(x^2) + eps) * weight`.
+    ///
+    /// # Panics
+    /// Panics if `weight` is empty.
+    #[must_use]
+    pub fn rms(weight: Vec<f32>, eps: f32) -> Self {
+        assert!(!weight.is_empty(), "a norm needs at least one feature");
+        Self {
+            weight,
+            bias: None,
+            eps,
+            rms: true,
+        }
+    }
+
+    /// Features per row.
+    #[must_use]
+    pub const fn width(&self) -> usize {
+        self.weight.len()
+    }
+
+    /// Normalizes each [`Norm::width`]-wide row of `x` into `y` (f32 or f16,
+    /// same shape).
+    ///
+    /// # Panics
+    /// Panics if `x.len()` is not a multiple of the width or `y` is not the
+    /// shape of `x`.
+    pub fn forward<X: ModelFloat, Y: ModelFloat>(&self, x: &[X], y: &mut [Y]) {
+        norm(x, &self.weight, self.bias.as_deref(), self.eps, self.rms, y);
+    }
 }
 
 /// `out[i] = 1 / sqrt(mean(x_i^2) + eps)` for each `k`-wide row of `x`: the

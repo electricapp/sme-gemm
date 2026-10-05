@@ -4,9 +4,9 @@
 use crate::fill_f32;
 use half::f16;
 use sme_gemm::{
-    Epilogue, Gate, GatedLinear, HotPool, KvCache, Linear, Mlp, Q4Params, Q4Weights, SelfAttention,
-    WeightLayout, caps, matmul_f16_packed, matmul_f32_packed, matmul_q4, matmul_q4_ep, nn, prepack,
-    prepack_f16, prepack_f32,
+    Block, Epilogue, Gate, GatedLinear, HotPool, KvCache, Linear, Mlp, Q4Params, Q4Weights,
+    SelfAttention, WeightLayout, caps, matmul_f16_packed, matmul_f32_packed, matmul_q4,
+    matmul_q4_ep, nn, prepack, prepack_f16, prepack_f32,
 };
 
 fn transpose<T: Copy>(w: &[T], n: usize, k: usize) -> Vec<T> {
@@ -174,6 +174,101 @@ fn norms_match_f64() {
     }
 }
 
+/// `nn::Norm` gives the bits of the norm functions it holds the parameters of.
+#[test]
+fn norm_layer_matches_functions() {
+    let dim = 100usize;
+    let mut s = 0x11ea_0110;
+    let x: Vec<f32> = fill_f32(&mut s, 3 * dim).iter().map(|v| v * 4.0).collect();
+    let (w, b) = (fill_f32(&mut s, dim), fill_f32(&mut s, dim));
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let (mut got, mut want) = (vec![0.0f32; x.len()], vec![0.0f32; x.len()]);
+    let (mut got16, mut want16) = (vec![f16::ZERO; x.len()], vec![f16::ZERO; x.len()]);
+    let ln = nn::Norm::layer(w.clone(), Some(b.clone()), 1e-5);
+    assert_eq!(ln.width(), dim);
+    ln.forward(&x, &mut got);
+    nn::layer_norm(&x, &w, Some(&b), 1e-5, &mut want);
+    assert_eq!(bits(&got), bits(&want), "layer f32");
+    ln.forward(&x, &mut got16);
+    nn::layer_norm(&x, &w, Some(&b), 1e-5, &mut want16);
+    assert_eq!(got16, want16, "layer f16");
+    let rms = nn::Norm::rms(w.clone(), 1e-6);
+    rms.forward(&x, &mut got);
+    nn::rms_norm(&x, &w, 1e-6, &mut want);
+    assert_eq!(bits(&got), bits(&want), "rms f32");
+    rms.forward(&x, &mut got16);
+    nn::rms_norm(&x, &w, 1e-6, &mut want16);
+    assert_eq!(got16, want16, "rms f16");
+}
+
+/// `Block::accumulate` gives the bits of its parts run in turn on the residual
+/// stream, with a pool alive (one row chains each half's GEMVs with its NEON
+/// work) and without: a prompt of several rows, then one row at a time, for
+/// GPT-2's form (layer norm, plain MLP) and the `RMSNorm` / gated one.
+#[test]
+fn block_matches_its_parts() {
+    let (heads, kv_heads, hd) = (4usize, 2usize, 64usize);
+    let (d, f) = (heads * hd, 640usize);
+    let wq = (heads + 2 * kv_heads) * hd;
+    let lay = WeightLayout::OutIn;
+    let mut s = 0x11ea_0500;
+    let (w1, w2) = (fill_f32(&mut s, wq * d), fill_f32(&mut s, d * d));
+    let (wu, wg, wd) = (
+        fill_f32(&mut s, f * d),
+        fill_f32(&mut s, f * d),
+        fill_f32(&mut s, d * f),
+    );
+    let mut gamma = || -> Vec<f32> { fill_f32(&mut s, d).iter().map(|v| v + 1.0).collect() };
+    let (g1, g2) = (gamma(), gamma());
+    let b1 = fill_f32(&mut s, d);
+    for gated in [false, true] {
+        let parts = || {
+            let norm = |g: &[f32]| {
+                if gated {
+                    nn::Norm::rms(g.to_vec(), 1e-6)
+                } else {
+                    nn::Norm::layer(g.to_vec(), Some(b1.clone()), 1e-5)
+                }
+            };
+            let attn = SelfAttention::new(
+                Linear::quantize(&w1, lay, wq, d),
+                Linear::quantize(&w2, lay, d, d),
+                heads,
+                kv_heads,
+                hd,
+            );
+            let down = Linear::quantize(&wd, lay, d, f);
+            let mlp = if gated {
+                Mlp::gated(GatedLinear::quantize(&wg, &wu, lay, f, d, Gate::Silu), down)
+            } else {
+                Mlp::new(Linear::quantize(&wu, lay, f, d), Gate::Gelu, down)
+            };
+            (norm(&g1), attn, norm(&g2), mlp)
+        };
+        let (n1, attn, n2, mlp) = parts();
+        let block = Block::new(n1.clone(), parts().1, n2.clone(), parts().3);
+        for pool in [false, true] {
+            let _pool = pool.then(|| HotPool::with_workers(2));
+            let (mut bc, mut hc) = (block.cache(32), attn.cache(32));
+            for (step, m) in std::iter::once(3usize).chain([1; 12]).enumerate() {
+                let x0: Vec<f32> = fill_f32(&mut s, m * d).iter().map(|v| v * 4.0).collect();
+                let mut want = x0.clone();
+                let mut h = vec![f16::ZERO; m * d];
+                n1.forward(&want, &mut h);
+                attn.accumulate(&h, &mut hc, &mut want, m);
+                n2.forward(&want, &mut h);
+                mlp.accumulate(&h, &mut want, m);
+                let mut got = x0;
+                block.accumulate(&mut got, &mut bc, m);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                let tag = format!("gated={gated} pool={pool} step={step}");
+                assert_eq!(bits(&got), bits(&want), "{tag}");
+                assert_eq!(bc.keys(), hc.keys(), "{tag} keys");
+            }
+        }
+    }
+}
+
 /// A gated layer equals its two halves run as separate layers, then
 /// `act(gate) * up` in f32: interleaving whole 32-column tiles leaves every
 /// column's quantization and accumulation unchanged.
@@ -294,7 +389,7 @@ fn self_attention_matches_its_steps() {
             let (qkv, out) = (mk(&w1, wq, d, &b1), mk(&w2, d, d, &b2));
             let (mut solo_c, mut pool_c) = (attn.cache(32), attn.cache(32));
             let mut hand_c = KvCache::new(heads, kv_heads, hd, 32);
-            for (step, m) in [3usize].into_iter().chain([1; 20]).enumerate() {
+            for (step, m) in std::iter::once(3usize).chain([1; 20]).enumerate() {
                 let x: Vec<f32> = fill_f32(&mut s, m * d).iter().map(|v| v * 4.0).collect();
                 // By hand, on the projection as given.
                 let mut want = vec![0.25f32; m * d];
@@ -318,7 +413,7 @@ fn self_attention_matches_its_steps() {
                 attn.accumulate(&x, &mut solo_c, &mut solo, m);
                 let mut pooled = vec![0.25f32; m * d];
                 {
-                    let _pool = HotPool::new(2);
+                    let _pool = HotPool::with_workers(2);
                     attn.accumulate(&x, &mut pool_c, &mut pooled, m);
                 }
                 let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -379,7 +474,7 @@ fn mlp_matches_three_calls() {
         ];
         let (uf, df) = (Linear::f16(&w1, lay, f, d), Linear::f16(&w2, lay, d, f));
         for pool in [false, true] {
-            let _pool = pool.then(|| HotPool::new(2));
+            let _pool = pool.then(|| HotPool::with_workers(2));
             for m in [1usize, 3] {
                 for rep in 0..if m == 1 { 40 } else { 2 } {
                     let x = fill_f32(&mut s, m * d);

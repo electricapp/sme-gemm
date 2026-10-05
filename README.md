@@ -115,16 +115,24 @@ matching f16).
     weights and a `HotPool`, the activation, or each KV-head group's append and
     attention, runs on pool workers beside the two GEMVs instead of between them
     (ARCHITECTURE.md §2.13), with the same bits as running the steps in turn.
-  - `nn::layer_norm` / `nn::rms_norm`, writing f16 straight for the next matmul.
+  - `Block`: a pre-norm layer, `x += attn(norm1(x)); x += mlp(norm2(x))`, from
+    two `nn::Norm`s, a `SelfAttention` and an `Mlp` (GPT-2's with layer norms
+    and a plain MLP; `RMSNorm`, gated MLPs and grouped-query heads are the
+    parts' own parameters). Layers of other shapes compose the parts directly.
+  - `nn::Norm` (`Norm::layer` / `Norm::rms`, holding weight, bias and eps) and
+    the `nn::layer_norm` / `nn::rms_norm` functions, writing f16 straight for
+    the next matmul.
   - `SmeWarm` keeps the SME unit awake between calls: it idles within a few
     hundred ns, and a loop alternating short SME calls with NEON work otherwise
     pays ~1 µs per call to wake it. `SME_GEMM_TRACE=1` prints every SME call
     with its shape, time and the idle gap before it, flagging those that paid
     the wake.
-  - `HotPool::new(workers)` keeps worker threads spinning so short NEON passes
-    can split across cores without GCD's microseconds of wake-up: `KvCache`
+  - `HotPool::new()` keeps worker threads spinning so short NEON passes can
+    split across cores without GCD's microseconds of wake-up: `KvCache`
     attention splits its heads across them from 64 cached keys (2x at 128 keys,
-    2.9x at 1024 on M5).
+    2.9x at 1024 on M5). It starts one worker per P-core left after the caller
+    and the `SmeWarm` helper, which it also holds (`with_workers(n)` picks the
+    count).
 - **candle** / **burn** adapters (optional features).
 - Scalar reference fallback off Apple.
 
@@ -286,7 +294,27 @@ gemm_f32(m, n, k, &mut cf, /*c_row*/ n, /*c_col*/ 1,
     &bf, /*b_row*/ n, /*b_col*/ 1, /*alpha*/ 1.0, /*beta*/ 1.0);
 ```
 
-A transformer block from the building blocks (weights as PyTorch stores them):
+A transformer layer (weights as PyTorch stores them, `[out][in]`):
+
+```rust
+use sme_gemm::{nn::Norm, Block, Gate, HotPool, Linear, Mlp, SelfAttention, WeightLayout};
+
+let (d, heads) = (384, 6);
+let q = |n: usize, k: usize| Linear::quantize(&vec![0.01f32; n * k], WeightLayout::OutIn, n, k);
+let block = Block::new(
+    Norm::layer(vec![1.0; d], None, 1e-5),
+    SelfAttention::new(q(3 * d, d), q(d, d), heads, heads, d / heads),
+    Norm::layer(vec![1.0; d], None, 1e-5),
+    Mlp::new(q(4 * d, d), Gate::Gelu, q(d, 4 * d)),
+);
+let mut cache = block.cache(256);
+let _pool = HotPool::new(); // spare P-cores for attention and gelu, SME kept awake
+
+let mut x = vec![0.1f32; d]; // one position's residual stream, f32
+block.accumulate(&mut x, &mut cache, 1);
+```
+
+The same layer from its parts, the way to build one of another shape:
 
 ```rust
 use half::f16;
@@ -321,9 +349,10 @@ Also: `matmul_{bf16,f32,f64,i16}`, `gemm_*`, `matmul_*_batched`,
 `sme_gemm::candle::sme_matmul`. Caps: `sme_gemm::caps()`.
 
 **End to end.** `examples/shakespeare` runs nanoGPT shakespeare-char (10.7M
-parameters) from these blocks alone (`SelfAttention`, `Mlp`, `Linear`,
-`nn::layer_norm`, `SmeWarm`, `HotPool`; the model file adds only embeddings and
-sampling) as a CLI that continues a prompt. On an M5 it generates ~26.7k
+parameters) from these pieces alone (`Block` of `nn::Norm`, `SelfAttention` and
+`Mlp` over 4-bit `Linear`s, and `HotPool`; the model file adds only reading the
+safetensors checkpoint, embeddings and sampling) as a CLI that continues a
+prompt. On an M5 it generates ~26.7k
 characters/s over 256-character windows (~31.7k at short context) with the
 validation loss of the f32 model:
 

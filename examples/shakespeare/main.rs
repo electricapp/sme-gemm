@@ -1,6 +1,6 @@
 //! `shakespeare`: continue text in the style of Shakespeare with nanoGPT
 //! shakespeare-char (10.7M parameters) running 4-bit on Apple's SME unit, built
-//! from sme-gemm's `Linear`, `KvCache`, `nn` and `SmeWarm`.
+//! from sme-gemm's `Block`, `KvCache` and `HotPool`.
 //!
 //!   examples/shakespeare/fetch.sh     # once: checkpoint + text into examples/shakespeare/data
 //!   cargo run --release --example shakespeare -- "ROMEO:"
@@ -13,7 +13,7 @@ use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use model::{CTX, F32Weights, Model, Rng, Sampler, Session, decode, encode, sample};
+use model::{CTX, Checkpoint, Model, Rng, Sampler, Session, decode, encode, sample};
 
 /// This example's directory in the checkout it was built from: `fetch.sh` and
 /// the default `data/` live here.
@@ -230,8 +230,9 @@ fn setup_hint() -> String {
 
 fn run() -> Result<(), String> {
     let o = parse()?;
-    let w = F32Weights::load(&o.data).map_err(|e| format!("{e}\n{}", setup_hint()))?;
-    let m = Model::quantize(&w, o.q4_block);
+    let ck = Checkpoint::load(&o.data.join("model.safetensors"))
+        .map_err(|e| format!("{e}\n{}", setup_hint()))?;
+    let m = Model::load(&ck, o.q4_block)?;
     if o.profile {
         reference::profile(&m);
         return Ok(());
@@ -240,10 +241,10 @@ fn run() -> Result<(), String> {
         let path = o.data.join("input.txt");
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("{}: {e}\n{}", path.display(), setup_hint()))?;
-        reference::bench(&w, &m, &text);
+        reference::bench(&ck, &m, &text);
         return Ok(());
     }
-    drop(w);
+    drop(ck);
     let mut sess = Session::new(&m);
     let mut rng = Rng::new(o.sampler.seed);
     let mut continue_text = |text: &str| -> Result<(), String> {

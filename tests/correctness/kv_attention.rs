@@ -214,7 +214,7 @@ fn hot_pool_attention_matches_one_thread() {
         let scale = 1.0 / (hd as f32).sqrt();
         let mut one = vec![0.0f32; heads * hd];
         attention_kv_f16(&q, &k, &v, len, heads, kv_heads, hd, scale, &mut one);
-        let pool = sme_gemm::HotPool::new(2);
+        let pool = sme_gemm::HotPool::with_workers(2);
         for _ in 0..50 {
             let mut many = vec![0.0f32; heads * hd];
             attention_kv_f16(&q, &k, &v, len, heads, kv_heads, hd, scale, &mut many);

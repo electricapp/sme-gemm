@@ -29,10 +29,11 @@ thread_local! {
     static ITEM: RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
-/// A transformer self-attention block added into a residual stream: the fused
-/// `qkv` projection, the new position's key and value appended to a
-/// [`KvCache`], attention over the cache, and the `out` projection,
-/// `y += out(attention(q, K, V))`.
+/// A transformer self-attention block added into a residual stream.
+///
+/// It runs the fused `qkv` projection, appends the new position's key and
+/// value to a [`KvCache`], attends over the cache, and adds the `out`
+/// projection: `y += out(attention(q, K, V))`.
 ///
 /// `qkv` has `(heads + 2 * kv_heads) * head_dim` outputs, `[q | k | v]` in
 /// head order (GPT-2's `c_attn`; a Llama-style `q_proj`/`k_proj`/`v_proj`
@@ -108,10 +109,9 @@ impl SelfAttention {
                 q.chain(k).chain(v)
             })
             .collect();
-        let (qkv, grouped) = match qkv.permuted_outputs(&perm) {
-            Some(p) => (p, true),
-            None => (qkv, false),
-        };
+        let (qkv, grouped) = qkv
+            .permuted_outputs(&perm)
+            .map_or((qkv, false), |p| (p, true));
         Self {
             qkv,
             grouped,
@@ -126,6 +126,11 @@ impl SelfAttention {
     #[must_use]
     pub const fn width(&self) -> usize {
         self.qkv.k()
+    }
+
+    /// Outputs of the `out` projection (the residual's width in a [`crate::Block`]).
+    pub(crate) const fn out_width(&self) -> usize {
+        self.out.n()
     }
 
     /// An empty cache for this block's heads, `capacity` positions long.

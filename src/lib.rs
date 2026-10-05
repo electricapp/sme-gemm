@@ -21,9 +21,12 @@
 //! the kernel picked by row count and an optional folded input `RMSNorm`),
 //! [`GatedLinear`] (a `SwiGLU` / `GeGLU` MLP's gate and up as one matmul),
 //! [`KvCache`] (f16 key/value cache and its attention), [`nn`] (layer and RMS
-//! norm), [`SmeWarm`] (keeps the SME unit awake between calls) and [`HotPool`]
-//! (spinning workers for short NEON passes). `SME_GEMM_TRACE=1` prints every
-//! SME call with its shape, time, and the idle gap before it.
+//! norm, as functions and as the [`nn::Norm`] layer), [`SelfAttention`] and
+//! [`Mlp`] (a transformer layer's two halves), [`Block`] (a pre-norm layer
+//! made of them), [`SmeWarm`] (keeps the SME unit awake between calls) and
+//! [`HotPool`] (spinning workers for short NEON passes, sized for the machine,
+//! plus an `SmeWarm`). `SME_GEMM_TRACE=1` prints every SME call with its shape,
+//! time, and the idle gap before it.
 //!
 //! Every dtype has a real `prepack_*` that builds the kernel's packed weight
 //! panel, so `*_packed` reuse works across f16, bf16, f32, f64, i8 and i16.
@@ -39,6 +42,7 @@ pub mod candle;
 pub mod probe;
 mod reference;
 
+mod block;
 mod convert;
 mod element;
 mod epilogue;
@@ -54,6 +58,7 @@ mod pool;
 mod self_attention;
 mod warm;
 
+pub use block::Block;
 pub use layout::{Prepack, WeightLayout, prepack};
 pub use linear::{Gate, GatedLinear, Linear, ModelFloat};
 pub use mlp::Mlp;

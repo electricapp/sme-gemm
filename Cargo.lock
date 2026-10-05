@@ -2159,6 +2159,7 @@ dependencies = [
  "libc",
  "ort",
  "proptest",
+ "safetensors",
 ]
 
 [[package]]

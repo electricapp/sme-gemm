@@ -1,8 +1,8 @@
 #!/bin/sh
 # One-time setup for examples/shakespeare: downloads the nanoGPT
-# shakespeare-char checkpoint, converts it to raw f32 (weights.f32 + index.txt,
-# no torch needed), and fetches the text --bench scores against, all into
-# data/ next to this script. Re-running skips whatever is already there.
+# shakespeare-char checkpoint, converts it to model.safetensors (no torch
+# needed), and fetches the text --bench scores against, all into data/ next to
+# this script. Re-running skips whatever is already there.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 crate=$(cd "$here/../.." && pwd)
@@ -12,7 +12,7 @@ for tool in curl python3; do
 done
 mkdir -p "$data"
 
-if [ -s "$data/weights.f32" ] && [ -s "$data/index.txt" ]; then
+if [ -s "$data/model.safetensors" ]; then
     echo "checkpoint: already in $data"
 else
     echo "checkpoint: downloading (~43 MB)"
