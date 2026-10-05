@@ -5,7 +5,6 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use half::f16;
-use half::slice::HalfFloatSliceExt;
 
 use crate::element::sealed;
 use crate::{
@@ -37,18 +36,18 @@ impl ModelFloat for f16 {
     }
     fn as_f32<'a>(x: &'a [Self], scratch: &'a mut Vec<f32>) -> &'a [f32] {
         scratch.resize(x.len(), 0.0);
-        x.convert_to_f32_slice(scratch);
+        crate::convert::to_f32(x, scratch);
         scratch
     }
     fn store_f32(src: &[f32], dst: &mut [Self]) {
-        dst.convert_from_f32_slice(src);
+        crate::convert::to_f16(src, dst);
     }
 }
 
 impl ModelFloat for f32 {
     fn as_f16<'a>(x: &'a [Self], scratch: &'a mut Vec<f16>) -> &'a [f16] {
         scratch.resize(x.len(), f16::ZERO);
-        scratch.convert_from_f32_slice(x);
+        crate::convert::to_f16(x, scratch);
         scratch
     }
     fn as_f32<'a>(x: &'a [Self], _: &'a mut Vec<f32>) -> &'a [f32] {
@@ -301,7 +300,7 @@ impl Linear {
         Y16.with_borrow_mut(|out| {
             out.resize(y.len(), f16::ZERO);
             self.forward_ep(x, out, m, ep);
-            out.convert_to_f32_slice(y);
+            crate::convert::to_f32(out, y);
         });
     }
 
@@ -315,9 +314,7 @@ impl Linear {
         Y16.with_borrow_mut(|out| {
             out.resize(y.len(), f16::ZERO);
             self.forward(x, out, m);
-            for (acc, v) in y.iter_mut().zip(out.iter()) {
-                *acc += v.to_f32();
-            }
+            crate::convert::add_f16(out, y);
         });
     }
 
@@ -549,7 +546,7 @@ impl GatedLinear {
         Y16.with_borrow_mut(|out| {
             out.resize(y.len(), f16::ZERO);
             self.forward(x, out, m);
-            out.convert_to_f32_slice(y);
+            crate::convert::to_f32(out, y);
         });
     }
 }

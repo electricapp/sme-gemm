@@ -96,6 +96,12 @@ static int run_q4_panels_bf16(bf16 *dst, const bf16 *a, const uint8_t *nibbles,
 // Up to here the GEMV beats the MOPA path, whose panel unpack costs as much SME
 // time as a 32-row M-tile (measured 1.45x at m=5, 1.06x at 7, 0.96x at 8).
 #define Q4_GEMV_MAXR 7
+// Pulls A's lines in up front; see the f16 kernel.
+#define Q4_TOUCH(p, bytes)                                                                         \
+    for (uint64_t o_ = 0; o_ < (uint64_t)(bytes); o_ += 4 * svcntb())                              \
+    __asm__ volatile("whilelt pn8.b, %0, %1, vlx4\n\tld1b {z0.b-z3.b}, pn8/z, [%2, %0]" ::"r"(o_), \
+                     "r"((uint64_t)(bytes)), "r"(p)                                                \
+                     : "z0", "z1", "z2", "z3", "p8", "memory")
 
 // As the f16 kernel: with 4 bands or fewer, odd depths go to a second group.
 #define Q4_D1(i, BB)                                                                               \
@@ -174,6 +180,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
     svbfloat16_t vb = svdup_n_bf16((bf16)1.0f);
     svbfloat16_t va = svdup_n_bf16((bf16)0.0f);
     svldr_zt(0, lut);
+    Q4_TOUCH(a, rows * k * sizeof(bf16));
     size_t block = (size_t)1 << bshift;
     size_t nbk = (k + block - 1) >> bshift;
     size_t bb = 8 / rows, nbands = b_hi - b_lo;

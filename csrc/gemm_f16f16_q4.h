@@ -106,6 +106,17 @@ static int run_q4_panels(f16 *dst, const f16 *a, const uint8_t *nibbles, const f
 // Up to here the GEMV beats the MOPA path, whose panel unpack costs as much SME
 // time as a 32-row M-tile (measured 1.45x at m=5, 1.06x at 7, 0.96x at 8).
 #define Q4_GEMV_MAXR 7
+// A's lines are usually fresh from the caller's core, and the unit's first read
+// of each waits on that core (~0.15 us over k=384, ~0.37 us over k=1536 when
+// met one by one inside the loop). Loading it all up front, four vectors at a
+// time with no result used, overlaps those waits; the last load is predicated
+// to the end of A. The library's own producers store with STNP (neon_act.h),
+// which leaves nothing to wait on.
+#define Q4_TOUCH(p, bytes)                                                                         \
+    for (uint64_t o_ = 0; o_ < (uint64_t)(bytes); o_ += 4 * svcntb())                              \
+    __asm__ volatile("whilelt pn8.b, %0, %1, vlx4\n\tld1b {z0.b-z3.b}, pn8/z, [%2, %0]" ::"r"(o_), \
+                     "r"((uint64_t)(bytes)), "r"(p)                                                \
+                     : "z0", "z1", "z2", "z3", "p8", "memory")
 
 // One row: depth i of the step at `d`, for each of BB bands. BB is a constant in
 // each expansion, so the band loop unrolls (a runtime count spills).
@@ -189,6 +200,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
     svfloat16_t vb = svdup_n_f16((f16)1.0f);
     svfloat16_t va = svdup_n_f16((f16)0.0f);
     svldr_zt(0, lut);
+    Q4_TOUCH(a, rows * k * sizeof(f16));
     size_t block = (size_t)1 << bshift;
     size_t nbk = (k + block - 1) >> bshift;
     // Rows x bands <= 8 block-sum groups; spread the bands evenly over passes.

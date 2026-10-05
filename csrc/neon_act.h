@@ -18,6 +18,14 @@
 
 #include "epilogue.h"
 
+// Stores 16 halves (f16 or bf16 bits) that an SME kernel reads next, as one
+// non-temporal pair. The unit's first read of a line the core stored normally
+// waits on that core -- a one-row Q4 GEMV over k=1536 runs 0.37 us slower on M5
+// -- while an STNP store leaves no line behind in the core to wait on.
+static inline void na_stnp16(void *p, float16x8_t lo, float16x8_t hi) {
+    __asm__ volatile("stnp %q0, %q1, [%2]" ::"w"(lo), "w"(hi), "r"(p) : "memory");
+}
+
 // If ep ends in an activation worth moving out of the streaming region, return
 // its kind and set *rest to the nodes before it; else EP_ACT_NONE.
 static inline uint32_t na_split(const ep_desc16 *ep, ep_desc16 *rest) {
@@ -86,12 +94,18 @@ static inline void na_act_f16(__fp16 *c, size_t m, size_t n, long rs, uint32_t a
     for (size_t i = 0; i < m; i++) {
         __fp16 *row = c + (long)i * rs;
         size_t j = 0;
+#define NA_ACT8(h)                                                                                 \
+    vcvt_high_f16_f32(vcvt_f16_f32(na_apply(vcvt_f32_f16(vget_low_f16(h)), act)),                  \
+                      na_apply(vcvt_high_f32_f16(h), act))
+        for (; j + 16 <= n; j += 16) {
+            float16x8_t h0 = vld1q_f16(row + j), h1 = vld1q_f16(row + j + 8);
+            na_stnp16(row + j, NA_ACT8(h0), NA_ACT8(h1));
+        }
         for (; j + 8 <= n; j += 8) {
             float16x8_t h = vld1q_f16(row + j);
-            float32x4_t lo = na_apply(vcvt_f32_f16(vget_low_f16(h)), act);
-            float32x4_t hi = na_apply(vcvt_high_f32_f16(h), act);
-            vst1q_f16(row + j, vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi)));
+            vst1q_f16(row + j, NA_ACT8(h));
         }
+#undef NA_ACT8
         for (; j < n; j += 4) {
             float buf[4] = {0};
             size_t w = n - j < 4 ? n - j : 4;
@@ -119,6 +133,14 @@ static inline void na_act_bf16(uint16_t *c, size_t m, size_t n, long rs, uint32_
     for (size_t i = 0; i < m; i++) {
         uint16_t *row = c + (long)i * rs;
         size_t j = 0;
+#define NA_ACT4(o)                                                                                 \
+    na_to_bf16(na_apply(vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(row + j + (o)), 16)), act))
+        for (; j + 16 <= n; j += 16) {
+            uint16x8_t lo = vcombine_u16(NA_ACT4(0), NA_ACT4(4));
+            uint16x8_t hi = vcombine_u16(NA_ACT4(8), NA_ACT4(12));
+            na_stnp16(row + j, vreinterpretq_f16_u16(lo), vreinterpretq_f16_u16(hi));
+        }
+#undef NA_ACT4
         for (; j + 4 <= n; j += 4) {
             float32x4_t x = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(row + j), 16));
             vst1_u16(row + j, na_to_bf16(na_apply(x, act)));

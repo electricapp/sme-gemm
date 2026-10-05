@@ -39,6 +39,7 @@ pub mod candle;
 pub mod probe;
 mod reference;
 
+mod convert;
 mod element;
 mod epilogue;
 mod exec;
