@@ -4,7 +4,7 @@
 use crate::fill_f32;
 use half::f16;
 use sme_gemm::{
-    Epilogue, Gate, GatedLinear, Linear, Q4Params, Q4Weights, WeightLayout, caps,
+    Epilogue, Gate, GatedLinear, HotPool, Linear, Mlp, Q4Params, Q4Weights, WeightLayout, caps,
     matmul_f16_packed, matmul_f32_packed, matmul_q4, matmul_q4_ep, nn, prepack, prepack_f16,
     prepack_f32,
 };
@@ -261,6 +261,76 @@ fn rms_norm_fold_matches_normalizing_first() {
                 a[i],
                 b[i]
             );
+        }
+    }
+}
+
+/// `Mlp::accumulate` gives the same bits as its three calls run one after
+/// another: plain and gated, 4-bit and f16, with a pool alive (one row then
+/// overlaps the activation with both GEMVs) and without. The hidden width
+/// spans several GEMV passes and ends in a partial band, block and chunk.
+#[test]
+fn mlp_matches_three_calls() {
+    let (d, f) = (160usize, 1100usize);
+    let mut s = 0x11ea_0300;
+    let (w1, b1) = (fill_f32(&mut s, f * d), fill_f32(&mut s, f));
+    let (w2, b2) = (fill_f32(&mut s, d * f), fill_f32(&mut s, d));
+    let (wg, bg) = (fill_f32(&mut s, f * d), fill_f32(&mut s, f));
+    let lay = WeightLayout::OutIn;
+    for act in [Gate::Gelu, Gate::Silu] {
+        let ep = match act {
+            Gate::Gelu => Epilogue::new().gelu(),
+            Gate::Silu => Epilogue::new().silu(),
+        };
+        let up = || Linear::quantize(&w1, lay, f, d).with_bias(&b1);
+        let gated = || GatedLinear::quantize(&wg, &w1, lay, f, d, act).with_bias(&bg, &b1);
+        let down = || Linear::quantize(&w2, lay, d, f).with_bias(&b2);
+        let (u, g, dn) = (up(), gated(), down());
+        let blocks = [
+            (Mlp::new(up(), act, down()), false),
+            (Mlp::gated(gated(), down()), true),
+            (
+                Mlp::new(
+                    Linear::f16(&w1, lay, f, d),
+                    act,
+                    Linear::f16(&w2, lay, d, f),
+                ),
+                false,
+            ),
+        ];
+        let (uf, df) = (Linear::f16(&w1, lay, f, d), Linear::f16(&w2, lay, d, f));
+        for pool in [false, true] {
+            let _pool = pool.then(|| HotPool::new(2));
+            for m in [1usize, 3] {
+                for rep in 0..if m == 1 { 40 } else { 2 } {
+                    let x = fill_f32(&mut s, m * d);
+                    for (i, (mlp, is_gated)) in blocks.iter().enumerate() {
+                        let mut h = vec![f16::ZERO; m * f];
+                        let mut want = vec![0.25f32; m * d];
+                        match (i, is_gated) {
+                            (2, _) => {
+                                uf.forward_ep(&x, &mut h, m, &ep);
+                                df.accumulate(&h, &mut want, m);
+                            }
+                            (_, true) => {
+                                g.forward(&x, &mut h, m);
+                                dn.accumulate(&h, &mut want, m);
+                            }
+                            _ => {
+                                u.forward_ep(&x, &mut h, m, &ep);
+                                dn.accumulate(&h, &mut want, m);
+                            }
+                        }
+                        let mut got = vec![0.25f32; m * d];
+                        mlp.accumulate(&x, &mut got, m);
+                        let (gb, wb): (Vec<u32>, Vec<u32>) = (
+                            got.iter().map(|v| v.to_bits()).collect(),
+                            want.iter().map(|v| v.to_bits()).collect(),
+                        );
+                        assert_eq!(gb, wb, "{act:?} block {i} m={m} pool={pool} rep={rep}");
+                    }
+                }
+            }
         }
     }
 }

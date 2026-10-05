@@ -39,12 +39,26 @@ static SLOTS: [Slot; MAX_WORKERS] = [const {
         done: AtomicU64::new(0),
     }
 }; MAX_WORKERS];
+/// A cache line of its own. The workers poll `LIVE` on every spin, so the
+/// caller-side atomics (`IN_USE`, `SEQ`, `JOB`) must not share its line: a
+/// read-modify-write on a line other cores are spinning on waits for each of
+/// them to give it up, which cost a post ~0.1 us.
+#[repr(align(128))]
+struct Line<T>(T);
+
+impl<T> core::ops::Deref for Line<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 /// Running workers; 0 while no pool is alive.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
+static LIVE: Line<AtomicUsize> = Line(AtomicUsize::new(0));
 /// Held by the one call using the pool, and by shutdown.
-static IN_USE: AtomicBool = AtomicBool::new(false);
-static SEQ: AtomicU64 = AtomicU64::new(0);
-static JOB: AtomicPtr<Job<'static>> = AtomicPtr::new(core::ptr::null_mut());
+static IN_USE: Line<AtomicBool> = Line(AtomicBool::new(false));
+static SEQ: Line<AtomicU64> = Line(AtomicU64::new(0));
+static JOB: Line<AtomicPtr<Job<'static>>> = Line(AtomicPtr::new(core::ptr::null_mut()));
 static REFS: AtomicUsize = AtomicUsize::new(0);
 static HANDLES: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 
@@ -155,6 +169,112 @@ fn run_worker(w: usize) {
         slot.done.store(p, Ordering::Release);
         last = Instant::now();
     }
+}
+
+/// Whether a pool is alive (a call may still find it busy).
+pub(crate) fn live() -> bool {
+    LIVE.load(Ordering::Relaxed) > 0
+}
+
+/// A raw pointer the pool's items may share: each writes a disjoint range.
+#[derive(Clone, Copy)]
+pub(crate) struct Shared<T>(pub(crate) *mut T);
+impl<T> Shared<T> {
+    /// The pointer (a method, so closures capture the `Sync` wrapper).
+    pub(crate) const fn ptr(self) -> *mut T {
+        self.0
+    }
+}
+// SAFETY: every user has its items write disjoint ranges of the one buffer,
+// and the pool returns only after all of them finish.
+unsafe impl<T> Sync for Shared<T> {}
+// SAFETY: as for Sync.
+unsafe impl<T> Send for Shared<T> {}
+
+/// A job posted by [`alongside`], as the calling thread sees it meanwhile.
+pub(crate) struct Posted<'a>(&'a Job<'a>);
+
+impl Posted<'_> {
+    /// Runs on the calling thread every item no worker has claimed yet (a
+    /// worker may be asleep after an idle spell), returning once those are done.
+    pub(crate) fn drain(&self) {
+        if self.0.next.load(Ordering::Relaxed) < self.0.items {
+            self.0.drain();
+        }
+    }
+}
+
+/// Posts `f(i)` for every `i < items` to the pool's workers and runs `main` on
+/// the calling thread meanwhile -- typically SME work that the items feed or
+/// follow, synchronized through atomics of the caller's own. Returns `main`'s
+/// result once every item is done (draining any still unclaimed); `None`,
+/// running nothing, when no pool is alive or another call holds it.
+///
+/// # Panics
+/// Re-raises (as a new panic) if any `f(i)` panicked, after every worker has
+/// finished.
+pub(crate) fn alongside<R>(
+    items: usize,
+    f: &(dyn Fn(usize) + Sync),
+    main: impl FnOnce(&Posted<'_>) -> R,
+) -> Option<R> {
+    if items == 0 || LIVE.load(Ordering::Relaxed) == 0 || IN_USE.swap(true, Ordering::Acquire) {
+        return None;
+    }
+    let live = LIVE.load(Ordering::Acquire);
+    if live == 0 {
+        IN_USE.store(false, Ordering::Release);
+        return None;
+    }
+    let job = Job {
+        f,
+        items,
+        next: AtomicUsize::new(0),
+        panicked: AtomicBool::new(false),
+    };
+    JOB.store(
+        (&raw const job).cast::<Job<'static>>().cast_mut(),
+        Ordering::Release,
+    );
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let engaged = &SLOTS[..live.min(items)];
+    for s in engaged {
+        s.posted.store(seq, Ordering::Release);
+    }
+    // Wait for the workers even if `main` unwinds: the job lives on this frame.
+    struct Finish<'a, 'j> {
+        job: &'a Job<'j>,
+        engaged: &'a [Slot],
+        seq: u64,
+    }
+    impl Drop for Finish<'_, '_> {
+        fn drop(&mut self) {
+            // A load first: the line is usually a worker's, and taking it for
+            // a read-modify-write when every item is claimed costs more.
+            if self.job.next.load(Ordering::Relaxed) < self.job.items {
+                self.job.drain();
+            }
+            for s in self.engaged {
+                while s.done.load(Ordering::Acquire) != self.seq {
+                    std::hint::spin_loop();
+                }
+            }
+            JOB.store(core::ptr::null_mut(), Ordering::Relaxed);
+            IN_USE.store(false, Ordering::Release);
+        }
+    }
+    let finish = Finish {
+        job: &job,
+        engaged,
+        seq,
+    };
+    let r = main(&Posted(&job));
+    drop(finish);
+    assert!(
+        !job.panicked.load(Ordering::Relaxed),
+        "a HotPool task panicked"
+    );
+    Some(r)
 }
 
 /// Runs `f(i)` for every `i < items` on the calling thread and the pool's

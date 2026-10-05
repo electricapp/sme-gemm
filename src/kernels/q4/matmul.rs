@@ -102,6 +102,67 @@ fn q4_f16_impl(a: &[f16], w: &Q4Weights, c: &mut [f16], m: usize, ep: &Epilogue<
     );
 }
 
+/// One row of [`matmul_q4_ep`] as a link of a chain ([`Mlp`](crate::Mlp)):
+/// raises `done` to each output column once it is stored and waits on `ready`
+/// for the depths of `a` (either `None`), with the whole op-graph, activation
+/// included, in the kernel. `false` with nothing done when there is no SME f16
+/// path, or when the kernel failed (`c` untouched, `done` not raised).
+///
+/// # Safety
+/// `a` holds `w.k()` and `c` `w.n()` values for the whole call; other threads
+/// write `a` only below what `ready` has published and read `c` only below
+/// what `done` has.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn q4_chained(
+    a: *const f16,
+    w: &Q4Weights,
+    c: *mut f16,
+    ep: &Epilogue<'_, f16>,
+    done: Option<&core::sync::atomic::AtomicUsize>,
+    ready: Option<&core::sync::atomic::AtomicUsize>,
+) -> bool {
+    let (m, n, k) = (1, w.n, w.k);
+    crate::exec::validate_ep(ep, m, n);
+    if n == 0 || !caps().sme_f16f16 {
+        return false;
+    }
+    let fnodes = crate::exec::resolve_nodes(&ep.nodes, ep.act, n);
+    let desc = crate::ffi::EpDesc16 {
+        n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
+        nodes: fnodes.as_ptr(),
+    };
+    let ep_ptr = if fnodes.is_empty() {
+        core::ptr::null()
+    } else {
+        &raw const desc
+    };
+    let _busy = crate::warm::busy("gemm_sme_f16f16_q4", m, n, k);
+    // SAFETY: the caller's contract covers a and c; the weights describe
+    // (n, k) as in `q4_f16_impl`; `done` and `ready` outlive the call, and the
+    // kernel only stores to the one and loads from the other.
+    let rc = unsafe {
+        crate::ffi::gemm_sme_f16f16_q4_chained(
+            m,
+            n,
+            k,
+            c.cast::<u16>(),
+            a.cast::<u16>(),
+            w.nibbles.as_ptr(),
+            w.scales.as_ptr(),
+            if w.mins.is_empty() {
+                core::ptr::null()
+            } else {
+                w.mins.as_ptr()
+            },
+            w.params.block,
+            ep_ptr,
+            done.map_or(core::ptr::null(), core::ptr::from_ref),
+            ready.map_or(core::ptr::null(), core::ptr::from_ref),
+        )
+    };
+    rc == 0
+}
+
 /// [`matmul_q4`] with bf16 activations and output (B16B16 MOPA, M5+
 /// `FEAT_SME_B16B16`): row-major `C = A @ dequant(B)`, B kept 4-bit resident.
 ///

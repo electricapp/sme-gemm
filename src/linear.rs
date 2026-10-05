@@ -319,8 +319,20 @@ impl Linear {
     }
 
     fn run(&self, x: &[f16], y: &mut [f16], m: usize, ep: &Epilogue<'_, f16>) {
+        self.with_lead(x, m, ep, |ep| self.run_ep(x, y, m, ep));
+    }
+
+    /// `f` given `ep` behind this layer's own leading ops (the RMS row scale of
+    /// `x`, then the bias), if it has any.
+    fn with_lead<R>(
+        &self,
+        x: &[f16],
+        m: usize,
+        ep: &Epilogue<'_, f16>,
+        f: impl FnOnce(&Epilogue<'_, f16>) -> R,
+    ) -> R {
         if self.rms_eps.is_none() && self.bias.is_none() {
-            return self.run_ep(x, y, m, ep);
+            return f(ep);
         }
         R16.with_borrow_mut(|r| {
             let mut lead = Epilogue::new();
@@ -333,8 +345,48 @@ impl Linear {
             if let Some(b) = self.bias.as_deref() {
                 lead = lead.add_col(b);
             }
-            self.run_ep(x, y, m, &ep.with_leading(lead));
-        });
+            f(&ep.with_leading(lead))
+        })
+    }
+
+    /// Whether [`Linear::run_chained`] can run this layer: 4-bit weights on
+    /// SME f16, and with `gated` input (written while the call runs) no RMS
+    /// norm, which would need all of it up front.
+    pub(crate) fn chainable(&self, gated: bool) -> bool {
+        matches!(self.w, Weights::Q4 { .. })
+            && caps().sme_f16f16
+            && !(gated && self.rms_eps.is_some())
+    }
+
+    /// `y = x @ W (+ bias)` for one row as a link of a chain ([`crate::Mlp`]):
+    /// raises `done` to each output column once stored and waits on `ready`
+    /// for `x`'s depths (either `None`). `false`, `done` not raised, when the
+    /// kernel could not run.
+    ///
+    /// # Safety
+    /// `x` holds `k` and `y` `n` values for the whole call. Other threads may
+    /// write `x` only below what they have published in `ready` (all of it
+    /// before the call when `ready` is `None`), and read `y` only below what
+    /// `done` has published. The layer is [`Linear::chainable`].
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) unsafe fn run_chained(
+        &self,
+        x: *const f16,
+        y: *mut f16,
+        done: Option<&std::sync::atomic::AtomicUsize>,
+        ready: Option<&std::sync::atomic::AtomicUsize>,
+    ) -> bool {
+        let Weights::Q4 { q4, .. } = &self.w else {
+            return false;
+        };
+        // SAFETY: an RMS norm (the only reader of x here) implies `ready` is
+        // None (chainable), so x is complete; otherwise the slice is not read.
+        let xs =
+            unsafe { core::slice::from_raw_parts(x, if ready.is_some() { 0 } else { self.k() }) };
+        self.with_lead(xs, 1, &Epilogue::new(), |ep| {
+            // SAFETY: forwarded from the caller.
+            unsafe { crate::kernels::q4::q4_chained(x, q4, y, ep, done, ready) }
+        })
     }
 
     fn run_ep(&self, x: &[f16], y: &mut [f16], m: usize, ep: &Epilogue<'_, f16>) {
@@ -352,17 +404,19 @@ impl Linear {
     }
 }
 
-/// The activation a [`GatedLinear`] applies to its gate.
+/// An MLP's activation: what a [`GatedLinear`] applies to its gate, or an
+/// [`Mlp`](crate::Mlp) to its hidden layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {
-    /// `silu(gate) * up`: `SwiGLU` (Llama, Mistral, Qwen).
+    /// `silu(x)`; gated, `silu(gate) * up`: `SwiGLU` (Llama, Mistral, Qwen).
     Silu,
-    /// `gelu(gate) * up`, tanh form: `GeGLU` (Gemma).
+    /// `gelu(x)`, tanh form; gated, `gelu(gate) * up`: `GeGLU` (Gemma), or
+    /// GPT-2's plain MLP.
     Gelu,
 }
 
 impl Gate {
-    const fn act(self) -> crate::epilogue::Activation {
+    pub(crate) const fn act(self) -> crate::epilogue::Activation {
         match self {
             Self::Silu => crate::epilogue::Activation::Silu,
             Self::Gelu => crate::epilogue::Activation::Gelu,
@@ -520,6 +574,11 @@ impl GatedLinear {
     #[must_use]
     pub const fn gate(&self) -> Gate {
         self.gate
+    }
+
+    /// The `2n`-output layer behind it, gate and up interleaved.
+    pub(crate) const fn inner(&self) -> &Linear {
+        &self.inner
     }
 
     /// `y = act(x @ W_gate) * (x @ W_up)` for `m` rows: `x` is `m x k`, `y` is

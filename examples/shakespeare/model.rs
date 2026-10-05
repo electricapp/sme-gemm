@@ -1,13 +1,14 @@
 //! nanoGPT shakespeare-char (6 layers, 384 wide, 6 heads of 64, 65-character
 //! vocabulary, 256-token context) composed from sme-gemm's model-level pieces:
 //! a [`Linear`] per projection (4-bit, from the checkpoint's `[out][in]`
-//! weights), a [`KvCache`] per layer, [`nn::layer_norm`], an [`SmeWarm`]
-//! keeping the SME unit awake across the work between calls, and a [`HotPool`]
-//! splitting attention's heads across two more cores. Embeddings and sampling
-//! are the only model code left here.
+//! weights), an [`Mlp`] block per layer, a [`KvCache`] per layer,
+//! [`nn::layer_norm`], an [`SmeWarm`] keeping the SME unit awake across the
+//! work between calls, and a [`HotPool`] splitting attention's heads across two
+//! more cores (and running the MLP's gelu alongside its matmuls). Embeddings
+//! and sampling are the only model code left here.
 
 use half::f16;
-use sme_gemm::{Epilogue, HotPool, KvCache, Linear, Q4Params, SmeWarm, WeightLayout, nn};
+use sme_gemm::{Gate, HotPool, KvCache, Linear, Mlp, Q4Params, SmeWarm, WeightLayout, nn};
 
 pub(crate) const D: usize = 384;
 pub(crate) const NL: usize = 6;
@@ -91,8 +92,7 @@ struct Layer {
     ln2: Vec<f32>,
     attn: Linear,
     proj: Linear,
-    fc: Linear,
-    fcp: Linear,
+    mlp: Mlp,
 }
 
 /// The model: projections 4-bit, the tied output head f16, embeddings and norms
@@ -123,8 +123,7 @@ impl Model {
                 ln2: l.ln2.clone(),
                 attn: q(&l.attn, 3 * D, D),
                 proj: q(&l.proj, D, D),
-                fc: q(&l.fc, FF, D),
-                fcp: q(&l.fcp, D, FF),
+                mlp: Mlp::new(q(&l.fc, FF, D), Gate::Gelu, q(&l.fcp, D, FF)),
             })
             .collect();
         Self {
@@ -202,7 +201,7 @@ pub(crate) fn sample(logits: &[f32], s: &Sampler, rng: &mut Rng) -> usize {
 }
 
 /// The stages `--profile` times, in `Session::forward` order.
-pub(crate) const STAGES: [&str; 10] = [
+pub(crate) const STAGES: [&str; 9] = [
     "embed",
     "ln_1",
     "c_attn",
@@ -210,15 +209,14 @@ pub(crate) const STAGES: [&str; 10] = [
     "attention",
     "c_proj + residual",
     "ln_2",
-    "c_fc + gelu",
-    "mlp c_proj + residual",
+    "mlp + residual",
     "ln_f + head",
 ];
 
 /// Generation state: a KV cache per layer, row scratch, and the SME guard.
 pub(crate) struct Session<'m> {
     /// Seconds per stage, accumulated while `Some` (`--profile`).
-    pub(crate) prof: Option<[f64; 10]>,
+    pub(crate) prof: Option<[f64; 9]>,
     m: &'m Model,
     caches: Vec<KvCache>,
     // [rows][...] scratch, sized for a full-context batch.
@@ -227,10 +225,8 @@ pub(crate) struct Session<'m> {
     qkv: Vec<f16>,
     q: Vec<f16>,
     y: Vec<f32>,
-    ff: Vec<f16>,
     last: Vec<f32>,
     pub(crate) logits: Vec<f32>,
-    gelu: Epilogue<'static, f16>,
     _warm: SmeWarm,
     _pool: Option<HotPool>,
 }
@@ -246,10 +242,8 @@ impl<'m> Session<'m> {
             qkv: vec![f16::ZERO; CTX * 3 * D],
             q: vec![f16::ZERO; CTX * D],
             y: vec![0.0; CTX * D],
-            ff: vec![f16::ZERO; CTX * FF],
             last: vec![0.0; D],
             logits: vec![0.0; V],
-            gelu: Epilogue::new().gelu(),
             _warm: SmeWarm::new(),
             // NO_POOL=1 runs attention on the calling thread alone.
             _pool: std::env::var_os("NO_POOL")
@@ -319,14 +313,11 @@ impl<'m> Session<'m> {
             // MLP
             nn::layer_norm(&*x, &ly.ln2, None, EPS, &mut *h16);
             lap(6);
-            ly.fc
-                .forward_ep(&*h16, &mut self.ff[..r * FF], r, &self.gelu);
+            ly.mlp.accumulate(&*h16, &mut *x, r);
             lap(7);
-            ly.fcp.accumulate(&self.ff[..r * FF], &mut *x, r);
-            lap(8);
         }
         nn::layer_norm(&x[(r - 1) * D..], &m.lnf, None, EPS, &mut self.last);
         m.head.forward_f32(&self.last, &mut self.logits, 1);
-        lap(9);
+        lap(8);
     }
 }

@@ -14,9 +14,20 @@
 #ifndef SME_GEMM_F16F16_Q4_H
 #define SME_GEMM_F16F16_Q4_H
 
+#include <stdatomic.h>
+
 #include "neon_act.h"
 
 #define Q4_BAND 128
+
+// Hooks for a GEMV chained to work on other threads (src/mlp.rs). `done` is
+// raised (release) to the last output column of each pass once its outputs are
+// stored; before each K-block the kernel waits (acquire) until `ready` covers
+// the block's depths of A. Either may be NULL.
+typedef struct {
+    _Atomic size_t *done;
+    const _Atomic size_t *ready;
+} q4_chain;
 
 // Code c -> f16(sign-extended c); 16-bit LUTI4 reads the low half of 32-bit entries.
 static uint32_t g_q4_lut[16] __attribute__((aligned(64)));
@@ -192,7 +203,8 @@ static int run_q4_panels(f16 *dst, const f16 *a, const uint8_t *nibbles, const f
 __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
     f16 *dst, const f16 *a, const f16 *asum, size_t rows, const uint8_t *nibbles, const f16 *scales,
     const f16 *mins, size_t n, size_t k, size_t b_lo, size_t b_hi, size_t nib_per_band,
-    size_t sc_per_band, unsigned bshift, const uint32_t *lut, const ep_desc16 *ep) {
+    size_t sc_per_band, unsigned bshift, const uint32_t *lut, const ep_desc16 *ep,
+    const q4_chain *chain) {
     svbool_t p8 = svptrue_b8(), p16 = svptrue_b16();
     svcount_t pn = svptrue_c16(), pc = svptrue_c8();
     const EpNode *nodes = ep ? ep->nodes : NULL;
@@ -200,18 +212,31 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
     svfloat16_t vb = svdup_n_f16((f16)1.0f);
     svfloat16_t va = svdup_n_f16((f16)0.0f);
     svldr_zt(0, lut);
-    Q4_TOUCH(a, rows * k * sizeof(f16));
+    _Atomic size_t *done = chain ? chain->done : NULL;
+    const _Atomic size_t *ready = chain ? chain->ready : NULL;
+    if (!ready) Q4_TOUCH(a, rows * k * sizeof(f16)); // gated A is not written yet
     size_t block = (size_t)1 << bshift;
     size_t nbk = (k + block - 1) >> bshift;
     // Rows x bands <= 8 block-sum groups; spread the bands evenly over passes.
     size_t bb = 8 / rows, nbands = b_hi - b_lo;
     size_t passes = (nbands + bb - 1) / bb, per = (nbands + passes - 1) / passes;
+    // Core-side atomics stall streaming code (on M5 a load ~20 ns, a release
+    // store ~60 ns, waiting for the unit's stores): `ready` is read again only
+    // past the depths it last covered, and a pass's columns are published one
+    // K-block into the next pass, by when its stores have long completed.
+    size_t avail = ready ? 0 : k, pending = 0;
     for (size_t b0 = b_lo; b0 < b_hi; b0 += per) {
         size_t B = b_hi - b0 < per ? b_hi - b0 : per;
         const uint8_t *nb = nibbles + b0 * nib_per_band;
         svzero_za();
         for (size_t bk = 0; bk < nbk; bk++) {
             size_t d1 = ((bk + 1) << bshift) < k ? (bk + 1) << bshift : k;
+            while (avail < d1)
+                avail = atomic_load_explicit(ready, memory_order_acquire);
+            if (bk == 1 && pending) {
+                atomic_store_explicit(done, pending, memory_order_release);
+                pending = 0;
+            }
             for (size_t d = bk << bshift; d < d1; d += 8) {
                 size_t L = d1 - d < 8 ? d1 - d : 8;
                 // Lanes at or past k load as zero; past-k depths are never run.
@@ -289,7 +314,13 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
 #undef EP_Q4G_RD
 #undef Q4_ST
             }
+        if (done) {
+            size_t c1 = (b0 + B) * Q4_BAND;
+            pending = c1 < n ? c1 : n;
+        }
     }
+    // The last pass is published by the caller once out of streaming mode,
+    // where a release store costs nothing (gemm_sme_f16f16_q4_chained).
 }
 #undef Q4_D1
 #undef Q4_L2
@@ -302,10 +333,11 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
 // Q4 GEMM: C(f16) = A(f16) @ dequant(B), B 4-bit resident band-major (see the
 // top of this file); f16 exists only one N-block panel at a time on the MOPA
 // path. `block` is the K-block size (power of two; 32 = Q4_0/Q4_1). `ep` is the
-// fused f16 op-graph applied in-register at the store, or NULL.
+// fused f16 op-graph applied in-register at the store, or NULL. `chain` (or
+// NULL) holds the progress hooks of a chained call, which runs as one call.
 static int q4_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
                    const uint8_t *nibbles, const uint16_t *scales, const uint16_t *mins,
-                   size_t block, const ep_desc16 *ep) {
+                   size_t block, const ep_desc16 *ep, const q4_chain *chain) {
     if (m == 0 || n == 0) return 0;
     if (block == 0 || (block & (block - 1)) != 0) return -1; // power of two only
     unsigned bshift = 0;
@@ -341,19 +373,22 @@ static int q4_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
         // E-cluster's slower unit does not hold the call up on a big chunk.
         size_t chunk = 8 / m < 2 ? 8 / m : 2;
         size_t g_chunks = (n_bands + chunk - 1) / chunk;
-        if (ep_flops(m, n, k) < (1u << 21) || g_chunks < 3) {
+        if (chain || ep_flops(m, n, k) < (1u << 21) || g_chunks < 3) {
             run_q4_gemv((f16 *)dst, a, asum, m, nibbles, sc, mn, n, k, 0, n_bands, nib_per_band,
-                        sc_per_band, bshift, g_q4_lut, ep);
+                        sc_per_band, bshift, g_q4_lut, ep, chain);
             return 0;
         }
         dispatch_apply(g_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t ci) {
           size_t b0 = ci * chunk;
           size_t b1 = b0 + chunk < n_bands ? b0 + chunk : n_bands;
           run_q4_gemv((f16 *)dst, a, asum, m, nibbles, sc, mn, n, k, b0, b1, nib_per_band,
-                      sc_per_band, bshift, g_q4_lut, ep);
+                      sc_per_band, bshift, g_q4_lut, ep, NULL);
         });
         return 0;
     }
+    // The MOPA path reads all of A up front and stores C at the end.
+    if (chain && chain->ready)
+        while (atomic_load_explicit(chain->ready, memory_order_acquire) < k) {}
     return run_q4_panels((f16 *)dst, (const f16 *)lhs, nibbles, (const f16 *)scales,
                          (const f16 *)mins, m, n, k, bshift, ep);
 }
@@ -366,8 +401,21 @@ int gemm_sme_f16f16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16
     ep_desc16 rest;
     uint32_t act = na_split(ep, &rest);
     const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
-    int rc = q4_core(m, n, k, dst, lhs, nibbles, scales, mins, block, kep);
+    int rc = q4_core(m, n, k, dst, lhs, nibbles, scales, mins, block, kep, NULL);
     if (rc == 0 && act) na_post_f16(dst, m, n, (long)n, 1, act);
+    return rc;
+}
+
+// gemm_sme_f16f16_q4 as one link of a chain (src/mlp.rs): raises *done as
+// output columns are stored and waits on *ready for A's depths (either NULL).
+// Nothing is split off: a trailing activation in ep runs in the kernel.
+int gemm_sme_f16f16_q4_chained(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
+                               const uint8_t *nibbles, const uint16_t *scales, const uint16_t *mins,
+                               size_t block, const ep_desc16 *ep, _Atomic size_t *done,
+                               const _Atomic size_t *ready) {
+    q4_chain chain = {done, ready};
+    int rc = q4_core(m, n, k, dst, lhs, nibbles, scales, mins, block, ep, &chain);
+    if (rc == 0 && done) atomic_store_explicit(done, n, memory_order_release);
     return rc;
 }
 

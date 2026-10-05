@@ -24,6 +24,8 @@ mod matmul;
 mod quantize;
 mod weights;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use matmul::q4_chained;
 pub use matmul::{matmul_q4, matmul_q4_bf16, matmul_q4_bf16_ep, matmul_q4_ep};
 pub use weights::Q4Weights;
 

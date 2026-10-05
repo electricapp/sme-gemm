@@ -48,12 +48,14 @@ mod ffi;
 mod kernels;
 mod layout;
 mod linear;
+mod mlp;
 pub mod nn;
 mod pool;
 mod warm;
 
 pub use layout::{Prepack, WeightLayout, prepack};
 pub use linear::{Gate, GatedLinear, Linear, ModelFloat};
+pub use mlp::Mlp;
 pub use pool::HotPool;
 pub use probe::{Caps, caps, has_sme};
 pub use warm::SmeWarm;

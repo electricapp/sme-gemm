@@ -83,25 +83,6 @@ thread_local! {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PAR_MIN_HEAD_KEYS: usize = 384;
 
-/// A raw pointer the pool's items may share: each writes a disjoint range.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
-struct Shared<T>(*mut T);
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<T> Shared<T> {
-    /// The pointer (a method, so closures capture the `Sync` wrapper).
-    const fn ptr(self) -> *mut T {
-        self.0
-    }
-}
-// SAFETY: items write disjoint ranges of the one output (see
-// `groups_in_parallel`), and the caller waits for all of them.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe impl<T> Sync for Shared<T> {}
-// SAFETY: as for Sync.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe impl<T> Send for Shared<T> {}
-
 /// [`attention_kv_f16`] with each KV-head group (its `heads / kv_heads` query
 /// heads) as one item on the [`HotPool`](crate::HotPool); `false` (nothing
 /// done) without a pool. Shapes were checked by the caller.
@@ -120,7 +101,7 @@ fn groups_in_parallel(
     scale: f32,
 ) -> bool {
     let g = heads / kv_heads;
-    let out = Shared(out.as_mut_ptr());
+    let out = crate::pool::Shared(out.as_mut_ptr());
     crate::pool::parallel(kv_heads, &|kh| {
         SCORES.with_borrow_mut(|scores| {
             if scores.len() < len {

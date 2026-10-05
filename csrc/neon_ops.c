@@ -11,6 +11,27 @@ void neon_glu_f16(__fp16 *out, const __fp16 *in, size_t m, size_t n, uint32_t ac
 void neon_f32_to_f16(__fp16 *dst, const float *src, size_t n);
 void neon_f16_to_f32(float *dst, const __fp16 *src, size_t n);
 void neon_add_f16_to_f32(float *dst, const __fp16 *src, size_t n);
+void neon_act_f16(__fp16 *dst, const __fp16 *src, size_t n, uint32_t act);
+
+// dst = act(src) over n contiguous values, dst stored non-temporally for the
+// next kernel (src/mlp.rs, on a hidden layer as the GEMV produces it). Out of
+// place on purpose: a line this core has just read stays in its cache when
+// rewritten even by STNP, and an SME read from another core then waits on it.
+void neon_act_f16(__fp16 *dst, const __fp16 *src, size_t n, uint32_t act) {
+    size_t j = 0;
+#define ACT8(h)                                                                                    \
+    vcvt_high_f16_f32(vcvt_f16_f32(na_apply(vcvt_f32_f16(vget_low_f16(h)), act)),                  \
+                      na_apply(vcvt_high_f32_f16(h), act))
+    for (; j + 16 <= n; j += 16) {
+        float16x8_t h0 = vld1q_f16(src + j), h1 = vld1q_f16(src + j + 8);
+        na_stnp16(dst + j, ACT8(h0), ACT8(h1));
+    }
+    for (; j + 8 <= n; j += 8)
+        vst1q_f16(dst + j, ACT8(vld1q_f16(src + j)));
+#undef ACT8
+    for (; j < n; j++)
+        dst[j] = (__fp16)vgetq_lane_f32(na_apply(vdupq_n_f32((float)src[j]), act), 0);
+}
 
 // The f16 <-> f32 conversions at a model's edges, 16 values a step (FCVTN /
 // FCVTL, round to nearest even, the same bits as a scalar FCVT). The f16 side

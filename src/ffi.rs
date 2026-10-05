@@ -91,6 +91,9 @@ unsafe extern "C" {
     pub(crate) fn neon_f16_to_f32(dst: *mut f32, src: *const u16, n: usize);
     /// `dst[i] += src[i]`, f16 into f32, `n` values.
     pub(crate) fn neon_add_f16_to_f32(dst: *mut f32, src: *const u16, n: usize);
+    /// `dst[i] = act(src[i])` over `n` f16 values, out of place; `act` is a
+    /// gelu/silu/sigmoid/tanh `EP_ACT_*` kind.
+    pub(crate) fn neon_act_f16(dst: *mut u16, src: *const u16, n: usize, act: u32);
     /// A short burst of streaming vector work for the keep-awake helper
     /// (`warm.rs`); the result only keeps the work from being optimized out.
     pub(crate) fn sme_warm_tick() -> f32;
@@ -141,6 +144,22 @@ unsafe extern "C" {
         mins: *const u16,
         block: usize,
         ep: *const EpDesc16,
+    ) -> core::ffi::c_int;
+    /// `gemm_sme_f16f16_q4` as one link of a chain: raises `done` to each
+    /// stored output column and waits on `ready` for A's depths (either null).
+    pub(crate) fn gemm_sme_f16f16_q4_chained(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut u16,
+        lhs: *const u16,
+        nibbles: *const u8,
+        scales: *const u16,
+        mins: *const u16,
+        block: usize,
+        ep: *const EpDesc16,
+        done: *const core::sync::atomic::AtomicUsize,
+        ready: *const core::sync::atomic::AtomicUsize,
     ) -> core::ffi::c_int;
     pub(crate) fn gemm_sme_b16b16_q4(
         m: usize,
