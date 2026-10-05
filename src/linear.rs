@@ -28,6 +28,12 @@ pub trait ModelFloat: Copy + Default + sealed::Sealed {
     /// `dst = src`, rounding as needed.
     #[doc(hidden)]
     fn store_f32(src: &[f32], dst: &mut [Self]);
+    /// `x` itself when `Self` is f32.
+    #[doc(hidden)]
+    fn as_f32_slice(x: &[Self]) -> Option<&[f32]>;
+    /// `x` itself when `Self` is f16.
+    #[doc(hidden)]
+    fn as_f16_slice_mut(x: &mut [Self]) -> Option<&mut [f16]>;
 }
 
 impl ModelFloat for f16 {
@@ -42,6 +48,12 @@ impl ModelFloat for f16 {
     fn store_f32(src: &[f32], dst: &mut [Self]) {
         crate::convert::to_f16(src, dst);
     }
+    fn as_f32_slice(_: &[Self]) -> Option<&[f32]> {
+        None
+    }
+    fn as_f16_slice_mut(x: &mut [Self]) -> Option<&mut [f16]> {
+        Some(x)
+    }
 }
 
 impl ModelFloat for f32 {
@@ -55,6 +67,12 @@ impl ModelFloat for f32 {
     }
     fn store_f32(src: &[f32], dst: &mut [Self]) {
         dst.copy_from_slice(src);
+    }
+    fn as_f32_slice(x: &[Self]) -> Option<&[f32]> {
+        Some(x)
+    }
+    fn as_f16_slice_mut(_: &mut [Self]) -> Option<&mut [f16]> {
+        None
     }
 }
 

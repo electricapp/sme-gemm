@@ -15,6 +15,8 @@ void neon_add_f16_to_f32(float *dst, const __fp16 *src, size_t n);
 void neon_act_f16(__fp16 *dst, const __fp16 *src, size_t n, uint32_t act);
 void neon_norm_row_f32(float *y, const float *x, const float *w, const float *b, size_t n,
                        float eps, int rms);
+void neon_norm_row_f16(__fp16 *y, const float *x, const float *w, const float *b, size_t n,
+                       float eps, int rms);
 
 // Sum of x (or of (x - c)^2 when sq), 16 lanes at a time in four chains.
 static float row_sum(const float *x, size_t n, float c, int sq) {
@@ -51,6 +53,28 @@ void neon_norm_row_f32(float *y, const float *x, const float *w, const float *b,
     }
     for (; i < n; i++)
         y[i] = (x[i] - mean) * r * w[i] + (b ? b[i] : 0.0f);
+}
+
+// neon_norm_row_f32 rounded to f16 as it goes, stored non-temporally for the
+// GEMV that reads it next: the same bits as the f32 row then neon_f32_to_f16,
+// without the f32 row.
+void neon_norm_row_f16(__fp16 *y, const float *x, const float *w, const float *b, size_t n,
+                       float eps, int rms) {
+    float mean = rms ? 0.0f : row_sum(x, n, 0.0f, 0) / (float)n;
+    float r = 1.0f / sqrtf(row_sum(x, n, mean, 1) / (float)n + eps);
+    float32x4_t vm = vdupq_n_f32(mean), vr = vdupq_n_f32(r);
+    size_t i = 0;
+#define NORM4(o)                                                                                   \
+    (b ? vaddq_f32(vmulq_f32(vmulq_f32(vsubq_f32(vld1q_f32(x + i + (o)), vm), vr),                 \
+                             vld1q_f32(w + i + (o))),                                              \
+                   vld1q_f32(b + i + (o)))                                                         \
+       : vmulq_f32(vmulq_f32(vsubq_f32(vld1q_f32(x + i + (o)), vm), vr), vld1q_f32(w + i + (o))))
+    for (; i + 16 <= n; i += 16)
+        na_stnp16(y + i, vcvt_high_f16_f32(vcvt_f16_f32(NORM4(0)), NORM4(4)),
+                  vcvt_high_f16_f32(vcvt_f16_f32(NORM4(8)), NORM4(12)));
+#undef NORM4
+    for (; i < n; i++)
+        y[i] = (__fp16)((x[i] - mean) * r * w[i] + (b ? b[i] : 0.0f));
 }
 
 // dst = act(src) over n contiguous values, dst stored non-temporally for the

@@ -74,13 +74,50 @@ pub fn layer_norm<X: ModelFloat, Y: ModelFloat>(
     eps: f32,
     y: &mut [Y],
 ) {
-    let dim = weight.len();
     if let Some(b) = bias {
-        assert_eq!(b.len(), dim, "bias holds weight.len() values");
+        assert_eq!(b.len(), weight.len(), "bias holds weight.len() values");
     }
-    rows(x, dim, y, |x, out| {
-        norm_row(out, x, weight, bias, eps, false)
-    });
+    norm(x, weight, bias, eps, false, y);
+}
+
+/// [`layer_norm`] (`rms` false) or [`rms_norm`] (`rms` true) over every row.
+fn norm<X: ModelFloat, Y: ModelFloat>(
+    x: &[X],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+    rms: bool,
+    y: &mut [Y],
+) {
+    let dim = weight.len();
+    // f32 in, f16 out (the usual step before a matmul): one pass a row,
+    // rounding and storing as it goes, with no f32 row in between.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let (Some(xf), Some(yh)) = (X::as_f32_slice(x), Y::as_f16_slice_mut(y)) {
+        assert!(dim > 0, "a norm needs at least one feature");
+        assert!(
+            xf.len().is_multiple_of(dim),
+            "x holds whole rows of weight.len()"
+        );
+        assert_eq!(yh.len(), xf.len(), "y is the same shape as x");
+        for (xr, yr) in xf.chunks_exact(dim).zip(yh.chunks_exact_mut(dim)) {
+            // SAFETY: each row and weight (and bias) hold dim values, checked
+            // above and by the callers; the pass only reads x/weight/bias.
+            unsafe {
+                crate::ffi::neon_norm_row_f16(
+                    yr.as_mut_ptr().cast::<u16>(),
+                    xr.as_ptr(),
+                    weight.as_ptr(),
+                    bias.map_or(core::ptr::null(), <[f32]>::as_ptr),
+                    dim,
+                    eps,
+                    i32::from(rms),
+                );
+            }
+        }
+        return;
+    }
+    rows(x, dim, y, |x, out| norm_row(out, x, weight, bias, eps, rms));
 }
 
 /// One row of [`layer_norm`] (`rms` false) or [`rms_norm`] (`rms` true).
@@ -117,9 +154,7 @@ fn norm_row(out: &mut [f32], x: &[f32], weight: &[f32], bias: Option<&[f32]>, ep
 /// Panics if `x.len()` is not a multiple of `weight.len()` or `y` is not the
 /// shape of `x`.
 pub fn rms_norm<X: ModelFloat, Y: ModelFloat>(x: &[X], weight: &[f32], eps: f32, y: &mut [Y]) {
-    rows(x, weight.len(), y, |x, out| {
-        norm_row(out, x, weight, None, eps, true)
-    });
+    norm(x, weight, None, eps, true, y);
 }
 
 /// `out[i] = 1 / sqrt(mean(x_i^2) + eps)` for each `k`-wide row of `x`: the

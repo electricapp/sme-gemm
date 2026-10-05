@@ -102,6 +102,16 @@ unsafe extern "C" {
         eps: f32,
         rms: i32,
     );
+    /// `neon_norm_row_f32` rounded to f16 (stored non-temporally).
+    pub(crate) fn neon_norm_row_f16(
+        y: *mut u16,
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        n: usize,
+        eps: f32,
+        rms: i32,
+    );
     /// `dst[i] = act(src[i])` over `n` f16 values, out of place; `act` is a
     /// gelu/silu/sigmoid/tanh `EP_ACT_*` kind.
     pub(crate) fn neon_act_f16(dst: *mut u16, src: *const u16, n: usize, act: u32);

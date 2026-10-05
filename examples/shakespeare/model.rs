@@ -273,8 +273,9 @@ impl<'m> Session<'m> {
         };
         for (i, &t) in toks.iter().enumerate() {
             let x = &mut self.x[i * D..(i + 1) * D];
-            for (c, x) in x.iter_mut().enumerate() {
-                *x = m.wte[t * D + c] + m.wpe[(pos + i) * D + c];
+            let (te, pe) = (&m.wte[t * D..][..D], &m.wpe[(pos + i) * D..][..D]);
+            for ((x, &a), &b) in x.iter_mut().zip(te).zip(pe) {
+                *x = a + b;
             }
         }
         lap(0);
