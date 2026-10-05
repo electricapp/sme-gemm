@@ -1,9 +1,9 @@
 //! The row-wise passes that sit between matmuls in a model, writing f32 or
 //! straight to f16 for the next [`Linear`](crate::Linear).
 //!
-//! Plain Rust over eight-lane accumulators, which LLVM vectorizes to NEON on
-//! the calling thread: one row is a few hundred nanoseconds of work, far below
-//! what spreading it across cores or entering a streaming region would cost.
+//! NEON on the calling thread (`csrc/neon_ops.c`; plain Rust elsewhere): one
+//! row is tens of nanoseconds of work, far below what spreading it across
+//! cores or entering a streaming region would cost.
 
 use std::cell::RefCell;
 
@@ -15,6 +15,7 @@ thread_local! {
 }
 
 /// Sum of `f(x)` over a row, eight lanes at a time.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn lane_sum(x: &[f32], f: impl Fn(f32) -> f32) -> f32 {
     let mut acc = [0f32; 8];
     let mut chunks = x.chunks_exact(8);
@@ -78,22 +79,35 @@ pub fn layer_norm<X: ModelFloat, Y: ModelFloat>(
         assert_eq!(b.len(), dim, "bias holds weight.len() values");
     }
     rows(x, dim, y, |x, out| {
-        let mean = lane_sum(x, |v| v) / dim as f32;
-        let var = lane_sum(x, |v| (v - mean) * (v - mean)) / dim as f32;
-        let r = 1.0 / (var + eps).sqrt();
-        match bias {
-            Some(b) => {
-                for (((o, &v), &w), &b) in out.iter_mut().zip(x).zip(weight).zip(b) {
-                    *o = (v - mean) * r * w + b;
-                }
-            }
-            None => {
-                for ((o, &v), &w) in out.iter_mut().zip(x).zip(weight) {
-                    *o = (v - mean) * r * w;
-                }
-            }
-        }
+        norm_row(out, x, weight, bias, eps, false)
     });
+}
+
+/// One row of [`layer_norm`] (`rms` false) or [`rms_norm`] (`rms` true).
+fn norm_row(out: &mut [f32], x: &[f32], weight: &[f32], bias: Option<&[f32]>, eps: f32, rms: bool) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    // SAFETY: out, x, weight (and bias) all hold weight.len() values (`rows`
+    // and the callers check it); the pass only reads x/weight/bias.
+    unsafe {
+        crate::ffi::neon_norm_row_f32(
+            out.as_mut_ptr(),
+            x.as_ptr(),
+            weight.as_ptr(),
+            bias.map_or(core::ptr::null(), <[f32]>::as_ptr),
+            weight.len(),
+            eps,
+            i32::from(rms),
+        );
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let dim = weight.len() as f32;
+        let mean = if rms { 0.0 } else { lane_sum(x, |v| v) / dim };
+        let r = 1.0 / (lane_sum(x, |v| (v - mean) * (v - mean)) / dim + eps).sqrt();
+        for (i, ((o, &v), &w)) in out.iter_mut().zip(x).zip(weight).enumerate() {
+            *o = (v - mean) * r * w + bias.map_or(0.0, |b| b[i]);
+        }
+    }
 }
 
 /// RMS normalization of each `weight.len()`-wide row of `x`:
@@ -103,12 +117,8 @@ pub fn layer_norm<X: ModelFloat, Y: ModelFloat>(
 /// Panics if `x.len()` is not a multiple of `weight.len()` or `y` is not the
 /// shape of `x`.
 pub fn rms_norm<X: ModelFloat, Y: ModelFloat>(x: &[X], weight: &[f32], eps: f32, y: &mut [Y]) {
-    let dim = weight.len();
-    rows(x, dim, y, |x, out| {
-        let r = 1.0 / (lane_sum(x, |v| v * v) / dim as f32 + eps).sqrt();
-        for ((o, &v), &w) in out.iter_mut().zip(x).zip(weight) {
-            *o = v * r * w;
-        }
+    rows(x, weight.len(), y, |x, out| {
+        norm_row(out, x, weight, None, eps, true)
     });
 }
 

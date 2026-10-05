@@ -91,6 +91,17 @@ unsafe extern "C" {
     pub(crate) fn neon_f16_to_f32(dst: *mut f32, src: *const u16, n: usize);
     /// `dst[i] += src[i]`, f16 into f32, `n` values.
     pub(crate) fn neon_add_f16_to_f32(dst: *mut f32, src: *const u16, n: usize);
+    /// One row of a layer norm (`rms` 0) or RMS norm (`rms` 1) in f32, `n`
+    /// values; `b` may be null.
+    pub(crate) fn neon_norm_row_f32(
+        y: *mut f32,
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        n: usize,
+        eps: f32,
+        rms: i32,
+    );
     /// `dst[i] = act(src[i])` over `n` f16 values, out of place; `act` is a
     /// gelu/silu/sigmoid/tanh `EP_ACT_*` kind.
     pub(crate) fn neon_act_f16(dst: *mut u16, src: *const u16, n: usize, act: u32);

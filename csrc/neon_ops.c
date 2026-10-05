@@ -2,6 +2,7 @@
 // the calling thread or spread over the cores for large outputs.
 #include <arm_neon.h>
 #include <dispatch/dispatch.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,6 +13,45 @@ void neon_f32_to_f16(__fp16 *dst, const float *src, size_t n);
 void neon_f16_to_f32(float *dst, const __fp16 *src, size_t n);
 void neon_add_f16_to_f32(float *dst, const __fp16 *src, size_t n);
 void neon_act_f16(__fp16 *dst, const __fp16 *src, size_t n, uint32_t act);
+void neon_norm_row_f32(float *y, const float *x, const float *w, const float *b, size_t n,
+                       float eps, int rms);
+
+// Sum of x (or of (x - c)^2 when sq), 16 lanes at a time in four chains.
+static float row_sum(const float *x, size_t n, float c, int sq) {
+    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = s0, s2 = s0, s3 = s0, vc = vdupq_n_f32(c);
+    size_t i = 0;
+#define TERM(o)                                                                                    \
+    (sq ? vmulq_f32(vsubq_f32(vld1q_f32(x + i + (o)), vc), vsubq_f32(vld1q_f32(x + i + (o)), vc))  \
+        : vld1q_f32(x + i + (o)))
+    for (; i + 16 <= n; i += 16) {
+        s0 = vaddq_f32(s0, TERM(0));
+        s1 = vaddq_f32(s1, TERM(4));
+        s2 = vaddq_f32(s2, TERM(8));
+        s3 = vaddq_f32(s3, TERM(12));
+    }
+#undef TERM
+    float s = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+    for (; i < n; i++)
+        s += sq ? (x[i] - c) * (x[i] - c) : x[i];
+    return s;
+}
+
+// One row of nn::layer_norm (rms = 0: (x - mean) / sqrt(var + eps) * w (+ b),
+// mean and variance in two passes) or nn::rms_norm (rms = 1: x / sqrt(mean(x^2)
+// + eps) * w); b may be NULL.
+void neon_norm_row_f32(float *y, const float *x, const float *w, const float *b, size_t n,
+                       float eps, int rms) {
+    float mean = rms ? 0.0f : row_sum(x, n, 0.0f, 0) / (float)n;
+    float r = 1.0f / sqrtf(row_sum(x, n, mean, 1) / (float)n + eps);
+    float32x4_t vm = vdupq_n_f32(mean), vr = vdupq_n_f32(r);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vmulq_f32(vmulq_f32(vsubq_f32(vld1q_f32(x + i), vm), vr), vld1q_f32(w + i));
+        vst1q_f32(y + i, b ? vaddq_f32(v, vld1q_f32(b + i)) : v);
+    }
+    for (; i < n; i++)
+        y[i] = (x[i] - mean) * r * w[i] + (b ? b[i] : 0.0f);
+}
 
 // dst = act(src) over n contiguous values, dst stored non-temporally for the
 // next kernel (src/mlp.rs, on a hidden layer as the GEMV produces it). Out of
