@@ -66,6 +66,10 @@ struct Job<'a> {
     f: &'a (dyn Fn(usize) + Sync),
     items: usize,
     next: AtomicUsize,
+    /// Engaged workers that have drained the job and will not touch it again;
+    /// beside `next`, so the caller learns both from one cache line instead of
+    /// a miss on each worker's mailbox.
+    finished: AtomicUsize,
     panicked: AtomicBool,
 }
 
@@ -162,10 +166,11 @@ fn run_worker(w: usize) {
             continue;
         }
         // SAFETY: the caller stored JOB before posting this sequence (Release,
-        // read here with Acquire) and keeps the job alive until this slot's
-        // `done` reaches it, which happens only after the drain below.
+        // read here with Acquire) and keeps the job alive until every engaged
+        // worker has counted itself in `finished`, this thread's last touch.
         let job = unsafe { &*JOB.load(Ordering::Acquire) };
         job.drain();
+        job.finished.fetch_add(1, Ordering::Release);
         slot.done.store(p, Ordering::Release);
         last = Instant::now();
     }
@@ -209,8 +214,8 @@ impl Posted<'_> {
 /// when the caller's work unwinds (the job lives on the caller's frame).
 struct Finish<'a, 'j> {
     job: &'a Job<'j>,
-    engaged: &'a [Slot],
-    seq: u64,
+    /// Workers the job was posted to.
+    engaged: usize,
 }
 
 impl Drop for Finish<'_, '_> {
@@ -220,10 +225,8 @@ impl Drop for Finish<'_, '_> {
         if self.job.next.load(Ordering::Relaxed) < self.job.items {
             self.job.drain();
         }
-        for s in self.engaged {
-            while s.done.load(Ordering::Acquire) != self.seq {
-                std::hint::spin_loop();
-            }
+        while self.job.finished.load(Ordering::Acquire) != self.engaged {
+            std::hint::spin_loop();
         }
         JOB.store(core::ptr::null_mut(), Ordering::Relaxed);
         IN_USE.store(false, Ordering::Release);
@@ -256,6 +259,7 @@ pub(crate) fn alongside<R>(
         f,
         items,
         next: AtomicUsize::new(0),
+        finished: AtomicUsize::new(0),
         panicked: AtomicBool::new(false),
     };
     JOB.store(
@@ -270,8 +274,7 @@ pub(crate) fn alongside<R>(
     // Wait for the workers even if `main` unwinds: the job lives on this frame.
     let finish = Finish {
         job: &job,
-        engaged,
-        seq,
+        engaged: engaged.len(),
     };
     let r = main(&Posted(&job));
     drop(finish);
@@ -303,6 +306,7 @@ pub(crate) fn parallel(items: usize, f: &(dyn Fn(usize) + Sync)) -> bool {
         f,
         items,
         next: AtomicUsize::new(0),
+        finished: AtomicUsize::new(0),
         panicked: AtomicBool::new(false),
     };
     JOB.store(
@@ -315,10 +319,8 @@ pub(crate) fn parallel(items: usize, f: &(dyn Fn(usize) + Sync)) -> bool {
         s.posted.store(seq, Ordering::Release);
     }
     job.drain();
-    for s in engaged {
-        while s.done.load(Ordering::Acquire) != seq {
-            std::hint::spin_loop();
-        }
+    while job.finished.load(Ordering::Acquire) != engaged.len() {
+        std::hint::spin_loop();
     }
     JOB.store(core::ptr::null_mut(), Ordering::Relaxed);
     IN_USE.store(false, Ordering::Release);
