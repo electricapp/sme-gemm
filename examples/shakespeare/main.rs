@@ -48,6 +48,7 @@ OPTIONS:
                           the data/ directory fetch.sh fills]
     -q, --quiet           no timing line on stderr
         --bench           accuracy against f32 and throughput, then exit
+        --profile         time each stage of a generation step, then exit
     -h, --help            this text
 
 EXAMPLES:
@@ -69,6 +70,7 @@ struct Opts {
     data: PathBuf,
     quiet: bool,
     bench: bool,
+    profile: bool,
     prompt: Option<String>,
 }
 
@@ -87,6 +89,7 @@ fn parse() -> Result<Opts, String> {
             .map_or_else(|| Path::new(HOME).join("data"), PathBuf::from),
         quiet: false,
         bench: false,
+        profile: false,
         prompt: None,
     };
     let mut words = vec![];
@@ -121,6 +124,7 @@ fn parse() -> Result<Opts, String> {
             "--data" => o.data = PathBuf::from(val(&a)?),
             "-q" | "--quiet" => o.quiet = true,
             "--bench" => o.bench = true,
+            "--profile" => o.profile = true,
             "--" => words.extend(args.by_ref()),
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unknown option {s} (try --help)"));
@@ -228,6 +232,10 @@ fn run() -> Result<(), String> {
     let o = parse()?;
     let w = F32Weights::load(&o.data).map_err(|e| format!("{e}\n{}", setup_hint()))?;
     let m = Model::quantize(&w, o.q4_block);
+    if o.profile {
+        reference::profile(&m);
+        return Ok(());
+    }
     if o.bench {
         let path = o.data.join("input.txt");
         let text = std::fs::read_to_string(&path)

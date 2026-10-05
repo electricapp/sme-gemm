@@ -119,6 +119,48 @@ fn argmax(v: &[f32]) -> usize {
 
 /// Validation loss of the f32 reference and the Q4/SME model, then generation
 /// and prompt throughput.
+/// Per-stage time of a generation step over 256-token windows (mean context
+/// 128), with the stage timers on, then the same without them.
+pub(crate) fn profile(m: &Model) {
+    let s = Sampler {
+        temperature: 0.8,
+        top_k: 0,
+        seed: 3,
+    };
+    let mut rng = Rng::new(s.seed);
+    let mut sess = Session::new(m);
+    let windows = 60;
+    let run = |sess: &mut Session<'_>, rng: &mut Rng| {
+        let t0 = Instant::now();
+        for _ in 0..windows {
+            sess.reset();
+            let mut tok = 0;
+            for _ in 0..CTX {
+                sess.forward(&[tok]);
+                tok = sample(&sess.logits, &s, rng);
+            }
+        }
+        t0.elapsed().as_secs_f64() / (windows * CTX) as f64 * 1e6
+    };
+    run(&mut sess, &mut rng);
+    sess.prof = Some([0.0; 10]);
+    let timed = run(&mut sess, &mut rng);
+    let p = sess.prof.take().unwrap_or_default();
+    let plain = run(&mut sess, &mut rng);
+    let per = |x: f64| x / (windows * CTX) as f64 * 1e6;
+    println!("us per generated token, 256-token windows (mean context 128):");
+    for (name, t) in crate::model::STAGES.iter().zip(p) {
+        println!("  {name:<22} {:>6.2}", per(t));
+    }
+    println!(
+        "  {:<22} {:>6.2}   (untimed run: {plain:.2} us = {:.0} tok/s)",
+        "total",
+        p.iter().map(|&t| per(t)).sum::<f64>(),
+        1e6 / plain
+    );
+    let _ = timed;
+}
+
 pub(crate) fn bench(w: &F32Weights, m: &Model, text: &str) {
     let toks: Vec<usize> = text.chars().filter_map(encode).collect();
     let val = &toks[toks.len() * 9 / 10..];

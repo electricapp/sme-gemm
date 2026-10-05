@@ -201,8 +201,24 @@ pub(crate) fn sample(logits: &[f32], s: &Sampler, rng: &mut Rng) -> usize {
     argmax
 }
 
+/// The stages `--profile` times, in `Session::forward` order.
+pub(crate) const STAGES: [&str; 10] = [
+    "embed",
+    "ln_1",
+    "c_attn",
+    "kv push + q",
+    "attention",
+    "c_proj + residual",
+    "ln_2",
+    "c_fc + gelu",
+    "mlp c_proj + residual",
+    "ln_f + head",
+];
+
 /// Generation state: a KV cache per layer, row scratch, and the SME guard.
 pub(crate) struct Session<'m> {
+    /// Seconds per stage, accumulated while `Some` (`--profile`).
+    pub(crate) prof: Option<[f64; 10]>,
     m: &'m Model,
     caches: Vec<KvCache>,
     // [rows][...] scratch, sized for a full-context batch.
@@ -222,6 +238,7 @@ pub(crate) struct Session<'m> {
 impl<'m> Session<'m> {
     pub(crate) fn new(m: &'m Model) -> Self {
         Self {
+            prof: None,
             m,
             caches: (0..NL).map(|_| KvCache::new(NH, NH, HD, CTX)).collect(),
             x: vec![0.0; CTX * D],
@@ -260,17 +277,29 @@ impl<'m> Session<'m> {
             "forward: {r} tokens at {pos} overflow the context"
         );
         let m = self.m;
+        let mut t0 = std::time::Instant::now();
+        let prof = &mut self.prof;
+        let mut lap = |i: usize| {
+            if let Some(p) = prof.as_mut() {
+                let now = std::time::Instant::now();
+                p[i] += (now - t0).as_secs_f64();
+                t0 = now;
+            }
+        };
         for (i, &t) in toks.iter().enumerate() {
             let x = &mut self.x[i * D..(i + 1) * D];
             for (c, x) in x.iter_mut().enumerate() {
                 *x = m.wte[t * D + c] + m.wpe[(pos + i) * D + c];
             }
         }
+        lap(0);
         let (x, h16) = (&mut self.x[..r * D], &mut self.h16[..r * D]);
         for (ly, cache) in m.layers.iter().zip(&mut self.caches) {
             // attention
             nn::layer_norm(&*x, &ly.ln1, None, EPS, &mut *h16);
+            lap(1);
             ly.attn.forward(&*h16, &mut self.qkv[..r * 3 * D], r);
+            lap(2);
             for (row, q) in self.qkv[..r * 3 * D]
                 .chunks_exact(3 * D)
                 .zip(self.q.chunks_exact_mut(D))
@@ -278,19 +307,26 @@ impl<'m> Session<'m> {
                 q.copy_from_slice(&row[..D]);
                 cache.push(&row[D..2 * D], &row[2 * D..]);
             }
+            lap(3);
             if r == 1 {
                 cache.attend(&self.q[..D], &mut self.y[..D]);
             } else {
                 cache.attend_causal(&self.q[..r * D], r, &mut self.y[..r * D]);
             }
+            lap(4);
             ly.proj.accumulate(&self.y[..r * D], &mut *x, r);
+            lap(5);
             // MLP
             nn::layer_norm(&*x, &ly.ln2, None, EPS, &mut *h16);
+            lap(6);
             ly.fc
                 .forward_ep(&*h16, &mut self.ff[..r * FF], r, &self.gelu);
+            lap(7);
             ly.fcp.accumulate(&self.ff[..r * FF], &mut *x, r);
+            lap(8);
         }
         nn::layer_norm(&x[(r - 1) * D..], &m.lnf, None, EPS, &mut self.last);
         m.head.forward_f32(&self.last, &mut self.logits, 1);
+        lap(9);
     }
 }
