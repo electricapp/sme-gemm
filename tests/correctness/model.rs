@@ -4,9 +4,9 @@
 use crate::fill_f32;
 use half::f16;
 use sme_gemm::{
-    Epilogue, Gate, GatedLinear, HotPool, Linear, Mlp, Q4Params, Q4Weights, WeightLayout, caps,
-    matmul_f16_packed, matmul_f32_packed, matmul_q4, matmul_q4_ep, nn, prepack, prepack_f16,
-    prepack_f32,
+    Epilogue, Gate, GatedLinear, HotPool, KvCache, Linear, Mlp, Q4Params, Q4Weights, SelfAttention,
+    WeightLayout, caps, matmul_f16_packed, matmul_f32_packed, matmul_q4, matmul_q4_ep, nn, prepack,
+    prepack_f16, prepack_f32,
 };
 
 fn transpose<T: Copy>(w: &[T], n: usize, k: usize) -> Vec<T> {
@@ -261,6 +261,85 @@ fn rms_norm_fold_matches_normalizing_first() {
                 a[i],
                 b[i]
             );
+        }
+    }
+}
+
+/// `SelfAttention::accumulate` gives the same bits, and leaves the same cache,
+/// with a pool alive (one row then overlaps the attention with both GEMVs) as
+/// without, and matches its steps run by hand on the unpermuted projection to
+/// f16 rounding: a prompt of several rows, then one row at a time, plain
+/// multi-head and grouped-query, 4-bit and f16. GPT-2 small's shape runs `qkv`
+/// as GEMV passes of 5 and 4 bands, which round differently, so the grouping
+/// must not move columns between them on one path only.
+#[test]
+fn self_attention_matches_its_steps() {
+    let lay = WeightLayout::OutIn;
+    for &(heads, kv_heads, hd) in &[(4usize, 4usize, 64usize), (6, 2, 32), (6, 6, 64)] {
+        let d = heads * hd;
+        let wq = (heads + 2 * kv_heads) * hd;
+        let mut s = 0x11ea_0400 ^ (heads * 31 + kv_heads) as u64;
+        let (w1, b1) = (fill_f32(&mut s, wq * d), fill_f32(&mut s, wq));
+        let (w2, b2) = (fill_f32(&mut s, d * d), fill_f32(&mut s, d));
+        for q4 in [true, false] {
+            let mk = |w: &[f32], n: usize, k: usize, b: &[f32]| {
+                if q4 {
+                    Linear::quantize(w, lay, n, k).with_bias(b)
+                } else {
+                    Linear::f16(w, lay, n, k).with_bias(b)
+                }
+            };
+            let attn =
+                SelfAttention::new(mk(&w1, wq, d, &b1), mk(&w2, d, d, &b2), heads, kv_heads, hd);
+            let (qkv, out) = (mk(&w1, wq, d, &b1), mk(&w2, d, d, &b2));
+            let (mut solo_c, mut pool_c) = (attn.cache(32), attn.cache(32));
+            let mut hand_c = KvCache::new(heads, kv_heads, hd, 32);
+            for (step, m) in [3usize].into_iter().chain([1; 20]).enumerate() {
+                let x: Vec<f32> = fill_f32(&mut s, m * d).iter().map(|v| v * 4.0).collect();
+                // By hand, on the projection as given.
+                let mut want = vec![0.25f32; m * d];
+                let mut h = vec![f16::ZERO; m * wq];
+                qkv.forward(&x, &mut h, m);
+                let (ql, kl) = (heads * hd, kv_heads * hd);
+                let mut q = Vec::new();
+                for r in 0..m {
+                    let row = &h[r * wq..(r + 1) * wq];
+                    q.extend_from_slice(&row[..ql]);
+                    hand_c.push(&row[ql..ql + kl], &row[ql + kl..]);
+                }
+                let mut a = vec![0.0f32; m * ql];
+                if m == 1 {
+                    hand_c.attend(&q, &mut a);
+                } else {
+                    hand_c.attend_causal(&q, m, &mut a);
+                }
+                out.accumulate(&a, &mut want, m);
+                let mut solo = vec![0.25f32; m * d];
+                attn.accumulate(&x, &mut solo_c, &mut solo, m);
+                let mut pooled = vec![0.25f32; m * d];
+                {
+                    let _pool = HotPool::new(2);
+                    attn.accumulate(&x, &mut pool_c, &mut pooled, m);
+                }
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                let tag = format!("{heads}/{kv_heads}x{hd} q4={q4} step={step}");
+                assert_eq!(bits(&pooled), bits(&solo), "{tag}");
+                assert_eq!(pool_c.keys(), solo_c.keys(), "{tag} keys");
+                assert_eq!(pool_c.values(), solo_c.values(), "{tag} values");
+                assert_eq!(solo_c.len(), hand_c.len(), "{tag}");
+                // The grouping moves columns between GEMV passes that round
+                // differently (~3e-3 relative on q/k/v), which softmax then
+                // amplifies on single outputs: compare whole rows.
+                let (err, norm) = solo.iter().zip(&want).fold((0f32, 0f32), |(e, n), (g, w)| {
+                    (e + (g - w) * (g - w), n + w * w)
+                });
+                assert!(
+                    err.sqrt() <= 2e-2 * norm.sqrt(),
+                    "{tag}: |by hand - block| {} vs |by hand| {}",
+                    err.sqrt(),
+                    norm.sqrt()
+                );
+            }
         }
     }
 }

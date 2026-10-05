@@ -143,7 +143,7 @@ pub(crate) fn profile(m: &Model) {
         t0.elapsed().as_secs_f64() / (windows * CTX) as f64 * 1e6
     };
     run(&mut sess, &mut rng);
-    sess.prof = Some([0.0; 9]);
+    sess.prof = Some([0.0; 6]);
     let timed = run(&mut sess, &mut rng);
     let p = sess.prof.take().unwrap_or_default();
     let plain = run(&mut sess, &mut rng);

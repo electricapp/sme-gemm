@@ -8,7 +8,9 @@
 //! and sampling are the only model code left here.
 
 use half::f16;
-use sme_gemm::{Gate, HotPool, KvCache, Linear, Mlp, Q4Params, SmeWarm, WeightLayout, nn};
+use sme_gemm::{
+    Gate, HotPool, KvCache, Linear, Mlp, Q4Params, SelfAttention, SmeWarm, WeightLayout, nn,
+};
 
 pub(crate) const D: usize = 384;
 pub(crate) const NL: usize = 6;
@@ -90,8 +92,7 @@ impl F32Weights {
 struct Layer {
     ln1: Vec<f32>,
     ln2: Vec<f32>,
-    attn: Linear,
-    proj: Linear,
+    attn: SelfAttention,
     mlp: Mlp,
 }
 
@@ -121,8 +122,7 @@ impl Model {
             .map(|l| Layer {
                 ln1: l.ln1.clone(),
                 ln2: l.ln2.clone(),
-                attn: q(&l.attn, 3 * D, D),
-                proj: q(&l.proj, D, D),
+                attn: SelfAttention::new(q(&l.attn, 3 * D, D), q(&l.proj, D, D), NH, NH, HD),
                 mlp: Mlp::new(q(&l.fc, FF, D), Gate::Gelu, q(&l.fcp, D, FF)),
             })
             .collect();
@@ -201,13 +201,10 @@ pub(crate) fn sample(logits: &[f32], s: &Sampler, rng: &mut Rng) -> usize {
 }
 
 /// The stages `--profile` times, in `Session::forward` order.
-pub(crate) const STAGES: [&str; 9] = [
+pub(crate) const STAGES: [&str; 6] = [
     "embed",
     "ln_1",
-    "c_attn",
-    "kv push + q",
-    "attention",
-    "c_proj + residual",
+    "attention + residual",
     "ln_2",
     "mlp + residual",
     "ln_f + head",
@@ -216,15 +213,12 @@ pub(crate) const STAGES: [&str; 9] = [
 /// Generation state: a KV cache per layer, row scratch, and the SME guard.
 pub(crate) struct Session<'m> {
     /// Seconds per stage, accumulated while `Some` (`--profile`).
-    pub(crate) prof: Option<[f64; 9]>,
+    pub(crate) prof: Option<[f64; 6]>,
     m: &'m Model,
     caches: Vec<KvCache>,
     // [rows][...] scratch, sized for a full-context batch.
     x: Vec<f32>,
     h16: Vec<f16>,
-    qkv: Vec<f16>,
-    q: Vec<f16>,
-    y: Vec<f32>,
     last: Vec<f32>,
     pub(crate) logits: Vec<f32>,
     _warm: SmeWarm,
@@ -236,12 +230,9 @@ impl<'m> Session<'m> {
         Self {
             prof: None,
             m,
-            caches: (0..NL).map(|_| KvCache::new(NH, NH, HD, CTX)).collect(),
+            caches: m.layers.iter().map(|l| l.attn.cache(CTX)).collect(),
             x: vec![0.0; CTX * D],
             h16: vec![f16::ZERO; CTX * D],
-            qkv: vec![f16::ZERO; CTX * 3 * D],
-            q: vec![f16::ZERO; CTX * D],
-            y: vec![0.0; CTX * D],
             last: vec![0.0; D],
             logits: vec![0.0; V],
             _warm: SmeWarm::new(),
@@ -289,35 +280,17 @@ impl<'m> Session<'m> {
         lap(0);
         let (x, h16) = (&mut self.x[..r * D], &mut self.h16[..r * D]);
         for (ly, cache) in m.layers.iter().zip(&mut self.caches) {
-            // attention
             nn::layer_norm(&*x, &ly.ln1, None, EPS, &mut *h16);
             lap(1);
-            ly.attn.forward(&*h16, &mut self.qkv[..r * 3 * D], r);
+            ly.attn.accumulate(&*h16, cache, &mut *x, r);
             lap(2);
-            for (row, q) in self.qkv[..r * 3 * D]
-                .chunks_exact(3 * D)
-                .zip(self.q.chunks_exact_mut(D))
-            {
-                q.copy_from_slice(&row[..D]);
-                cache.push(&row[D..2 * D], &row[2 * D..]);
-            }
-            lap(3);
-            if r == 1 {
-                cache.attend(&self.q[..D], &mut self.y[..D]);
-            } else {
-                cache.attend_causal(&self.q[..r * D], r, &mut self.y[..r * D]);
-            }
-            lap(4);
-            ly.proj.accumulate(&self.y[..r * D], &mut *x, r);
-            lap(5);
-            // MLP
             nn::layer_norm(&*x, &ly.ln2, None, EPS, &mut *h16);
-            lap(6);
+            lap(3);
             ly.mlp.accumulate(&*h16, &mut *x, r);
-            lap(7);
+            lap(4);
         }
         nn::layer_norm(&x[(r - 1) * D..], &m.lnf, None, EPS, &mut self.last);
         m.head.forward_f32(&self.last, &mut self.logits, 1);
-        lap(8);
+        lap(5);
     }
 }

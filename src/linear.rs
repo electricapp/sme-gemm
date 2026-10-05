@@ -349,13 +349,42 @@ impl Linear {
         })
     }
 
-    /// Whether [`Linear::run_chained`] can run this layer: 4-bit weights on
-    /// SME f16, and with `gated` input (written while the call runs) no RMS
-    /// norm, which would need all of it up front.
+    /// This layer with output `j` taken from output `perm[j]`, exactly; `None`
+    /// for f16 weights. The f16 panel is rebuilt if this layer had one.
+    pub(crate) fn permuted_outputs(&self, perm: &[usize]) -> Option<Self> {
+        let Weights::Q4 { q4, panel } = &self.w else {
+            return None;
+        };
+        let out = Self {
+            w: Weights::Q4 {
+                q4: q4.permute_columns(perm),
+                panel: OnceLock::new(),
+            },
+            bias: self
+                .bias
+                .as_ref()
+                .map(|b| perm.iter().map(|&i| b[i]).collect()),
+            rms_eps: self.rms_eps,
+        };
+        if panel.get().is_some() {
+            out.build_panel();
+        }
+        Some(out)
+    }
+
+    /// Whether [`Linear::run_chained`] runs this layer for one row as
+    /// [`Linear::forward`] would, bit for bit: 4-bit weights on SME f16 small
+    /// enough that the plain call is also a single GEMV on this thread (larger
+    /// ones spread over the cores, where a chain would be slower and band its
+    /// passes differently), and with `gated` input (written while the call
+    /// runs) no RMS norm, which would need all of it up front.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn chainable(&self, gated: bool) -> bool {
         matches!(self.w, Weights::Q4 { .. })
             && caps().sme_f16f16
             && !(gated && self.rms_eps.is_some())
+            // SAFETY: a pure function of the shape.
+            && unsafe { crate::ffi::gemm_sme_f16f16_q4_single(1, self.n(), self.k()) } != 0
     }
 
     /// `y = x @ W (+ bias)` for one row as a link of a chain ([`crate::Mlp`]):

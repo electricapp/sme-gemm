@@ -122,6 +122,47 @@ impl Q4Weights {
         }
     }
 
+    /// These weights with output column `j` taken from column `perm[j]` (`perm`
+    /// a permutation of `0..n`). Codes, scales and mins move unchanged, so the
+    /// result is exact.
+    pub(crate) fn permute_columns(&self, perm: &[usize]) -> Self {
+        let (n, k) = (self.n, self.k);
+        assert_eq!(perm.len(), n, "perm reorders all n columns");
+        let nbk = k.div_ceil(self.params.block);
+        let (nib_per_band, sc_per_band) = (k * (BAND / 2), nbk * BAND);
+        let mut nibbles = vec![0u8; self.nibbles.len()];
+        let mut sc = vec![0u16; self.scales.len()];
+        let mut mn = vec![0u16; self.mins.len()];
+        for (j, &src) in perm.iter().enumerate() {
+            assert!(src < n, "perm entry {src} out of range");
+            let (b, c, sb, s) = (j / BAND, j % BAND, src / BAND, src % BAND);
+            for d in 0..k {
+                let byte = self.nibbles[sb * nib_per_band + d * (BAND / 2) + s / 2];
+                let nib = (byte >> (4 * (s % 2))) & 0x0f;
+                nibbles[b * nib_per_band + d * (BAND / 2) + c / 2] |= nib << (4 * (c % 2));
+            }
+            for blk in 0..nbk {
+                let (to, from) = (
+                    b * sc_per_band + blk * BAND + c,
+                    sb * sc_per_band + blk * BAND + s,
+                );
+                sc[to] = self.scales[from];
+                if !mn.is_empty() {
+                    mn[to] = self.mins[from];
+                }
+            }
+        }
+        Self {
+            nibbles,
+            scales: sc,
+            mins: mn,
+            bf16_scales: OnceLock::new(),
+            n,
+            k,
+            params: self.params,
+        }
+    }
+
     /// Band-major scales and mins converted to bf16 bits.
     pub(super) fn bf16_scales(&self) -> &(Vec<u16>, Vec<u16>) {
         self.bf16_scales.get_or_init(|| {

@@ -330,6 +330,24 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
 #undef Q4_STEP1
 #undef Q4_DR
 
+// Bands a dispatched GEMV chunk: one pass's worth, but small enough that the
+// E-cluster's slower unit does not hold the call up on a big chunk.
+#define Q4_GEMV_CHUNK(m) (8 / (m) < 2 ? 8 / (m) : 2)
+
+// Whether an m-row GEMV runs as one call on the calling thread rather than
+// chunks over the cores. A chained call (src/mlp.rs) always runs as one, so a
+// chain is used only where this holds: then its bands form the same passes,
+// and give the same bits, as the plain call's.
+static int q4_gemv_single(size_t m, size_t n, size_t k) {
+    size_t n_bands = (n + Q4_BAND - 1) / Q4_BAND, chunk = Q4_GEMV_CHUNK(m);
+    return ep_flops(m, n, k) < (1u << 21) || (n_bands + chunk - 1) / chunk < 3;
+}
+
+int gemm_sme_f16f16_q4_single(size_t m, size_t n, size_t k);
+int gemm_sme_f16f16_q4_single(size_t m, size_t n, size_t k) {
+    return m <= Q4_GEMV_MAXR && q4_gemv_single(m, n, k);
+}
+
 // Q4 GEMM: C(f16) = A(f16) @ dequant(B), B 4-bit resident band-major (see the
 // top of this file); f16 exists only one N-block panel at a time on the MOPA
 // path. `block` is the K-block size (power of two; 32 = Q4_0/Q4_1). `ep` is the
@@ -369,11 +387,8 @@ static int q4_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
             }
         }
         const f16 *sc = (const f16 *)scales, *mn = (const f16 *)mins;
-        // Bands a dispatched chunk: one pass's worth, but small enough that the
-        // E-cluster's slower unit does not hold the call up on a big chunk.
-        size_t chunk = 8 / m < 2 ? 8 / m : 2;
-        size_t g_chunks = (n_bands + chunk - 1) / chunk;
-        if (chain || ep_flops(m, n, k) < (1u << 21) || g_chunks < 3) {
+        size_t chunk = Q4_GEMV_CHUNK(m), g_chunks = (n_bands + chunk - 1) / chunk;
+        if (chain || q4_gemv_single(m, n, k)) {
             run_q4_gemv((f16 *)dst, a, asum, m, nibbles, sc, mn, n, k, 0, n_bands, nib_per_band,
                         sc_per_band, bshift, g_q4_lut, ep, chain);
             return 0;

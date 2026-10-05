@@ -145,6 +145,9 @@ unsafe extern "C" {
         block: usize,
         ep: *const EpDesc16,
     ) -> core::ffi::c_int;
+    /// Whether `gemm_sme_f16f16_q4` runs an `m`-row call as a single GEMV on
+    /// the calling thread (non-zero), as a chained call always does.
+    pub(crate) fn gemm_sme_f16f16_q4_single(m: usize, n: usize, k: usize) -> core::ffi::c_int;
     /// `gemm_sme_f16f16_q4` as one link of a chain: raises `done` to each
     /// stored output column and waits on `ready` for A's depths (either null).
     pub(crate) fn gemm_sme_f16f16_q4_chained(
