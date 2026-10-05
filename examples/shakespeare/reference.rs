@@ -22,16 +22,14 @@ struct RefState {
 }
 
 fn erf(x: f32) -> f32 {
-    // Abramowitz-Stegun 7.1.26, |err| < 1.5e-7.
-    let s = x.signum();
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0
-        - (((((1.061_405_4 * t - 1.453_152_0) * t) + 1.421_413_7) * t - 0.284_496_74) * t
-            + 0.254_829_6)
-            * t
-            * (-x * x).exp();
-    s * y
+    // Abramowitz-Stegun 7.1.26, |err| < 1.5e-7, in f64.
+    let (s, x) = (f64::from(x.signum()), f64::from(x.abs()));
+    let t = 1.0 / 0.327_591_1f64.mul_add(x, 1.0);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    (s * (1.0 - poly * (-x * x).exp())) as f32
 }
 
 fn step_ref(w: &F32Weights, st: &mut RefState, tok: usize, pos: usize) {
@@ -76,20 +74,25 @@ fn step_ref(w: &F32Weights, st: &mut RefState, tok: usize, pos: usize) {
             let mx = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let e: Vec<f32> = s.iter().map(|v| (v - mx).exp()).collect();
             let sum: f32 = e.iter().sum();
-            for t in 0..=pos {
+            for (t, et) in e.iter().enumerate() {
                 for d in 0..HD {
-                    y[hh * HD + d] += e[t] / sum * st.v[base + t * D + hh * HD + d];
+                    y[hh * HD + d] += et / sum * st.v[base + t * D + hh * HD + d];
                 }
             }
         }
         mv(&ly.proj, &y, D, D, &mut o);
-        x.iter_mut().zip(&o).for_each(|(a, b)| *a += b);
+        for (a, b) in x.iter_mut().zip(&o) {
+            *a += b;
+        }
         layernorm(&x, &ly.ln2, &mut h);
         mv(&ly.fc, &h, FF, D, &mut f);
-        f.iter_mut()
-            .for_each(|v| *v = 0.5 * *v * (1.0 + erf(*v / std::f32::consts::SQRT_2)));
+        for v in &mut f {
+            *v = 0.5 * *v * (1.0 + erf(*v / std::f32::consts::SQRT_2));
+        }
         mv(&ly.fcp, &f, D, FF, &mut o);
-        x.iter_mut().zip(&o).for_each(|(a, b)| *a += b);
+        for (a, b) in x.iter_mut().zip(&o) {
+            *a += b;
+        }
     }
     layernorm(&x.clone(), &w.lnf, &mut x);
     for c in 0..V {
@@ -116,7 +119,7 @@ fn argmax(v: &[f32]) -> usize {
 
 /// Validation loss of the f32 reference and the Q4/SME model, then generation
 /// and prompt throughput.
-pub fn bench(w: &F32Weights, m: &Model, text: &str) {
+pub(crate) fn bench(w: &F32Weights, m: &Model, text: &str) {
     let toks: Vec<usize> = text.chars().filter_map(encode).collect();
     let val = &toks[toks.len() * 9 / 10..];
     let mut sess = Session::new(m);
@@ -144,7 +147,11 @@ pub fn bench(w: &F32Weights, m: &Model, text: &str) {
         lq / n as f64,
         100.0 * agree as f64 / n as f64
     );
+    speed(w, val, &mut sess, &mut rs);
+}
 
+/// Generation and prompt throughput, and batched vs token-by-token logits.
+fn speed(w: &F32Weights, val: &[usize], sess: &mut Session<'_>, rs: &mut RefState) {
     // Generation: full 256-token windows from "\n", median of 50.
     let s = Sampler {
         temperature: 0.8,
@@ -233,7 +240,7 @@ pub fn bench(w: &F32Weights, m: &Model, text: &str) {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         for (pos, &t) in p.iter().enumerate() {
-            step_ref(w, &mut rs, t, pos);
+            step_ref(w, rs, t, pos);
         }
         let d = |a: &[f32]| {
             a.iter()

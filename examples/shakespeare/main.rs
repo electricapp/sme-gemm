@@ -1,16 +1,26 @@
 //! `shakespeare`: continue text in the style of Shakespeare with nanoGPT
-//! shakespeare-char running 4-bit on Apple's SME unit through sme-gemm.
+//! shakespeare-char (10.7M parameters) running 4-bit on Apple's SME unit, built
+//! from sme-gemm's `Linear`, `KvCache`, `nn` and `SmeWarm`.
+//!
+//!   examples/shakespeare/fetch.sh     # once: checkpoint + text into examples/shakespeare/data
+//!   cargo run --release --example shakespeare -- "ROMEO:"
+//!   cargo install --path . --example shakespeare   # then: shakespeare "ROMEO:"
 
 mod model;
 mod reference;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use model::{CTX, F32Weights, Model, Rng, Sampler, Session, decode, encode, sample};
 
-const HELP: &str = "\
+/// This example's directory in the checkout it was built from: `fetch.sh` and
+/// the default `data/` live here.
+const HOME: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/shakespeare");
+
+const HELP: &str = concat!(
+    "\
 shakespeare -- continue text in the style of Shakespeare
 
 USAGE:
@@ -20,6 +30,13 @@ With no PROMPT it reads one from stdin when piped, or starts an interactive
 prompt. The model knows 65 characters (letters, the digit 3, space, newline and
 !$&',-.:;?); typographic quotes and dashes are mapped, anything else dropped.
 
+SETUP:
+    The nanoGPT shakespeare-char checkpoint is fetched once (~45 MB, needs curl
+    and python3) by
+        ",
+    env!("CARGO_MANIFEST_DIR"),
+    "/examples/shakespeare/fetch.sh
+
 OPTIONS:
     -n, --chars N         characters to generate [default: 500]
     -t, --temperature T   randomness; 0 always takes the likeliest [default: 0.8]
@@ -28,7 +45,7 @@ OPTIONS:
         --q4-block B      quantization block 32, 64 or 128: larger is faster and
                           slightly less accurate [default: 32]
         --data DIR        checkpoint directory [default: $SHAKESPEARE_DATA, else
-                          the data/ directory next to this crate]
+                          the data/ directory fetch.sh fills]
     -q, --quiet           no timing line on stderr
         --bench           accuracy against f32 and throughput, then exit
     -h, --help            this text
@@ -37,7 +54,8 @@ EXAMPLES:
     shakespeare \"ROMEO:\"
     shakespeare -n 2000 -t 0.6 \"To be, or not to be\"
     echo \"KING HENRY:\" | shakespeare -q
-";
+"
+);
 
 /// Characters the window keeps when generation runs past the 256 context. The
 /// model has absolute positions, so the kept tail is re-run as a prompt: half
@@ -65,10 +83,8 @@ fn parse() -> Result<Opts, String> {
                 .map_or(1, |d| d.as_nanos() as u64),
         },
         q4_block: 32,
-        data: std::env::var_os("SHAKESPEARE_DATA").map_or_else(
-            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data"),
-            PathBuf::from,
-        ),
+        data: std::env::var_os("SHAKESPEARE_DATA")
+            .map_or_else(|| Path::new(HOME).join("data"), PathBuf::from),
         quiet: false,
         bench: false,
         prompt: None,
@@ -89,10 +105,10 @@ fn parse() -> Result<Opts, String> {
                     .map_err(|_| "--temperature takes a number")?;
             }
             "-k" | "--top-k" => {
-                o.sampler.top_k = val(&a)?.parse().map_err(|_| "--top-k takes a count")?
+                o.sampler.top_k = val(&a)?.parse().map_err(|_| "--top-k takes a count")?;
             }
             "-s" | "--seed" => {
-                o.sampler.seed = val(&a)?.parse().map_err(|_| "--seed takes an integer")?
+                o.sampler.seed = val(&a)?.parse().map_err(|_| "--seed takes an integer")?;
             }
             "--q4-block" => {
                 o.q4_block = val(&a)?
@@ -194,63 +210,70 @@ fn generate(
     )
 }
 
+/// What to do about a missing or unreadable checkpoint.
+fn setup_hint() -> String {
+    let fetch = format!("{HOME}/fetch.sh");
+    if Path::new(&fetch).exists() {
+        format!("fetch it once (~45 MB, needs curl and python3):\n    {fetch}")
+    } else {
+        format!(
+            "this binary was built from {HOME}, which has since moved; reinstall it\n\
+             from the sme-gemm checkout:\n    \
+             cargo install --path <checkout> --example shakespeare --force"
+        )
+    }
+}
+
 fn run() -> Result<(), String> {
     let o = parse()?;
-    let t_start = Instant::now();
-    let w = F32Weights::load(&o.data).map_err(|e| {
-        format!(
-            "{e}\nfetch the checkpoint first: {}/fetch.sh",
-            env!("CARGO_MANIFEST_DIR")
-        )
-    })?;
-    let t_load = t_start.elapsed();
+    let w = F32Weights::load(&o.data).map_err(|e| format!("{e}\n{}", setup_hint()))?;
     let m = Model::quantize(&w, o.q4_block);
-    if std::env::var_os("SHAKESPEARE_TIMING").is_some() {
-        eprintln!(
-            "[load {:.1} ms, quantize {:.1} ms]",
-            t_load.as_secs_f64() * 1e3,
-            (t_start.elapsed() - t_load).as_secs_f64() * 1e3
-        );
-    }
     if o.bench {
-        let text = std::fs::read_to_string(o.data.join("input.txt"))
-            .map_err(|e| format!("input.txt: {e}"))?;
+        let path = o.data.join("input.txt");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{}: {e}\n{}", path.display(), setup_hint()))?;
         reference::bench(&w, &m, &text);
         return Ok(());
     }
     drop(w);
     let mut sess = Session::new(&m);
     let mut rng = Rng::new(o.sampler.seed);
-    let mut continue_text = |text: &str| {
+    let mut continue_text = |text: &str| -> Result<(), String> {
         let (toks, dropped) = tokenize(text);
         if dropped > 0 && !o.quiet {
             eprintln!("[dropped {dropped} characters the model does not know]");
         }
         let (cont, st) = generate(&mut sess, &toks, o.chars, &o.sampler, &mut rng);
         let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{text}{cont}");
-        let _ = out.flush();
+        writeln!(out, "{text}{cont}")
+            .and_then(|()| out.flush())
+            .map_err(|e| e.to_string())?;
         if !o.quiet {
             eprintln!(
-                "[prompt: {} chars in {:.2} ms | generated {} chars in {:.1} ms = {:.0} chars/s]",
+                "[prompt:    {:>5} chars in {:>7.2} ms = {:>6.0} chars/s]",
                 st.prompt_chars,
                 st.prompt_s * 1e3,
+                st.prompt_chars as f64 / st.prompt_s
+            );
+            eprintln!(
+                "[generated: {:>5} chars in {:>7.2} ms = {:>6.0} chars/s]",
                 o.chars,
                 st.gen_s * 1e3,
                 o.chars as f64 / st.gen_s
             );
         }
+        Ok(())
     };
     let stdin = std::io::stdin();
     match &o.prompt {
-        Some(p) => continue_text(p),
+        Some(p) => continue_text(p)?,
         None if !stdin.is_terminal() => {
             let mut text = String::new();
             stdin
                 .lock()
                 .read_to_string(&mut text)
                 .map_err(|e| e.to_string())?;
-            continue_text(text.trim_end_matches('\n'));
+            continue_text(text.trim_end_matches('\n'))?;
         }
         None => {
             eprintln!("Type a line for Shakespeare to continue (an empty line or Ctrl-D quits).");
@@ -266,7 +289,7 @@ fn run() -> Result<(), String> {
                 {
                     break;
                 }
-                continue_text(line.trim_end_matches('\n'));
+                continue_text(line.trim_end_matches('\n'))?;
                 println!();
             }
         }
