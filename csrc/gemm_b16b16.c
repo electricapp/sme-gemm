@@ -415,10 +415,11 @@ __arm_locally_streaming __arm_new("za") static void run_gemv_rm(
 static void bcast_row(bf16 *abc, const bf16 *a, long lhs_cs, size_t k) {
     const uint16_t *src = (const uint16_t *)a;
     uint16_t *out = (uint16_t *)abc;
+    // Non-temporal for the kernel that reads it next, as gemm_f16f16.c.
     for (size_t d = 0; d < k; d++) {
-        uint16x8_t v = vdupq_n_u16(src[(long)d * lhs_cs]);
-        uint16x8x4_t q = {{v, v, v, v}};
-        vst1q_u16_x4(out + d * 32, q);
+        float16x8_t v = vreinterpretq_f16_u16(vdupq_n_u16(src[(long)d * lhs_cs]));
+        na_stnp16(out + d * 32, v, v);
+        na_stnp16(out + d * 32 + 16, v, v);
     }
 }
 

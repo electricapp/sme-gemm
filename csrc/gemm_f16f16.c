@@ -447,12 +447,14 @@ __arm_locally_streaming __arm_new("za") static void run_gemv_rm(
     }
 }
 
-// abc[d*32 + j] = A[0, d].
+// abc[d*32 + j] = A[0, d]. Stored non-temporally: the GEMV kernel reads it
+// next, and lines this core stored normally stall the SME unit's first read of
+// each (neon_act.h); 0.93 -> 0.69 us for a 65x384 GEMV on M5.
 static void bcast_row(f16 *abc, const f16 *a, long lhs_cs, size_t k) {
     for (size_t d = 0; d < k; d++) {
         float16x8_t v = vdupq_n_f16(a[(long)d * lhs_cs]);
-        float16x8x4_t q = {{v, v, v, v}};
-        vst1q_f16_x4(abc + d * 32, q);
+        na_stnp16(abc + d * 32, v, v);
+        na_stnp16(abc + d * 32 + 16, v, v);
     }
 }
 
