@@ -11,7 +11,9 @@ mod reference;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use model::{CTX, Checkpoint, Model, Rng, Sampler, Session, decode, encode, sample};
 
@@ -166,15 +168,17 @@ struct Stats {
     gen_s: f64,
 }
 
-/// Continues `prompt` by `n` characters. Past the 256-character context the
-/// window restarts on its last KEEP characters as one batched prompt.
+/// Continues `prompt` by `n` characters, handing each to `emit` as soon as it
+/// is sampled. Past the 256-character context the window restarts on its last
+/// KEEP characters as one batched prompt.
 fn generate(
     sess: &mut Session<'_>,
     prompt: &[usize],
     n: usize,
     s: &Sampler,
     rng: &mut Rng,
-) -> (String, Stats) {
+    emit: &mut dyn FnMut(char) -> std::io::Result<()>,
+) -> std::io::Result<Stats> {
     let mut hist: Vec<usize> = if prompt.is_empty() {
         vec![0]
     } else {
@@ -184,16 +188,11 @@ fn generate(
     let t0 = Instant::now();
     let start = hist.len().saturating_sub(CTX);
     sess.forward(&hist[start..]);
-    let st = Stats {
-        prompt_chars: hist.len() - start,
-        prompt_s: t0.elapsed().as_secs_f64(),
-        gen_s: 0.0,
-    };
+    let (prompt_chars, prompt_s) = (hist.len() - start, t0.elapsed().as_secs_f64());
     let t1 = Instant::now();
-    let mut out = String::with_capacity(n);
     for i in 0..n {
         let tok = sample(&sess.logits, s, rng);
-        out.push(decode(tok));
+        emit(decode(tok))?;
         hist.push(tok);
         if i + 1 == n {
             break;
@@ -205,13 +204,78 @@ fn generate(
             sess.forward(&[tok]);
         }
     }
-    (
-        out,
-        Stats {
-            gen_s: t1.elapsed().as_secs_f64(),
-            ..st
-        },
-    )
+    Ok(Stats {
+        prompt_chars,
+        prompt_s,
+        gen_s: t1.elapsed().as_secs_f64(),
+    })
+}
+
+/// How often the output thread writes what has been generated.
+const OUTPUT_TICK: Duration = Duration::from_millis(10);
+
+/// Characters handed from generation to the output thread.
+#[derive(Default)]
+struct Handoff {
+    text: Mutex<String>,
+    /// Generation is over: write the rest and stop.
+    done: AtomicBool,
+    /// Writing failed: generation stops.
+    failed: AtomicBool,
+}
+
+impl Handoff {
+    fn text(&self) -> std::sync::MutexGuard<'_, String> {
+        self.text.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The output thread: writes `prompt`, then every [`OUTPUT_TICK`] the whole
+/// words generated since, then the rest once generation is done. Writing,
+/// however slow the terminal, never holds up generation, which only appends
+/// to the handoff.
+fn write_out(prompt: &str, h: &Handoff) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
+    let mut write = || {
+        write!(out, "{prompt}")?;
+        out.flush()?;
+        let mut pending = String::new();
+        loop {
+            // Read before taking the text: once `done` is seen, every
+            // character is in the handoff.
+            let last = h.done.load(Ordering::Acquire);
+            pending.push_str(&std::mem::take(&mut *h.text()));
+            let cut = if last {
+                pending.len()
+            } else {
+                pending.rfind([' ', '\n']).map_or(0, |i| i + 1)
+            };
+            if cut > 0 {
+                out.write_all(&pending.as_bytes()[..cut])?;
+                out.flush()?;
+                pending.drain(..cut);
+            }
+            if last {
+                writeln!(out)?;
+                return out.flush();
+            }
+            std::thread::park_timeout(OUTPUT_TICK);
+        }
+    };
+    let r = write();
+    if r.is_err() {
+        h.failed.store(true, Ordering::Relaxed);
+    }
+    r
+}
+
+/// An error writing the output, as the CLI reports it; a reader that has
+/// stopped (`| head`) just ends the run.
+fn out_err(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    e.to_string()
 }
 
 /// What to do about a missing or unreadable checkpoint.
@@ -252,11 +316,24 @@ fn run() -> Result<(), String> {
         if dropped > 0 && !o.quiet {
             eprintln!("[dropped {dropped} characters the model does not know]");
         }
-        let (cont, st) = generate(&mut sess, &toks, o.chars, &o.sampler, &mut rng);
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "{text}{cont}")
-            .and_then(|()| out.flush())
-            .map_err(|e| e.to_string())?;
+        let h = Handoff::default();
+        let (st, wrote) = std::thread::scope(|sc| {
+            let writer = sc.spawn(|| write_out(text, &h));
+            let mut emit = |c: char| {
+                if h.failed.load(Ordering::Relaxed) {
+                    return Err(std::io::ErrorKind::Other.into()); // the writer has the error
+                }
+                h.text().push(c);
+                Ok(())
+            };
+            let st = generate(&mut sess, &toks, o.chars, &o.sampler, &mut rng, &mut emit);
+            h.done.store(true, Ordering::Release);
+            writer.thread().unpark();
+            (st, writer.join())
+        });
+        let wrote = wrote.unwrap_or_else(|p| std::panic::resume_unwind(p));
+        wrote.map_err(|e| out_err(&e))?;
+        let st = st.map_err(|e| out_err(&e))?;
         if !o.quiet {
             eprintln!(
                 "[prompt:    {:>5} chars in {:>7.2} ms = {:>6.0} chars/s]",
