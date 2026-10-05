@@ -204,6 +204,32 @@ impl Posted<'_> {
     }
 }
 
+/// The end of an [`alongside`] job: runs whatever no worker claimed, waits for
+/// the engaged workers, and releases the pool. A drop guard, so it also runs
+/// when the caller's work unwinds (the job lives on the caller's frame).
+struct Finish<'a, 'j> {
+    job: &'a Job<'j>,
+    engaged: &'a [Slot],
+    seq: u64,
+}
+
+impl Drop for Finish<'_, '_> {
+    fn drop(&mut self) {
+        // A load first: the line is usually a worker's, and taking it for a
+        // read-modify-write when every item is claimed costs more.
+        if self.job.next.load(Ordering::Relaxed) < self.job.items {
+            self.job.drain();
+        }
+        for s in self.engaged {
+            while s.done.load(Ordering::Acquire) != self.seq {
+                std::hint::spin_loop();
+            }
+        }
+        JOB.store(core::ptr::null_mut(), Ordering::Relaxed);
+        IN_USE.store(false, Ordering::Release);
+    }
+}
+
 /// Posts `f(i)` for every `i < items` to the pool's workers and runs `main` on
 /// the calling thread meanwhile -- typically SME work that the items feed or
 /// follow, synchronized through atomics of the caller's own. Returns `main`'s
@@ -242,27 +268,6 @@ pub(crate) fn alongside<R>(
         s.posted.store(seq, Ordering::Release);
     }
     // Wait for the workers even if `main` unwinds: the job lives on this frame.
-    struct Finish<'a, 'j> {
-        job: &'a Job<'j>,
-        engaged: &'a [Slot],
-        seq: u64,
-    }
-    impl Drop for Finish<'_, '_> {
-        fn drop(&mut self) {
-            // A load first: the line is usually a worker's, and taking it for
-            // a read-modify-write when every item is claimed costs more.
-            if self.job.next.load(Ordering::Relaxed) < self.job.items {
-                self.job.drain();
-            }
-            for s in self.engaged {
-                while s.done.load(Ordering::Acquire) != self.seq {
-                    std::hint::spin_loop();
-                }
-            }
-            JOB.store(core::ptr::null_mut(), Ordering::Relaxed);
-            IN_USE.store(false, Ordering::Release);
-        }
-    }
     let finish = Finish {
         job: &job,
         engaged,

@@ -442,7 +442,7 @@ impl KvCache {
     /// The key and value storage, `capacity` rows each, for writers that fill
     /// a row's heads from several threads ([`crate::SelfAttention`]); the row
     /// counts once [`KvCache::grow`] says so.
-    pub(crate) fn storage(&mut self) -> (*mut f16, *mut f16) {
+    pub(crate) const fn storage(&mut self) -> (*mut f16, *mut f16) {
         (self.k.as_mut_ptr(), self.v.as_mut_ptr())
     }
 
