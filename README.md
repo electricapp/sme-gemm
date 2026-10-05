@@ -78,9 +78,9 @@ matching f16).
   f16/bf16/f32/f64 and i8/i16→f32 dequant (bf16 runs the graph in f32, then
   rounds). On the 16-bit paths a trailing gelu/silu/sigmoid/tanh runs as a NEON
   pass after the kernel, since streaming mode is slow at it (ARCHITECTURE.md
-  §2.5). A leading per-column bias folds into the accumulator. `.beta(b)`
-  scales the product; `.col_major_output()` stores C column-major.
-  `epilogue_map` is the non-fused escape hatch.
+  §2.5). A leading per-column bias folds into the accumulator. `.beta(b)` scales
+  the product; `.col_major_output()` stores C column-major. `epilogue_map` is
+  the non-fused escape hatch.
 - **Strided GEMM** — `gemm_{f16,bf16,f32,f64,i8,i16}`: `C = αC + β(A @ B)` with
   per-matrix row/col strides. Strides encode transpose, column-major, and
   accumulate-into-C.
@@ -94,20 +94,27 @@ matching f16).
 - **Model building blocks** — the pieces between "a GEMM" and "a model":
   - `Linear`: a layer's weights, 4-bit (`Linear::quantize`, from f32) or f16,
     from either `WeightLayout` (`OutIn` is PyTorch's `[out][in]`), with an
-    optional bias. It takes f32 or f16 rows, writes f16, f32, or adds into an f32
-    residual stream (`accumulate`), and picks the kernel by row count: the Q4
-    GEMV under 8 rows, an f16 panel built once on first use from 8.
+    optional bias. It takes f32 or f16 rows, writes f16, f32, or adds into an
+    f32 residual stream (`accumulate`), and picks the kernel by row count: the
+    Q4 GEMV under 8 rows, an f16 panel built once on first use from 8.
   - `GatedLinear`: the gate and up projections of a SwiGLU / GeGLU MLP as one
     matmul (interleaved 32 columns at a time) plus one NEON `act(g)·u` pass.
   - An input RMSNorm folds into the layer after it: `WeightLayout::scale_inputs`
     multiplies the norm's weight into W once, and `.rms_norm_input(eps)` applies
-    the per-row `1/rms(x)` as the epilogue's first step, so no normalized copy of
-    `x` is written.
-  - `Q4Weights::quantize` (`Q4_0` / `Q4_1`, any block) and `prepack(w, layout,
-    n, k)` for every dtype, so weights go in as they are stored.
+    the per-row `1/rms(x)` as the epilogue's first step, so no normalized copy
+    of `x` is written.
+  - `Q4Weights::quantize` (`Q4_0` / `Q4_1`, any block) and
+    `prepack(w, layout, n, k)` for every dtype, so weights go in as they are
+    stored.
   - `KvCache`: an f16 key/value cache with `push` / `attend` / `attend_causal`
     (grouped-query aware; NEON, since one row has no GEMM in it), over
     `attention_kv_f16` / `attention_kv_causal_f16`.
+  - `Mlp` (`y += down(act(up(x)))`, plain or gated) and `SelfAttention` (fused
+    qkv projection, KV cache append, attention, output projection): whole
+    transformer blocks into an f32 residual stream. For one row with 4-bit
+    weights and a `HotPool`, the activation, or each KV-head group's append and
+    attention, runs on pool workers beside the two GEMVs instead of between them
+    (ARCHITECTURE.md §2.13), with the same bits as running the steps in turn.
   - `nn::layer_norm` / `nn::rms_norm`, writing f16 straight for the next matmul.
   - `SmeWarm` keeps the SME unit awake between calls: it idles within a few
     hundred ns, and a loop alternating short SME calls with NEON work otherwise
@@ -207,14 +214,15 @@ footprint win (`O(m·d + n·d + n·dv)`), not a speed win, until 4096²:
 
 |                | m=1 ×4096² | m=16 | m=128 | m=256 | 1024³ |
 | -------------- | ---------- | ---- | ----- | ----- | ----- |
-| q4-resident ms | 0.07       | 0.47 | 1.10  | 1.99  | 0.47  |
-| eager-f16 ms   | 0.26       | 0.35 | 0.94  | 1.78  | 0.46  |
+| q4-resident ms | 0.06       | 0.51 | 1.20  | 2.02  | 0.48  |
+| eager-f16 ms   | 0.24       | 0.34 | 0.93  | 1.78  | 0.46  |
 
 Q4 holds a 4× smaller resident weight set. Up to `m=7` it runs the LUTI4 GEMV
-and reads a quarter of eager's bytes (3× at `m=1`). Above that it unpacks each
+and reads a quarter of eager's bytes (4× at `m=1`). Above that it unpacks each
 weight block once into ZA-built panels, an `O(n·k)` cost whatever `m`: it trails
-eager by 8–40% at `m=16..256`, where eager's 32 MB of f16 stays cache-resident
-between calls, and matches it by 1024³.
+eager by 13–50% at `m=16..256`, where eager's 32 MB of f16 stays cache-resident
+between calls, and is within 5% by 1024³. (`Linear` sidesteps this by unpacking
+once into an f16 panel for 8 rows and up.)
 
 |                  | 16³×256 | 32³×128 | 64³×64 | 32×128×64 ×64 | 96³×32 |
 | ---------------- | ------- | ------- | ------ | ------------- | ------ |
@@ -313,10 +321,11 @@ Also: `matmul_{bf16,f32,f64,i16}`, `gemm_*`, `matmul_*_batched`,
 `sme_gemm::candle::sme_matmul`. Caps: `sme_gemm::caps()`.
 
 **End to end.** `examples/shakespeare` runs nanoGPT shakespeare-char (10.7M
-parameters) from these blocks alone (`Linear`, `KvCache`, `nn::layer_norm`,
-`SmeWarm`, `HotPool`; the model file adds only embeddings and sampling) as a
-CLI that continues a prompt. On an M5 it generates ~12k characters/s (~13.5k
-at short context) with the validation loss of the f32 model:
+parameters) from these blocks alone (`SelfAttention`, `Mlp`, `Linear`,
+`nn::layer_norm`, `SmeWarm`, `HotPool`; the model file adds only embeddings and
+sampling) as a CLI that continues a prompt. On an M5 it generates ~24.8k
+characters/s over 256-character windows (~29.6k at short context) with the
+validation loss of the f32 model:
 
 ```sh
 examples/shakespeare/fetch.sh             # once: checkpoint + text, ~45 MB (curl, python3)
