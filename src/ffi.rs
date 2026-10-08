@@ -199,6 +199,20 @@ unsafe extern "C" {
         block: usize,
         ep: *const EpDesc16,
     ) -> core::ffi::c_int;
+    /// The 2-bit GEMM (`csrc/gemm_q2.c`): `codes`/`scales` band-major as
+    /// [`Q2Weights`](crate::Q2Weights) holds them, `codebook` its four values.
+    pub(crate) fn gemm_sme_f16_q2(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut u16,
+        lhs: *const u16,
+        codes: *const u8,
+        scales: *const f32,
+        codebook: *const i8,
+        block: usize,
+        ep: *const EpDesc16,
+    ) -> core::ffi::c_int;
     pub(crate) fn gemm_sme_b16b16_batched(
         count: usize,
         m: usize,

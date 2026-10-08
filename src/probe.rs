@@ -19,6 +19,8 @@ pub struct Caps {
     pub sme_i16i64: bool,
     /// `FEAT_SME_F64F64`: f64->f64 MOPA. M5+.
     pub sme_f64f64: bool,
+    /// `FEAT_SME2p1` (with SME2's LUTI2): the 2-bit path's kernel. M5+.
+    pub sme2p1: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(miri)))]
@@ -46,6 +48,7 @@ fn detect() -> Caps {
             sme_b16b16: flag(b"hw.optional.arm.FEAT_SME_B16B16\0"),
             sme_i16i64: flag(b"hw.optional.arm.FEAT_SME_I16I64\0"),
             sme_f64f64: flag(b"hw.optional.arm.FEAT_SME_F64F64\0"),
+            sme2p1: flag(b"hw.optional.arm.FEAT_SME2p1\0"),
         }
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64", not(miri))))]

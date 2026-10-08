@@ -8,7 +8,9 @@
 //!
 //! Supported element types: f16 (f32 or f16 accumulate), bf16 (f32 or bf16
 //! accumulate), f32, f64, i8->i32, i16->i64. Native 16-bit accumulate needs
-//! M5 (`FEAT_SME_F16F16` / `FEAT_SME_B16B16`).
+//! M5 (`FEAT_SME_F16F16` / `FEAT_SME_B16B16`). Weights can also stay 4-bit
+//! ([`Q4Weights`]) or 2-bit ([`Q2Weights`], int8 products, for models trained
+//! at two bits) through the multiply.
 //!
 //! On non-Apple targets every entry point transparently falls back to a
 //! portable scalar reference, so the crate builds and runs everywhere.
@@ -17,7 +19,7 @@
 //! block at a time, so the `m x n` score matrix is never materialized.
 //!
 //! Above the kernels sit the pieces a model is built from: [`Linear`] (a
-//! layer's 4-bit or f16 weights, quantized from either [`WeightLayout`], with
+//! layer's 4-bit, 2-bit or f16 weights, from either [`WeightLayout`], with
 //! the kernel picked by row count and an optional folded input `RMSNorm`),
 //! [`GatedLinear`] (a `SwiGLU` / `GeGLU` MLP's gate and up as one matmul),
 //! [`KvCache`] (f16 key/value cache and its attention), [`nn`] (layer and RMS
@@ -97,6 +99,7 @@ pub use kernels::int::{
     matmul_i16_dequant, matmul_i16_packed, matmul_i16_packed_dequant, prepack_i8, prepack_i16,
 };
 pub use kernels::kv_attention::{KvCache, attention_kv_causal_f16, attention_kv_f16};
+pub use kernels::q2::{Q2_BLOCK, Q2_TERNARY, Q2Params, Q2Weights, matmul_q2, matmul_q2_ep};
 pub use kernels::q4::{
     Q4_BLOCK, Q4Form, Q4Params, Q4Weights, dequant_q4, dequant_q4_bf16, dequant_q4_bf16_with,
     dequant_q4_with, matmul_q4, matmul_q4_bf16, matmul_q4_bf16_ep, matmul_q4_ep,

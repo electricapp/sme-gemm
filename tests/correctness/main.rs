@@ -241,6 +241,7 @@ mod kv_attention;
 mod model;
 mod nan;
 mod narrow;
+mod q2;
 mod q4;
 mod quant;
 mod reduce;

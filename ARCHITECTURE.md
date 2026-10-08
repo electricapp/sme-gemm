@@ -425,6 +425,44 @@ activation and GLU passes, the GEMV's broadcast A — is stored with `STNP`
 has not just read, so those passes write out of place. Kernels whose input may
 come from user code touch it up front (§2.8).
 
+### 2.15 2-bit weights: LUTI2 into SDOT
+
+`Q2Weights` holds a 2-bit code per weight, four int8 values the codes stand for
+(ternary by default) and an f32 scale per (column, K-block). Its kernel
+(`csrc/gemm_q2.c`) computes with int8 products rather than f16 ones, because
+the expansion is cheap enough to let them pay:
+
+- **Why int8.** A lane-indexed int8 SDOT vg1x4 is 256 multiply-adds, twice the
+  f16 FMLA lane's 128, at the same issue rate. Feeding it 4-bit codes takes two
+  LUTI4 x2 .B per SDOT, which costs more than SDOT saves, so Q4 stays f16. One
+  LUTI2 x4 .B turns a whole 64-byte register of 2-bit codes into the 256 bytes
+  one SDOT takes, so a one-row 2-bit GEMV runs at about twice the Q4 GEMV's rate
+  with the weights in L2, and reads half its bytes from DRAM.
+- **Layout.** A band is 64 columns, and for each quad of depths it holds 64
+  bytes, byte c holding column c's four codes. LUTI2's output vector v is then
+  columns 16v..16v+15 four depths each, SDOT's first operand as it stands, and
+  the lane-indexed SDOT takes four depths of A from a 16-byte replicating load.
+  Two quads of a band are one 128-byte line. LUTI2 .B reads the low byte of
+  ZT0's 32-bit entries 0-3, which hold the codebook. k pads to 16 depths, with
+  zero activations past k.
+- **Activations.** Before the kernel, NEON quantizes each row of A per K-block,
+  `s = amax/127` and `q = round_even(a * 127/amax)`, so every block sum is an
+  exact int32.
+- **Folds.** At each block edge the sum folds into an f32 total as
+  `total + f32(sum) * (scale * s)`, one fused FMLA into an f32 ZA group, block
+  by block in K order. Block sums are double-buffered as on the Q4 GEMV (§2.8)
+  and read with SME2p1's MOVAZ, which zeroes them as it reads, so no tile-mask
+  `ZERO` constrains where groups go. A pass of R rows and B bands with C sum
+  chains per (row, band) uses R·B·(2C+1) of the 16 vg1x4 groups: one row runs 3
+  bands with alternate quads in two chains, more rows fewer bands, up to 5 rows.
+  Larger m runs as balanced groups of at most 5 rows, each a GEMV of its own:
+  2-bit layers serve generation, where m is small, and keep that rate instead
+  of switching to a MOPA path at larger m.
+- **Bits.** With integer sums and a fixed fold order an output depends only on
+  its own column, not on m, the passes, or how a call splits over cores, and
+  `src/kernels/q2/matmul.rs` computes the same bits in Rust: the fallback, and
+  the unit tests' oracle.
+
 ## 3. Translation units and feature gating
 
 There are no stable Rust SME intrinsics — `core::arch` does not expose
@@ -444,7 +482,8 @@ same binary:
   feature layered on the same base flags, linked as its own static lib:
   `gemm_f16f16.c` → `+sme-f16f16`; `gemm_b16b16.c` → `+sme-b16b16 +sve-b16b16`
   (the SVE feature covers `svmul_bf16`/`svmla_bf16` in the bf16 epilogue);
-  `gemm_f64.c` → `+sme-f64f64`; `gemm_i16i64.c` → `+sme-i16i64`. Each is called
+  `gemm_f64.c` → `+sme-f64f64`; `gemm_i16i64.c` → `+sme-i16i64`; `gemm_q2.c` →
+  `+sme2p1` (MOVAZ; LUTI2 is base SME2). Each is called
   only behind a runtime probe, so compiling it with newer features does not
   raise the binary's floor — an M4 never enters those symbols.
 
@@ -480,7 +519,7 @@ tracking, since `cc` never sees it.
 `src/probe.rs` and `csrc/sme_probe.c` detect capabilities via `sysctlbyname` on
 the `hw.optional.arm.FEAT_SME*` flags, cached once in a `OnceLock`. `Caps` holds
 one bool per group: `sme` (base, M4+), and `sme_f16f16`, `sme_b16b16`,
-`sme_i16i64`, `sme_f64f64` (M5+). On non-Apple targets every flag is false and
+`sme_i16i64`, `sme_f64f64`, `sme2p1` (M5+). On non-Apple targets every flag is false and
 everything falls back to the scalar reference. Per-dtype entry points consult
 the matching flag before dispatching to an M5 kernel. The same probe reads the
 P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
@@ -514,8 +553,10 @@ P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
   kernel and the `#[repr(C)]` descriptor mirrors (`EpDesc16`, `EpDescF32`,
   `EpDescF64`). Apple aarch64 only.
 - **`kernels/`** — public per-dtype entry points: `f16.rs`, `bf16.rs`, `f32.rs`,
-  `f64.rs`, `int/` (`i8.rs`, `i16.rs`), and `q4/` (`weights.rs` builds and
-  dequantizes `Q4Weights`, `matmul.rs` the GEMM entry points). Each wires the
+  `f64.rs`, `int/` (`i8.rs`, `i16.rs`), `q4/` (`weights.rs` builds and
+  dequantizes `Q4Weights`, `matmul.rs` the GEMM entry points) and `q2/`
+  (`weights.rs` packs and quantizes `Q2Weights`, `matmul.rs` the entry points
+  and the bit-exact reference, §2.15). Each wires the
   worth-it check, the FFI call and the scalar fallback. `attention.rs` and
   `attention_half.rs` hold the flash-attention drivers, `kv_attention.rs` the
   KV-cache attention (§2.7).
@@ -534,10 +575,11 @@ P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
   `half` crate converts one value per inline-asm `FCVT`).
 - **`linear.rs`, `layout.rs`, `nn.rs`** — the model-level layer over the
   kernels. `Linear` holds a layer's weights (Q4 with a lazily built f16 panel,
-  or f16) and an optional bias, and routes each call by row count: the Q4 GEMV
-  below 8 rows, where reading the weights is the cost, and the dense f16 GEMM on
-  the panel from 8, where the Q4 MOPA path would unpack every block again per
-  call (the two agree bit for bit). Its bias goes in front of any caller
+  2-bit, or f16) and an optional bias, and routes each call by row count: the
+  Q4 GEMV below 8 rows, where reading the weights is the cost, and the dense f16
+  GEMM on the panel from 8, where the Q4 MOPA path would unpack every block
+  again per call (the two agree bit for bit). 2-bit weights run their GEMM at
+  every row count (§2.15). Its bias goes in front of any caller
   epilogue, where it folds into the accumulator; with `rms_norm_input` a per-row
   `1/rms(x)` goes in front of that (the norm's weight is folded into W by
   `WeightLayout::scale_inputs`). `GatedLinear` stores gate and up interleaved in
@@ -675,15 +717,15 @@ regresses the relu store, so bias+activation keeps the in-store add.
 
 | suite                  | count | covers                                                        |
 | ---------------------- | ----- | ------------------------------------------------------------- |
-| `tests/correctness/`   | 120   | dtypes, shapes, layouts, packed/batched, epilogue graphs      |
+| `tests/correctness/`   | 139   | dtypes, shapes, layouts, packed/batched, epilogue graphs      |
+| doctests               | 20    | the documented API examples                                   |
 | `tests/validation.rs`  | 19    | pre-FFI footprint asserts and panic contracts                 |
 | `tests/proptest.rs`    | 17    | randomized shapes/strides/operands against the oracle         |
+| unit tests             | 15    | in-module invariants; the 2-bit kernel against its reference |
 | `tests/guard_page.rs`  | 13    | reads past the declared footprint fault on a `PROT_NONE` page |
-| unit tests             | 11    | in-module invariants (unpackers invert their packers)         |
-| doctests               | 5     | the documented API examples                                   |
 | `tests/concurrency.rs` | 4     | one GEMM from many threads, bit-identical, across branches    |
 
-189 total. `tests/correctness/main.rs` holds the shared oracles and shape
+227 total. `tests/correctness/main.rs` holds the shared oracles and shape
 tables: `SIZES`, and `TAIL_SIZES` for shapes that clear the flop floor and have
 ragged M/N/K tails, where tail-predicate handling is exercised.
 `PROPTEST_CASES=N` widens the random sweep for a soak run.
@@ -721,9 +763,10 @@ under test, so the harnesses are built to control for them.
   reading DRAM.
 
 Throughput lives in `examples/bench.rs` (per dtype), `epilogue_bench.rs` (fusion
-overhead), `batched_bench.rs`, `q4_bench.rs`, `attention.rs`, `roofline.rs` and
-`dequant_bench.rs`. Cross-backend comparisons are `vs_accelerate`, `vs_ort`,
-`vs_candle` and `vs_burn`, the last three behind their feature flags.
+overhead), `batched_bench.rs`, `q4_bench.rs`, `q2_bench.rs`, `attention.rs`,
+`roofline.rs` and `dequant_bench.rs`. Cross-backend comparisons are
+`vs_accelerate`, `vs_ort`, `vs_candle` and `vs_burn`, the last three behind
+their feature flags.
 
 ---
 

@@ -8,7 +8,8 @@ use half::f16;
 
 use crate::element::sealed;
 use crate::{
-    Epilogue, Packed, Q4Params, Q4Weights, WeightLayout, caps, matmul_q4_ep, prepack, prepack_f16,
+    Epilogue, Packed, Q2Params, Q2Weights, Q4Params, Q4Weights, WeightLayout, caps, matmul_q2_ep,
+    matmul_q4_ep, prepack, prepack_f16,
 };
 
 /// The float types the model-level helpers take and give: `f32` and `f16`.
@@ -98,6 +99,10 @@ thread_local! {
 /// it. The two give the same products: the Q4 MOPA path is bit for bit the
 /// eager dequant plus the dense GEMM.
 ///
+/// 2-bit weights ([`Linear::quantize_q2`], [`Linear::from_q2`]) stay resident
+/// as [`Q2Weights`] and run [`matmul_q2`](crate::matmul_q2) at every row count,
+/// with int8 activations: for models trained at two bits.
+///
 /// Inputs are f16 or f32 ([`ModelFloat`]); outputs f16 ([`forward`]), f32
 /// ([`forward_f32`]), or added into an f32 residual stream ([`accumulate`]). A
 /// bias ([`with_bias`]) leads any epilogue a call adds.
@@ -133,6 +138,7 @@ enum Weights {
         q4: Q4Weights,
         panel: OnceLock<Packed<f16>>,
     },
+    Q2(Q2Weights),
     F16(Packed<f16>),
 }
 
@@ -168,6 +174,26 @@ impl Linear {
                 q4,
                 panel: OnceLock::new(),
             },
+            bias: None,
+            rms_eps: None,
+        }
+    }
+
+    /// Quantizes f32 weights to 2 bits with `p`'s block size and codebook; see
+    /// [`Q2Weights::quantize`].
+    ///
+    /// # Panics
+    /// Panics if `w.len() != n * k`, or if the codebook is all zeros.
+    #[must_use]
+    pub fn quantize_q2(w: &[f32], layout: WeightLayout, n: usize, k: usize, p: Q2Params) -> Self {
+        Self::from_q2(Q2Weights::quantize(w, layout, n, k, p))
+    }
+
+    /// Wraps weights that are already 2-bit packed.
+    #[must_use]
+    pub const fn from_q2(q2: Q2Weights) -> Self {
+        Self {
+            w: Weights::Q2(q2),
             bias: None,
             rms_eps: None,
         }
@@ -231,6 +257,7 @@ impl Linear {
     pub const fn n(&self) -> usize {
         match &self.w {
             Weights::Q4 { q4, .. } => q4.n(),
+            Weights::Q2(q2) => q2.n(),
             Weights::F16(p) => p.n(),
         }
     }
@@ -240,16 +267,26 @@ impl Linear {
     pub const fn k(&self) -> usize {
         match &self.w {
             Weights::Q4 { q4, .. } => q4.k(),
+            Weights::Q2(q2) => q2.k(),
             Weights::F16(p) => p.k(),
         }
     }
 
-    /// The 4-bit weights, if the layer is quantized.
+    /// The 4-bit weights, if the layer is 4-bit.
     #[must_use]
     pub const fn q4(&self) -> Option<&Q4Weights> {
         match &self.w {
             Weights::Q4 { q4, .. } => Some(q4),
-            Weights::F16(_) => None,
+            Weights::Q2(_) | Weights::F16(_) => None,
+        }
+    }
+
+    /// The 2-bit weights, if the layer is 2-bit.
+    #[must_use]
+    pub const fn q2(&self) -> Option<&Q2Weights> {
+        match &self.w {
+            Weights::Q2(q2) => Some(q2),
+            Weights::Q4 { .. } | Weights::F16(_) => None,
         }
     }
 
@@ -260,7 +297,8 @@ impl Linear {
     }
 
     /// Builds the f16 panel of 4-bit weights now rather than on the first call
-    /// with [`Linear::PANEL_ROWS`] or more rows. A no-op for f16 weights.
+    /// with [`Linear::PANEL_ROWS`] or more rows. A no-op for 2-bit and f16
+    /// weights.
     pub fn build_panel(&self) {
         if let Weights::Q4 { q4, panel } = &self.w {
             let _ = Self::panel(q4, panel);
@@ -368,7 +406,8 @@ impl Linear {
     }
 
     /// This layer with output `j` taken from output `perm[j]`, exactly; `None`
-    /// for f16 weights. The f16 panel is rebuilt if this layer had one.
+    /// for 2-bit and f16 weights, which no chained call reads. The f16 panel
+    /// is rebuilt if this layer had one.
     pub(crate) fn permuted_outputs(&self, perm: &[usize]) -> Option<Self> {
         let Weights::Q4 { q4, panel } = &self.w else {
             return None;
@@ -446,6 +485,7 @@ impl Linear {
                 packed(Self::panel(q4, panel), y);
             }
             Weights::Q4 { q4, .. } => matmul_q4_ep(x, q4, y, m, ep),
+            Weights::Q2(q2) => matmul_q2_ep(x, q2, y, m, ep),
             Weights::F16(p) => packed(p, y),
         }
     }
@@ -550,6 +590,28 @@ impl GatedLinear {
         let w = interleave(w_gate, w_up, layout, n, k);
         Self {
             inner: Linear::quantize_with(&w, WeightLayout::InOut, 2 * n, k, p),
+            gate,
+        }
+    }
+
+    /// The gate and up weights quantized to 2 bits with `p`; see
+    /// [`Linear::quantize_q2`].
+    ///
+    /// # Panics
+    /// As [`GatedLinear::quantize`], or if the codebook is all zeros.
+    #[must_use]
+    pub fn quantize_q2(
+        w_gate: &[f32],
+        w_up: &[f32],
+        layout: WeightLayout,
+        n: usize,
+        k: usize,
+        gate: Gate,
+        p: Q2Params,
+    ) -> Self {
+        let w = interleave(w_gate, w_up, layout, n, k);
+        Self {
+            inner: Linear::quantize_q2(&w, WeightLayout::InOut, 2 * n, k, p),
             gate,
         }
     }

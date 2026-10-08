@@ -53,6 +53,7 @@ const CSRC: &[&str] = &[
     "gemm_f64_small.h",
     "gemm_i16i64.c",
     "gemm_i16i64_batched.h",
+    "gemm_q2.c",
 ];
 
 fn compile_sme_kernels() {
@@ -154,6 +155,7 @@ fn compile_sme_kernels() {
     );
     feat_tu("gemm_f64.c", "sme_gemm_f64", &["+sme-f64f64"]);
     feat_tu("gemm_i16i64.c", "sme_gemm_i16i64", &["+sme-i16i64"]);
+    feat_tu("gemm_q2.c", "sme_gemm_q2", &["+sme2p1"]);
 
     link_compiler_rt(c_asan);
 }

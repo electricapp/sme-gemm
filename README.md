@@ -64,6 +64,7 @@ matching f16).
 | i8→i32      | i32 (SMOPA)                     | i32      | M4      |
 | **i16→i64** | i64 (SMOPA)                     | i64      | M5      |
 | **Q4**      | 4-bit block-quant → f16 or bf16 | f16/bf16 | M5      |
+| **2-bit**   | 2-bit codes × int8 A → i32, f32 | f16      | M5      |
 
 - **`Accum`** picks the compute type on half GEMMs: `Accum::F32` (widening, M4+,
   default), `Accum::F16` (`FEAT_SME_F16F16`, M5), `Accum::Bf16`
@@ -86,6 +87,15 @@ matching f16).
   accumulate-into-C.
 - **i8/i16 → f32 dequant** — `Dequant::new(scale)` or `.scale_per_n(&scales)`,
   then any epilogue (`matmul_i8_packed_dequant` / `matmul_i16_dequant`).
+- **2-bit weights** — `Q2Weights` (2-bit codes standing for four int8 values,
+  ternary −1/0/+1 by default, and an f32 scale per column and K-block) and
+  `matmul_q2` / `matmul_q2_ep`. Each row of A is quantized to int8 per block in
+  the call, and one LUTI2 turns 64 bytes of codes into one SDOT's 256 int8
+  weights, so a row runs at the int8 dot-product rate, about twice the Q4
+  GEMV's, from half its bytes. For models trained at two bits (BitNet b1.58,
+  llama.cpp's `TQ2_0`); `Q2Weights::new` takes their codes and scales as
+  stored, and `Q2Weights::quantize` re-encodes weights already on a 2-bit grid
+  exactly.
 - **Batched** — many small `C_i = A_i @ B_i` in one streaming session
   (`matmul_*_batched` / `_ep`).
 - **Pre-packed weights** — `prepack_*` once, reuse. Calls that skip it pack B
@@ -96,7 +106,10 @@ matching f16).
     from either `WeightLayout` (`OutIn` is PyTorch's `[out][in]`), with an
     optional bias. It takes f32 or f16 rows, writes f16, f32, or adds into an
     f32 residual stream (`accumulate`), and picks the kernel by row count: the
-    Q4 GEMV under 8 rows, an f16 panel built once on first use from 8.
+    Q4 GEMV under 8 rows, an f16 panel built once on first use from 8. 2-bit
+    layers (`Linear::quantize_q2`, `Linear::from_q2`,
+    `GatedLinear::quantize_q2`) run `matmul_q2` at every row count, so `Mlp`,
+    `SelfAttention` and `Block` take them as they are.
   - `GatedLinear`: the gate and up projections of a SwiGLU / GeGLU MLP as one
     matmul (interleaved 32 columns at a time) plus one NEON `act(g)·u` pass.
   - An input RMSNorm folds into the layer after it: `WeightLayout::scale_inputs`
@@ -232,6 +245,17 @@ eager by 13–50% at `m=16..256`, where eager's 32 MB of f16 stays cache-residen
 between calls, and is within 5% by 1024³. (`Linear` sidesteps this by unpacking
 once into an f16 panel for 8 rows and up.)
 
+| m = 1, µs (`examples/q2_bench`) | 1536×384 | 2048² | 4096² | 4096² ×8 matrices |
+| ------------------------------- | -------- | ----- | ----- | ----------------- |
+| Q4 GEMV                         | 1.3      | 15    | 50    | 99                |
+| 2-bit GEMV                      | 0.8      | 6.2   | 22    | 59                |
+| speedup                         | 1.7×     | 2.4×  | 2.3×  | 1.7×              |
+
+The 2-bit call includes quantizing its row of A. One matrix stays in the
+P-cluster's L2 between calls; eight 4096² sets stream from DRAM (32 MB of 2-bit
+codes against 75 MB of Q4), where the 2-bit path reads ~75 GB/s. 256-value
+blocks cost ~10% over one scale per column, 64-value blocks ~40%.
+
 |                  | 16³×256 | 32³×128 | 64³×64 | 32×128×64 ×64 | 96³×32 |
 | ---------------- | ------- | ------- | ------ | ------------- | ------ |
 | batched f16 µs   | 42      | 27      | 45     | 56            | 62     |
@@ -345,7 +369,7 @@ fc2.accumulate(&ff, &mut x, 1);
 ```
 
 Also: `matmul_{bf16,f32,f64,i16}`, `gemm_*`, `matmul_*_batched`,
-`matmul_i16_dequant`, `dequant_q4` / `matmul_q4`, optional
+`matmul_i16_dequant`, `dequant_q4` / `matmul_q4`, `matmul_q2`, optional
 `sme_gemm::candle::sme_matmul`. Caps: `sme_gemm::caps()`.
 
 **End to end.** `examples/shakespeare` runs nanoGPT shakespeare-char (10.7M
@@ -370,8 +394,8 @@ cargo install --path . --example shakespeare           # optional: `shakespeare`
 - **One SME unit per cluster.** Hot paths `dispatch_apply` M-tiles across both
   cluster units; small problems take a serial / direct-load path.
 - **Streaming mode, SVL=512.** Compiled `-mcpu=apple-m4`. M5 features
-  (`+sme-f16f16`, `+sme-b16b16`, `+sme-f64f64`, `+sme-i16i64`) are separate TUs
-  behind a runtime probe, so the M4 floor stays.
+  (`+sme-f16f16`, `+sme-b16b16`, `+sme-f64f64`, `+sme-i16i64`, `+sme2p1`) are
+  separate TUs behind a runtime probe, so the M4 floor stays.
 - **No stable Rust SME intrinsics** — kernels are C (`cc` + `arm_sme.h`).
 
 Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md).
