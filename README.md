@@ -401,7 +401,9 @@ tokenizer. On the CPU of a base M5 it generates 289 tok/s (tg128, one stream,
 ≥ 300 at short context); llama.cpp on the same machine and file runs 238 tok/s
 on the GPU (Metal) and 60 on the CPU, and its greedy output matches ours token
 for token. The weights stream at 71-80 GB/s against the P-cluster's ~83 GB/s
-limit:
+limit. Prompts are compute-bound and run the same one-row kernel five rows at
+a time: 690 tok/s (pp512) against llama.cpp's 3237 on the GPU and 423 on the
+CPU.
 
 ```sh
 examples/bonsai/fetch.sh                                   # once: the GGUF, 248 MB
