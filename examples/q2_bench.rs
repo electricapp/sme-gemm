@@ -8,7 +8,9 @@
 use std::time::Instant;
 
 use half::f16;
-use sme_gemm::{Q2Params, Q2Weights, Q4Weights, caps, matmul_q2, matmul_q4};
+use sme_gemm::{
+    Q1Weights, Q2Params, Q2Weights, Q4Weights, WeightLayout, caps, matmul_q1, matmul_q2, matmul_q4,
+};
 
 fn bytes(s: &mut u64, len: usize) -> Vec<u8> {
     (0..len)
@@ -41,7 +43,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     println!("{:?}\n{m} row(s)\n", caps());
-    println!("  n x k        sets | Q4 GEMV          | 2-bit GEMV       | speedup");
+    println!("  n x k        sets | Q4 GEMV          | 2-bit GEMV       | speedup | 1-bit GEMV");
     for &(n, k, sets) in &[
         (1536usize, 384usize, 1usize),
         (2048, 2048, 1),
@@ -64,11 +66,21 @@ fn main() {
             .map_or_else(Q2Params::default, Q2Params::new);
         let q2: Vec<Q2Weights> = (0..sets)
             .map(|_| {
-                let scales: Vec<f32> = bytes(&mut s, n * k.div_ceil(p.block()))
+                let scales: Vec<f16> = bytes(&mut s, n * k.div_ceil(p.block()))
                     .iter()
-                    .map(|&b| 0.01 + f32::from(b) * 1e-4)
+                    .map(|&b| f16::from_f32(0.01 + f32::from(b) * 1e-4))
                     .collect();
                 Q2Weights::new(&bytes(&mut s, (k * n).div_ceil(4)), &scales, n, k, p)
+            })
+            .collect();
+        let q1: Vec<Q1Weights> = (0..sets)
+            .map(|_| {
+                let scales: Vec<f16> = bytes(&mut s, n * k.div_ceil(p.block()))
+                    .iter()
+                    .map(|&b| f16::from_f32(0.01 + f32::from(b) * 1e-4))
+                    .collect();
+                let signs = bytes(&mut s, (k * n).div_ceil(8));
+                Q1Weights::new(&signs, &scales, WeightLayout::OutIn, n, k, p.block())
             })
             .collect();
         let a: Vec<f16> = bytes(&mut s, m * k)
@@ -79,15 +91,18 @@ fn main() {
         let calls = 64.max(sets * 8);
         let t4 = best(calls, |i| matmul_q4(&a, &q4[i % sets], &mut c, m));
         let t2 = best(calls, |i| matmul_q2(&a, &q2[i % sets], &mut c, m));
+        let t1 = best(calls, |i| matmul_q1(&a, &q1[i % sets], &mut c, m));
         let macs = (n * k) as f64;
-        let (b4, b2) = (macs * (0.5 + 2.0 / 32.0), macs * (0.25 + 4.0 / 256.0));
+        let (b4, b2) = (macs * (0.5 + 2.0 / 32.0), macs * (0.25 + 2.0 / 256.0));
         println!(
-            "  {n:>4} x {k:<4}  {sets:>3}  | {:>6.1} us {:>4.0} GB/s | {:>6.1} us {:>4.0} GB/s | {:.2}x",
+            "  {n:>4} x {k:<4}  {sets:>3}  | {:>6.1} us {:>4.0} GB/s | {:>6.1} us {:>4.0} GB/s | {:.2}x | {:>6.1} us {:>5.0} GMAC/s",
             t4 * 1e6,
             b4 / t4 / 1e9,
             t2 * 1e6,
             b2 / t2 / 1e9,
-            t4 / t2
+            t4 / t2,
+            t1 * 1e6,
+            macs * m as f64 / t1 / 1e9
         );
     }
 }

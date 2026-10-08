@@ -1,15 +1,23 @@
-// 2-bit path: C(f16) = A(f16) @ dequant(B), B kept 2-bit resident, int8
-// products (SME2 LUTI2 + SDOT; MOVAZ from SME2p1). Apple M5+.
+// 2-bit and 1-bit paths: C(f16) = A(f16) @ dequant(B), B kept 2- or 1-bit
+// resident, int8 products (SME2 LUTI2/LUTI4 + SDOT; MOVAZ from SME2p1). M5+.
 //
 // B is resident band-major: bands of Q2_BAND = 64 columns, and for each group
-// of four depths (a quad) a band holds 64 bytes, byte c holding column c's four
-// 2-bit codes (depth 4q+i at bits 2i). One 64-byte load and one LUTI2 x4 .B
-// turn a quad into 256 int8 weights -- four vectors, vector v holding columns
-// 16v..16v+15 four depths each -- which is exactly the first operand of one
-// indexed SDOT vg1x4. k is padded to kp, a multiple of 16; codes past k are
-// never weighted (A is zero there). `lut` holds the four int8 values the codes
-// map to: LUTI2 .B reads the low byte of ZT0's 32-bit entries 0-3.
-// Scales are [band][nbk][64] f32, one per (column, K-block).
+// of four depths (a quad) a band holds its 64 columns' codes. The expansion of
+// a quad is 256 int8 weights in four vectors, vector v holding columns
+// 16v..16v+15 four depths each -- exactly the first operand of one indexed
+// SDOT vg1x4:
+//   - 2-bit: 64 bytes a quad, byte c holding column c's four codes (depth 4q+i
+//     at bits 2i). One LUTI2 x4 .B expands a quad; `lut` holds the four int8
+//     values the codes map to, as LUTI2 .B reads the low byte of ZT0's 32-bit
+//     entries 0-3.
+//   - 1-bit: 32 bytes a quad, nibble c (low nibble first) holding column c's
+//     four signs (depth 4q+i at bit i, 1 for +1). One LUTI4 x4 .S expands a
+//     quad (half a vector): entry e of the table is the four bytes +-1 that
+//     nibble e stands for.
+// k is padded to kp, a multiple of 16; codes past k are never weighted (A is
+// zero there). Scales are [band][nbk][64] f16, one per (column, K-block), each
+// block's 64 interleaved so FCVT and FCVTLT widen them in column order: half h
+// of the 32 in vector v is column 32v + h/2 + 16(h%2).
 //
 // A is quantized per (row, K-block) before the kernel: s = amax/127 and
 // q = round_even(a * 127/amax), so every product is an exact int32 sum. At each
@@ -100,11 +108,11 @@ typedef struct {
     const int8_t *a8;
     const float *as;
     const uint8_t *codes;
-    const float *scales;
+    const f16 *scales;
     const uint32_t *lut;
     const ep_desc16 *ep;
     size_t n, kp, nbk, band_bytes, sc_per_band;
-    unsigned bshift;
+    unsigned bshift, bits;
 } q2_call;
 
 // Bands in a pass of `rows` rows: what fits ZA (below) at full chain count.
@@ -121,18 +129,36 @@ static inline size_t q2_cap(size_t rows) {
 #define Q2_TOT(r, j) ((uint32_t)((r) * Q2B + (j)))
 #define Q2_SUM(r, j, c, s) ((uint32_t)(Q2R * Q2B + (((s) * Q2C + (c)) * Q2R + (r)) * Q2B + (j)))
 
+// A step's codes for band j: 256 bytes at 2 bits, 128 at 1 bit.
 #define Q2_LD(j)                                                                                   \
     do {                                                                                           \
         if (Q2B > (j)) {                                                                           \
             lo##j = svld1_u8_x2(pc, cb + (j) * band_bytes);                                        \
-            hi##j = svld1_u8_x2(pc, cb + (j) * band_bytes + 128);                                  \
+            if (Q2W == 2) hi##j = svld1_u8_x2(pc, cb + (j) * band_bytes + 128);                    \
         }                                                                                          \
     } while (0)
-// Quad i (0-3) of the step for band j: one LUTI2, one SDOT per row.
+// The same step's lines of band j of the next pass, one pass (Q2B bands) ahead.
+// One core's SME streams ~62 GB/s from DRAM on its own and ~83 (the P-cluster's
+// limit) with a prefetch 32 KB or more ahead; a pass is 48 KB of a 2048-deep
+// 1-bit matrix.
+#define Q2_PF(j)                                                                                   \
+    do {                                                                                           \
+        if (Q2B > (j) && (j) < npf) {                                                              \
+            const uint8_t *f_ = cb + (Q2B + (j)) * band_bytes;                                     \
+            svprfb(p8, f_, SV_PLDL2STRM);                                                          \
+            if (Q2W == 2) svprfb(p8, f_ + 128, SV_PLDL2STRM);                                      \
+        }                                                                                          \
+    } while (0)
+// Quad i (0-3) of the step for band j: one LUTI, one SDOT per row.
 #define Q2_QJ(i, h, j)                                                                             \
     do {                                                                                           \
         if (Q2B > (j)) {                                                                           \
-            svint8x4_t w_ = svluti2_lane_zt_s8_x4(0, svget2(h##j, (i) & 1), 0);                    \
+            svint8x4_t w_;                                                                         \
+            if (Q2W == 2)                                                                          \
+                w_ = svluti2_lane_zt_s8_x4(0, svget2(h##j, (i) & 1), 0);                           \
+            else                                                                                   \
+                w_ = svreinterpret_s8_s32_x4(                                                      \
+                    svluti4_lane_zt_s32_x4(0, svget2(lo##j, (i) >> 1), (i) & 1));                  \
             uint32_t g_ = Q2_SUM(0, j, (i) % Q2C, s);                                              \
             svdot_lane_za32_s8_vg1x4(g_, w_, aq0, (i));                                            \
             if (Q2R > 1) svdot_lane_za32_s8_vg1x4(g_ + Q2B, w_, aq1, (i));                         \
@@ -162,11 +188,14 @@ static inline size_t q2_cap(size_t rows) {
                                    svadd_s32_x(p32, svget4(t_, 2), svget4(u_, 2)),                 \
                                    svadd_s32_x(p32, svget4(t_, 3), svget4(u_, 3)));                \
                 }                                                                                  \
+                const f16 *sp_ = scales + (b0 + j_) * sc_per_band + (blk) * Q2_BAND;               \
+                if (j_ < npf) svprfb(p8, sp_ + Q2B * sc_per_band, SV_PLDL2STRM);                   \
+                svfloat16x2_t h_ = svld1_f16_x2(pc16, sp_);                                        \
                 svfloat32x4_t w_ =                                                                 \
-                    svld1_f32_x4(pc32, scales + (b0 + j_) * sc_per_band + (blk) * Q2_BAND);        \
-                w_ = svcreate4(                                                                    \
-                    svmul_f32_x(p32, svget4(w_, 0), sa_), svmul_f32_x(p32, svget4(w_, 1), sa_),    \
-                    svmul_f32_x(p32, svget4(w_, 2), sa_), svmul_f32_x(p32, svget4(w_, 3), sa_));   \
+                    svcreate4(svmul_f32_x(p32, svcvt_f32_f16_x(p32, svget2(h_, 0)), sa_),          \
+                              svmul_f32_x(p32, svcvtlt_f32_f16_x(p32, svget2(h_, 0)), sa_),        \
+                              svmul_f32_x(p32, svcvt_f32_f16_x(p32, svget2(h_, 1)), sa_),          \
+                              svmul_f32_x(p32, svcvtlt_f32_f16_x(p32, svget2(h_, 1)), sa_));       \
                 svmla_za32_f32_vg1x4(Q2_TOT(r_, j_), svcvt_f32_s32_x4(t_), w_);                    \
             }                                                                                      \
         }                                                                                          \
@@ -192,10 +221,13 @@ static inline size_t q2_cap(size_t rows) {
     } while (0)
 #define EP_Q2_RD(s) acc
 
-// One pass: rows r0.. (RR of them) by bands b0.. (BB of them), all of K.
-#define Q2_PASS(RR, BB)                                                                            \
+// One pass: rows r0.. (RR of them) by bands b0.. (BB of them), all of K, with
+// WW-bit codes.
+#define Q2_PASS(RR, BB, WW)                                                                        \
     do {                                                                                           \
-        enum { Q2R = (RR), Q2B = (BB), Q2C = (RR) * (BB) * 5 <= 16 ? 2 : 1 };                      \
+        enum { Q2R = (RR), Q2B = (BB), Q2C = (RR) * (BB) * 5 <= 16 ? 2 : 1, Q2W = (WW) };          \
+        /* Bands of the next pass to prefetch: none after the last. */                             \
+        size_t npf = b_hi - b0 > Q2B ? b_hi - b0 - Q2B : 0;                                        \
         svzero_za();                                                                               \
         for (size_t bk = 0; bk < nbk; bk++) {                                                      \
             uint32_t s = (uint32_t)(bk & 1);                                                       \
@@ -203,7 +235,7 @@ static inline size_t q2_cap(size_t rows) {
                    d1 = d0 + ((size_t)1 << bshift) < kp ? d0 + ((size_t)1 << bshift) : kp;         \
             for (size_t d = d0; d < d1; d += 16) {                                                 \
                 const int8_t *ar = a8 + r0 * kp + d;                                               \
-                const uint8_t *cb = codes + b0 * band_bytes + d * 16;                              \
+                const uint8_t *cb = codes + b0 * band_bytes + d * 8 * Q2W;                         \
                 svint8_t aq0 = svld1rq_s8(p8, ar), aq1, aq2, aq3, aq4;                             \
                 if (Q2R > 1) aq1 = svld1rq_s8(p8, ar + kp);                                        \
                 if (Q2R > 2) aq2 = svld1rq_s8(p8, ar + 2 * kp);                                    \
@@ -213,6 +245,9 @@ static inline size_t q2_cap(size_t rows) {
                 Q2_LD(0);                                                                          \
                 Q2_LD(1);                                                                          \
                 Q2_LD(2);                                                                          \
+                Q2_PF(0);                                                                          \
+                Q2_PF(1);                                                                          \
+                Q2_PF(2);                                                                          \
                 Q2_Q(0, lo);                                                                       \
                 Q2_Q(1, lo);                                                                       \
                 Q2_Q(2, hi);                                                                       \
@@ -230,6 +265,36 @@ static inline size_t q2_cap(size_t rows) {
             }                                                                                      \
     } while (0)
 
+// The pass for `rows` rows and B bands, the row count and band count constant
+// in each inlined copy.
+#define Q2_PASSES(WW)                                                                              \
+    switch (rows * 4 + B) {                                                                        \
+        case 1 * 4 + 3:                                                                            \
+            Q2_PASS(1, 3, WW);                                                                     \
+            break;                                                                                 \
+        case 1 * 4 + 2:                                                                            \
+            Q2_PASS(1, 2, WW);                                                                     \
+            break;                                                                                 \
+        case 1 * 4 + 1:                                                                            \
+            Q2_PASS(1, 1, WW);                                                                     \
+            break;                                                                                 \
+        case 2 * 4 + 2:                                                                            \
+            Q2_PASS(2, 2, WW);                                                                     \
+            break;                                                                                 \
+        case 2 * 4 + 1:                                                                            \
+            Q2_PASS(2, 1, WW);                                                                     \
+            break;                                                                                 \
+        case 3 * 4 + 1:                                                                            \
+            Q2_PASS(3, 1, WW);                                                                     \
+            break;                                                                                 \
+        case 4 * 4 + 1:                                                                            \
+            Q2_PASS(4, 1, WW);                                                                     \
+            break;                                                                                 \
+        default:                                                                                   \
+            Q2_PASS(5, 1, WW);                                                                     \
+            break;                                                                                 \
+    }
+
 // Rows r0..r0+rows (at most Q2_MAXR) over bands [b_lo, b_hi), in balanced
 // passes of up to q2_cap(rows) bands.
 __arm_locally_streaming __arm_new("za", "zt0") static void run_q2_gemv(const q2_call *c, size_t r0,
@@ -239,14 +304,14 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q2_gemv(const q2_
     const int8_t *a8 = c->a8;
     const float *as = c->as;
     const uint8_t *codes = c->codes;
-    const float *scales = c->scales;
+    const f16 *scales = c->scales;
     size_t n = c->n, kp = c->kp, nbk = c->nbk, band_bytes = c->band_bytes;
     size_t sc_per_band = c->sc_per_band;
     unsigned bshift = c->bshift;
     const EpNode *nodes = c->ep ? c->ep->nodes : NULL;
     uint32_t n_nodes = c->ep ? c->ep->n_nodes : 0;
     svbool_t p8 = svptrue_b8(), p16 = svptrue_b16(), p32 = svptrue_b32();
-    svcount_t pc = svptrue_c8(), pc32 = svptrue_c32();
+    svcount_t pc = svptrue_c8(), pc16 = svptrue_c16();
     svfloat16_t vb = svdup_n_f16((f16)1.0f);
     svfloat16_t va = svdup_n_f16((f16)0.0f);
     svldr_zt(0, c->lut);
@@ -255,34 +320,14 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q2_gemv(const q2_
     size_t passes = (nbands + cap - 1) / cap, per = (nbands + passes - 1) / passes;
     for (size_t b0 = b_lo; b0 < b_hi; b0 += per) {
         size_t B = b_hi - b0 < per ? b_hi - b0 : per;
-        switch (rows * 4 + B) {
-            case 1 * 4 + 3:
-                Q2_PASS(1, 3);
-                break;
-            case 1 * 4 + 2:
-                Q2_PASS(1, 2);
-                break;
-            case 1 * 4 + 1:
-                Q2_PASS(1, 1);
-                break;
-            case 2 * 4 + 2:
-                Q2_PASS(2, 2);
-                break;
-            case 2 * 4 + 1:
-                Q2_PASS(2, 1);
-                break;
-            case 3 * 4 + 1:
-                Q2_PASS(3, 1);
-                break;
-            case 4 * 4 + 1:
-                Q2_PASS(4, 1);
-                break;
-            default:
-                Q2_PASS(5, 1);
-                break;
+        if (c->bits == 1) {
+            Q2_PASSES(1)
+        } else {
+            Q2_PASSES(2)
         }
     }
 }
+#undef Q2_PASSES
 #undef Q2_PASS
 #undef Q2_ST
 #undef EP_Q2_RD
@@ -290,15 +335,17 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q2_gemv(const q2_
 #undef Q2_Q
 #undef Q2_QJ
 #undef Q2_LD
+#undef Q2_PF
 #undef Q2_SUM
 #undef Q2_TOT
 
 // The GEMM: rows in balanced groups of at most Q2_MAXR, each a GEMV over all
-// bands; spread over the cores as (group, pass-sized band chunk) items unless
-// the call is small. `block` is the K-block size (a power of two, >= 16).
+// bands; several groups spread over the cores as (group, pass-sized band
+// chunk) items unless the call is small. `block` is the K-block size (a power of two, >= 16);
+// `bits` is 2 (with `codebook`) or 1.
 static int q2_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
-                   const uint8_t *codes, const float *scales, const int8_t *codebook, size_t block,
-                   const ep_desc16 *ep) {
+                   const uint8_t *codes, const uint16_t *scales, unsigned bits,
+                   const int8_t *codebook, size_t block, const ep_desc16 *ep) {
     if (m == 0 || n == 0) return 0;
     if (block < 16 || (block & (block - 1)) != 0) return -1;
     unsigned bshift = 0;
@@ -313,25 +360,34 @@ static int q2_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
     float *as = (float *)(void *)(scratch + s_off);
     q2_quant(a8, as, (const f16 *)lhs, m, k, kp, block, nbk);
     uint32_t lut[16] __attribute__((aligned(64))) = {0};
-    for (int i = 0; i < 4; i++)
-        lut[i] = (uint8_t)codebook[i];
+    if (bits == 2) {
+        for (int i = 0; i < 4; i++)
+            lut[i] = (uint8_t)codebook[i];
+    } else {
+        for (uint32_t e = 0; e < 16; e++)
+            for (uint32_t i = 0; i < 4; i++)
+                lut[e] |= (e >> i & 1 ? 0x01u : 0xffu) << (8 * i);
+    }
     q2_call c = {.dst = (f16 *)dst,
                  .a8 = a8,
                  .as = as,
                  .codes = codes,
-                 .scales = scales,
+                 .scales = (const f16 *)scales,
                  .lut = lut,
                  .ep = ep,
                  .n = n,
                  .kp = kp,
                  .nbk = nbk,
-                 .band_bytes = ep_cmul(kp, 16),
+                 .band_bytes = ep_cmul(kp, 8 * bits),
                  .sc_per_band = ep_cmul(nbk, Q2_BAND),
-                 .bshift = bshift};
+                 .bshift = bshift,
+                 .bits = bits};
     size_t groups = (m + Q2_MAXR - 1) / Q2_MAXR;
     size_t chunk = q2_cap((m + groups - 1) / groups);
     size_t chunks = (n_bands + chunk - 1) / chunk;
-    if (ep_flops(m, n, k) < (1u << 21) || groups * chunks < 3) {
+    // One group runs on the calling thread: the unit streams as fast from one
+    // core as from several, and dispatching costs more than it gains.
+    if (groups == 1 || ep_flops(m, n, k) < (1u << 21) || groups * chunks < 3) {
         for (size_t g = 0; g < groups; g++) {
             size_t g0 = m * g / groups, g1 = m * (g + 1) / groups;
             run_q2_gemv(&c, g0, g1 - g0, 0, n_bands);
@@ -351,15 +407,30 @@ static int q2_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
 // A trailing gelu/silu/sigmoid/tanh runs as a NEON pass over the output after
 // the kernel (neon_act.h), as on the Q4 path.
 int gemm_sme_f16_q2(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
-                    const uint8_t *codes, const float *scales, const int8_t *codebook, size_t block,
-                    const ep_desc16 *ep);
+                    const uint8_t *codes, const uint16_t *scales, const int8_t *codebook,
+                    size_t block, const ep_desc16 *ep);
 int gemm_sme_f16_q2(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
-                    const uint8_t *codes, const float *scales, const int8_t *codebook, size_t block,
+                    const uint8_t *codes, const uint16_t *scales, const int8_t *codebook,
+                    size_t block, const ep_desc16 *ep) {
+    ep_desc16 rest;
+    uint32_t act = na_split(ep, &rest);
+    const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
+    int rc = q2_core(m, n, k, dst, lhs, codes, scales, 2, codebook, block, kep);
+    if (rc == 0 && act) na_post_f16(dst, m, n, (long)n, 1, act);
+    return rc;
+}
+
+// The 1-bit GEMM: weights scale * (+1 or -1), signs packed as above.
+int gemm_sme_f16_q1(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
+                    const uint8_t *signs, const uint16_t *scales, size_t block,
+                    const ep_desc16 *ep);
+int gemm_sme_f16_q1(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
+                    const uint8_t *signs, const uint16_t *scales, size_t block,
                     const ep_desc16 *ep) {
     ep_desc16 rest;
     uint32_t act = na_split(ep, &rest);
     const ep_desc16 *kep = na_kernel_ep(ep, act, &rest);
-    int rc = q2_core(m, n, k, dst, lhs, codes, scales, codebook, block, kep);
+    int rc = q2_core(m, n, k, dst, lhs, signs, scales, 1, NULL, block, kep);
     if (rc == 0 && act) na_post_f16(dst, m, n, (long)n, 1, act);
     return rc;
 }

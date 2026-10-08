@@ -8,8 +8,8 @@ use half::f16;
 
 use crate::element::sealed;
 use crate::{
-    Epilogue, Packed, Q2Params, Q2Weights, Q4Params, Q4Weights, WeightLayout, caps, matmul_q2_ep,
-    matmul_q4_ep, prepack, prepack_f16,
+    Epilogue, Packed, Q1Weights, Q2Params, Q2Weights, Q4Params, Q4Weights, WeightLayout, caps,
+    matmul_q1_ep, matmul_q2_ep, matmul_q4_ep, prepack, prepack_f16,
 };
 
 /// The float types the model-level helpers take and give: `f32` and `f16`.
@@ -99,9 +99,10 @@ thread_local! {
 /// it. The two give the same products: the Q4 MOPA path is bit for bit the
 /// eager dequant plus the dense GEMM.
 ///
-/// 2-bit weights ([`Linear::quantize_q2`], [`Linear::from_q2`]) stay resident
-/// as [`Q2Weights`] and run [`matmul_q2`](crate::matmul_q2) at every row count,
-/// with int8 activations: for models trained at two bits.
+/// 2-bit and 1-bit weights ([`Linear::from_q2`], [`Linear::from_q1`], or
+/// quantized from f32) stay resident as [`Q2Weights`] / [`Q1Weights`] and run
+/// [`matmul_q2`](crate::matmul_q2) / [`matmul_q1`](crate::matmul_q1) at every
+/// row count, with int8 activations: for models trained at that precision.
 ///
 /// Inputs are f16 or f32 ([`ModelFloat`]); outputs f16 ([`forward`]), f32
 /// ([`forward_f32`]), or added into an f32 residual stream ([`accumulate`]). A
@@ -139,6 +140,7 @@ enum Weights {
         panel: OnceLock<Packed<f16>>,
     },
     Q2(Q2Weights),
+    Q1(Q1Weights),
     F16(Packed<f16>),
 }
 
@@ -194,6 +196,26 @@ impl Linear {
     pub const fn from_q2(q2: Q2Weights) -> Self {
         Self {
             w: Weights::Q2(q2),
+            bias: None,
+            rms_eps: None,
+        }
+    }
+
+    /// Quantizes f32 weights to 1 bit with `block`-value scale blocks; see
+    /// [`Q1Weights::quantize`].
+    ///
+    /// # Panics
+    /// Panics if `w.len() != n * k`, or `block` as [`Q1Weights::new`].
+    #[must_use]
+    pub fn quantize_q1(w: &[f32], layout: WeightLayout, n: usize, k: usize, block: usize) -> Self {
+        Self::from_q1(Q1Weights::quantize(w, layout, n, k, block))
+    }
+
+    /// Wraps weights that are already 1-bit packed.
+    #[must_use]
+    pub const fn from_q1(q1: Q1Weights) -> Self {
+        Self {
+            w: Weights::Q1(q1),
             bias: None,
             rms_eps: None,
         }
@@ -258,6 +280,7 @@ impl Linear {
         match &self.w {
             Weights::Q4 { q4, .. } => q4.n(),
             Weights::Q2(q2) => q2.n(),
+            Weights::Q1(q1) => q1.n(),
             Weights::F16(p) => p.n(),
         }
     }
@@ -268,6 +291,7 @@ impl Linear {
         match &self.w {
             Weights::Q4 { q4, .. } => q4.k(),
             Weights::Q2(q2) => q2.k(),
+            Weights::Q1(q1) => q1.k(),
             Weights::F16(p) => p.k(),
         }
     }
@@ -277,7 +301,7 @@ impl Linear {
     pub const fn q4(&self) -> Option<&Q4Weights> {
         match &self.w {
             Weights::Q4 { q4, .. } => Some(q4),
-            Weights::Q2(_) | Weights::F16(_) => None,
+            Weights::Q2(_) | Weights::Q1(_) | Weights::F16(_) => None,
         }
     }
 
@@ -286,7 +310,7 @@ impl Linear {
     pub const fn q2(&self) -> Option<&Q2Weights> {
         match &self.w {
             Weights::Q2(q2) => Some(q2),
-            Weights::Q4 { .. } | Weights::F16(_) => None,
+            Weights::Q4 { .. } | Weights::Q1(_) | Weights::F16(_) => None,
         }
     }
 
@@ -486,6 +510,7 @@ impl Linear {
             }
             Weights::Q4 { q4, .. } => matmul_q4_ep(x, q4, y, m, ep),
             Weights::Q2(q2) => matmul_q2_ep(x, q2, y, m, ep),
+            Weights::Q1(q1) => matmul_q1_ep(x, q1, y, m, ep),
             Weights::F16(p) => packed(p, y),
         }
     }
@@ -613,6 +638,19 @@ impl GatedLinear {
         Self {
             inner: Linear::quantize_q2(&w, WeightLayout::InOut, 2 * n, k, p),
             gate,
+        }
+    }
+
+    /// Gate and up weights that are already 1-bit packed (`n` outputs by `k`
+    /// inputs each, the same block size), interleaved exactly.
+    ///
+    /// # Panics
+    /// Panics if the two differ in shape or block size.
+    #[must_use]
+    pub fn from_q1(gate: &Q1Weights, up: &Q1Weights, act: Gate) -> Self {
+        Self {
+            inner: Linear::from_q1(Q1Weights::interleave(gate, up)),
+            gate: act,
         }
     }
 

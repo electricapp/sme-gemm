@@ -425,26 +425,34 @@ activation and GLU passes, the GEMV's broadcast A — is stored with `STNP`
 has not just read, so those passes write out of place. Kernels whose input may
 come from user code touch it up front (§2.8).
 
-### 2.15 2-bit weights: LUTI2 into SDOT
+### 2.15 2-bit and 1-bit weights: LUTI into SDOT
 
-`Q2Weights` holds a 2-bit code per weight, four int8 values the codes stand for
-(ternary by default) and an f32 scale per (column, K-block). Its kernel
-(`csrc/gemm_q2.c`) computes with int8 products rather than f16 ones, because
-the expansion is cheap enough to let them pay:
+`Q2Weights` holds a 2-bit code per weight and four int8 values the codes stand
+for (ternary by default); `Q1Weights` holds a sign bit per weight (llama.cpp's
+`Q1_0`). Both keep an f16 scale per (column, K-block), and one kernel
+(`csrc/gemm_q2.c`) runs both, computing with int8 products rather than f16
+ones, because the expansion is cheap enough to let them pay:
 
 - **Why int8.** A lane-indexed int8 SDOT vg1x4 is 256 multiply-adds, twice the
   f16 FMLA lane's 128, at the same issue rate. Feeding it 4-bit codes takes two
   LUTI4 x2 .B per SDOT, which costs more than SDOT saves, so Q4 stays f16. One
   LUTI2 x4 .B turns a whole 64-byte register of 2-bit codes into the 256 bytes
   one SDOT takes, so a one-row 2-bit GEMV runs at about twice the Q4 GEMV's rate
-  with the weights in L2, and reads half its bytes from DRAM.
-- **Layout.** A band is 64 columns, and for each quad of depths it holds 64
-  bytes, byte c holding column c's four codes. LUTI2's output vector v is then
-  columns 16v..16v+15 four depths each, SDOT's first operand as it stands, and
-  the lane-indexed SDOT takes four depths of A from a 16-byte replicating load.
-  Two quads of a band are one 128-byte line. LUTI2 .B reads the low byte of
-  ZT0's 32-bit entries 0-3, which hold the codebook. k pads to 16 depths, with
-  zero activations past k.
+  with the weights in L2, and reads half its bytes from DRAM. At one bit, a
+  4-bit index is one column's four signs, and LUTI4 x4 .S looks up 32-bit
+  entries of four ±1 bytes: one LUTI4 per SDOT again, from half the bytes.
+  (Ternary codes cannot go below two bits here: four trits have 81 states, and
+  no M5 LUT takes more than a 4-bit index.)
+- **Layout.** A band is 64 columns, and for each quad of depths it holds the
+  columns' codes: 64 bytes at two bits, byte c holding column c's four codes;
+  32 bytes at one bit, nibble c holding its four signs. The expansion's vector
+  v is then columns 16v..16v+15 four depths each, SDOT's first operand as it
+  stands, and the lane-indexed SDOT takes four depths of A from a 16-byte
+  replicating load. LUTI reads ZT0's 32-bit entries, the low byte at 8-bit
+  results: the codebook in entries 0-3, or the sixteen sign patterns. k pads to
+  16 depths, with zero activations past k. Each block's 64 f16 scales are stored
+  interleaved so FCVT (even halves) and FCVTLT (odd) widen them into four f32
+  vectors in column order.
 - **Activations.** Before the kernel, NEON quantizes each row of A per K-block,
   `s = amax/127` and `q = round_even(a * 127/amax)`, so every block sum is an
   exact int32.
@@ -456,12 +464,24 @@ the expansion is cheap enough to let them pay:
   chains per (row, band) uses R·B·(2C+1) of the 16 vg1x4 groups: one row runs 3
   bands with alternate quads in two chains, more rows fewer bands, up to 5 rows.
   Larger m runs as balanced groups of at most 5 rows, each a GEMV of its own:
-  2-bit layers serve generation, where m is small, and keep that rate instead
-  of switching to a MOPA path at larger m.
+  low-bit layers serve generation, where m is small, and keep that rate instead
+  of switching to a MOPA path at larger m. A fold costs about a quarter of a
+  128-deep block's SDOT time, which is why small blocks run slower.
+- **Streaming.** A one-row call is bound by reading its weights, and on M5 the
+  P-cluster as a whole reads DRAM at ~83 GB/s, one core's SME unit at ~62 on
+  its own. Each step therefore issues a `PRFB` for the same depths of the next
+  pass's bands, one pass (48 KB of a 2048-deep 1-bit matrix) ahead, and the
+  fold does the same for the next pass's scales; that takes the unit to the
+  cluster's limit. One row group runs on the calling thread: a second core
+  issuing to the same unit adds nothing, and dispatching costs more than it
+  gains. Having pool workers read the weights instead, the current matrix's or
+  the next one's, measured slower in every arrangement tried: the call then
+  waits on them. The E-cluster's DRAM link is separate (~100 GB/s), but its SME
+  unit runs this kernel at ~15 GB/s, too little to pay for splitting a call.
 - **Bits.** With integer sums and a fixed fold order an output depends only on
   its own column, not on m, the passes, or how a call splits over cores, and
-  `src/kernels/q2/matmul.rs` computes the same bits in Rust: the fallback, and
-  the unit tests' oracle.
+  `src/kernels/lowbit/matmul.rs` computes the same bits in Rust: the fallback,
+  and the unit tests' oracle.
 
 ## 3. Translation units and feature gating
 
@@ -554,9 +574,9 @@ P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
   `EpDescF64`). Apple aarch64 only.
 - **`kernels/`** — public per-dtype entry points: `f16.rs`, `bf16.rs`, `f32.rs`,
   `f64.rs`, `int/` (`i8.rs`, `i16.rs`), `q4/` (`weights.rs` builds and
-  dequantizes `Q4Weights`, `matmul.rs` the GEMM entry points) and `q2/`
-  (`weights.rs` packs and quantizes `Q2Weights`, `matmul.rs` the entry points
-  and the bit-exact reference, §2.15). Each wires the
+  dequantizes `Q4Weights`, `matmul.rs` the GEMM entry points) and `lowbit/`
+  (`q2.rs` and `q1.rs` pack and quantize `Q2Weights` / `Q1Weights`, `matmul.rs`
+  the entry points and the bit-exact reference, §2.15). Each wires the
   worth-it check, the FFI call and the scalar fallback. `attention.rs` and
   `attention_half.rs` hold the flash-attention drivers, `kv_attention.rs` the
   KV-cache attention (§2.7).
@@ -575,12 +595,12 @@ P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
   `half` crate converts one value per inline-asm `FCVT`).
 - **`linear.rs`, `layout.rs`, `nn.rs`** — the model-level layer over the
   kernels. `Linear` holds a layer's weights (Q4 with a lazily built f16 panel,
-  2-bit, or f16) and an optional bias, and routes each call by row count: the
-  Q4 GEMV below 8 rows, where reading the weights is the cost, and the dense f16
-  GEMM on the panel from 8, where the Q4 MOPA path would unpack every block
-  again per call (the two agree bit for bit). 2-bit weights run their GEMM at
-  every row count (§2.15). Its bias goes in front of any caller
-  epilogue, where it folds into the accumulator; with `rms_norm_input` a per-row
+  2-bit, 1-bit, or f16) and an optional bias, and routes each call by row
+  count: the Q4 GEMV below 8 rows, where reading the weights is the cost, and
+  the dense f16 GEMM on the panel from 8, where the Q4 MOPA path would unpack
+  every block again per call (the two agree bit for bit). 2-bit and 1-bit
+  weights run their GEMM at every row count (§2.15). Its bias goes in front of
+  any caller epilogue, where it folds into the accumulator; with `rms_norm_input` a per-row
   `1/rms(x)` goes in front of that (the norm's weight is folded into W by
   `WeightLayout::scale_inputs`). `GatedLinear` stores gate and up interleaved in
   whole 32-column tiles of one `Linear`, so each column quantizes and
@@ -718,14 +738,14 @@ regresses the relu store, so bias+activation keeps the in-store add.
 | suite                  | count | covers                                                        |
 | ---------------------- | ----- | ------------------------------------------------------------- |
 | `tests/correctness/`   | 139   | dtypes, shapes, layouts, packed/batched, epilogue graphs      |
-| doctests               | 20    | the documented API examples                                   |
+| doctests               | 21    | the documented API examples                                   |
 | `tests/validation.rs`  | 19    | pre-FFI footprint asserts and panic contracts                 |
 | `tests/proptest.rs`    | 17    | randomized shapes/strides/operands against the oracle         |
-| unit tests             | 15    | in-module invariants; the 2-bit kernel against its reference |
+| unit tests             | 17    | in-module invariants; the 2-bit kernel against its reference |
 | `tests/guard_page.rs`  | 13    | reads past the declared footprint fault on a `PROT_NONE` page |
 | `tests/concurrency.rs` | 4     | one GEMM from many threads, bit-identical, across branches    |
 
-227 total. `tests/correctness/main.rs` holds the shared oracles and shape
+230 total. `tests/correctness/main.rs` holds the shared oracles and shape
 tables: `SIZES`, and `TAIL_SIZES` for shapes that clear the flop floor and have
 ragged M/N/K tails, where tail-predicate handling is exercised.
 `PROPTEST_CASES=N` widens the random sweep for a soak run.

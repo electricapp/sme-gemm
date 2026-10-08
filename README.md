@@ -65,6 +65,7 @@ matching f16).
 | **i16→i64** | i64 (SMOPA)                     | i64      | M5      |
 | **Q4**      | 4-bit block-quant → f16 or bf16 | f16/bf16 | M5      |
 | **2-bit**   | 2-bit codes × int8 A → i32, f32 | f16      | M5      |
+| **1-bit**   | ±1 signs × int8 A → i32, f32    | f16      | M5      |
 
 - **`Accum`** picks the compute type on half GEMMs: `Accum::F32` (widening, M4+,
   default), `Accum::F16` (`FEAT_SME_F16F16`, M5), `Accum::Bf16`
@@ -87,15 +88,18 @@ matching f16).
   accumulate-into-C.
 - **i8/i16 → f32 dequant** — `Dequant::new(scale)` or `.scale_per_n(&scales)`,
   then any epilogue (`matmul_i8_packed_dequant` / `matmul_i16_dequant`).
-- **2-bit weights** — `Q2Weights` (2-bit codes standing for four int8 values,
-  ternary −1/0/+1 by default, and an f32 scale per column and K-block) and
-  `matmul_q2` / `matmul_q2_ep`. Each row of A is quantized to int8 per block in
-  the call, and one LUTI2 turns 64 bytes of codes into one SDOT's 256 int8
-  weights, so a row runs at the int8 dot-product rate, about twice the Q4
-  GEMV's, from half its bytes. For models trained at two bits (BitNet b1.58,
-  llama.cpp's `TQ2_0`); `Q2Weights::new` takes their codes and scales as
-  stored, and `Q2Weights::quantize` re-encodes weights already on a 2-bit grid
-  exactly.
+- **2-bit and 1-bit weights** — `Q2Weights` (2-bit codes standing for four
+  int8 values, ternary −1/0/+1 by default) and `Q1Weights` (a sign bit per
+  weight: llama.cpp's `Q1_0`, `PrismML`'s 1-bit Bonsai), each with an f16 scale
+  per column and K-block, and `matmul_q2` / `matmul_q1` (`_ep` for an
+  epilogue). Each row of A is quantized to int8 per block in the call, and one
+  LUTI2 (or LUTI4, at one bit) turns 64 (or 32) bytes of codes into one SDOT's
+  256 int8 weights, so a row runs at the int8 dot-product rate, about twice the
+  Q4 GEMV's, from a half (or a quarter) of its bytes; the kernel prefetches a
+  pass ahead, which takes one SME unit to the P-cluster's DRAM limit. For
+  models trained at that precision (BitNet b1.58, `TQ2_0`, Bonsai):
+  `Q2Weights::new` / `Q1Weights::new` take their codes and scales as stored,
+  and `quantize` re-encodes weights already on such a grid exactly.
 - **Batched** — many small `C_i = A_i @ B_i` in one streaming session
   (`matmul_*_batched` / `_ep`).
 - **Pre-packed weights** — `prepack_*` once, reuse. Calls that skip it pack B
@@ -107,9 +111,10 @@ matching f16).
     optional bias. It takes f32 or f16 rows, writes f16, f32, or adds into an
     f32 residual stream (`accumulate`), and picks the kernel by row count: the
     Q4 GEMV under 8 rows, an f16 panel built once on first use from 8. 2-bit
-    layers (`Linear::quantize_q2`, `Linear::from_q2`,
-    `GatedLinear::quantize_q2`) run `matmul_q2` at every row count, so `Mlp`,
-    `SelfAttention` and `Block` take them as they are.
+    and 1-bit layers (`Linear::from_q2` / `from_q1` or `quantize_q2` /
+    `quantize_q1`, `GatedLinear::quantize_q2` / `from_q1`) run their GEMM at
+    every row count, so `Mlp`, `SelfAttention` and `Block` take them as they
+    are.
   - `GatedLinear`: the gate and up projections of a SwiGLU / GeGLU MLP as one
     matmul (interleaved 32 columns at a time) plus one NEON `act(g)·u` pass.
   - An input RMSNorm folds into the layer after it: `WeightLayout::scale_inputs`
@@ -245,16 +250,17 @@ eager by 13–50% at `m=16..256`, where eager's 32 MB of f16 stays cache-residen
 between calls, and is within 5% by 1024³. (`Linear` sidesteps this by unpacking
 once into an f16 panel for 8 rows and up.)
 
-| m = 1, µs (`examples/q2_bench`) | 1536×384 | 2048² | 4096² | 4096² ×8 matrices |
-| ------------------------------- | -------- | ----- | ----- | ----------------- |
-| Q4 GEMV                         | 1.3      | 15    | 50    | 99                |
-| 2-bit GEMV                      | 0.8      | 6.2   | 22    | 59                |
-| speedup                         | 1.7×     | 2.4×  | 2.3×  | 1.7×              |
+| m = 1, µs (`examples/q2_bench`)  | 1536×384 | 2048² | 4096² | 4096² ×8 matrices |
+| -------------------------------- | -------- | ----- | ----- | ----------------- |
+| Q4 GEMV                          | 1.3      | 13    | 47    | 94                |
+| 2-bit GEMV (256-value blocks)    | 0.8      | 7.8   | 24    | 59                |
+| 1-bit GEMV (128-value, `Q1_0`)   | 0.9      | 7.6   | 26    | 28 ¹              |
 
-The 2-bit call includes quantizing its row of A. One matrix stays in the
+The low-bit calls include quantizing their row of A. One matrix stays in the
 P-cluster's L2 between calls; eight 4096² sets stream from DRAM (32 MB of 2-bit
-codes against 75 MB of Q4), where the 2-bit path reads ~75 GB/s. 256-value
-blocks cost ~10% over one scale per column, 64-value blocks ~40%.
+codes, 75 MB of Q4), where the 2-bit path reads ~73 GB/s. Small blocks cost
+fold time: against one scale per column, 256-value blocks run ~10% slower and
+64-value ones ~40%. ¹ Eight 1-bit sets are 17 MB, mostly still cached.
 
 |                  | 16³×256 | 32³×128 | 64³×64 | 32×128×64 ×64 | 96³×32 |
 | ---------------- | ------- | ------- | ------ | ------------- | ------ |
@@ -369,7 +375,7 @@ fc2.accumulate(&ff, &mut x, 1);
 ```
 
 Also: `matmul_{bf16,f32,f64,i16}`, `gemm_*`, `matmul_*_batched`,
-`matmul_i16_dequant`, `dequant_q4` / `matmul_q4`, `matmul_q2`, optional
+`matmul_i16_dequant`, `dequant_q4` / `matmul_q4`, `matmul_q2`, `matmul_q1`, optional
 `sme_gemm::candle::sme_matmul`. Caps: `sme_gemm::caps()`.
 
 **End to end.** `examples/shakespeare` runs nanoGPT shakespeare-char (10.7M
@@ -385,6 +391,22 @@ examples/shakespeare/fetch.sh             # once: checkpoint + text, ~45 MB (cur
 cargo run --release --example shakespeare -- "ROMEO:"
 cargo run --release --example shakespeare -- --bench   # accuracy vs f32, speed
 cargo install --path . --example shakespeare           # optional: `shakespeare` on PATH
+```
+
+`examples/bonsai` runs `PrismML`'s 1-bit Bonsai 1.7B (Qwen3-1.7B trained to
+one bit, Apache-2.0) from its `Q1_0` GGUF: `Q1Weights` behind every projection
+and the tied 151k-token head, the library's norms (QK-norm included),
+`KvCache` and a `SwiGLU` `Mlp`, plus the model's YaRN RoPE and Qwen's BPE
+tokenizer. On the CPU of a base M5 it generates 289 tok/s (tg128, one stream,
+≥ 300 at short context); llama.cpp on the same machine and file runs 238 tok/s
+on the GPU (Metal) and 60 on the CPU, and its greedy output matches ours token
+for token. The weights stream at 71-80 GB/s against the P-cluster's ~83 GB/s
+limit:
+
+```sh
+examples/bonsai/fetch.sh                                   # once: the GGUF, 248 MB
+cargo run --release --example bonsai -- "Why is the sky blue?"
+cargo run --release --example bonsai -- --bench            # as llama-bench tg128
 ```
 
 `examples/sme_warm` shows the wake cost `SmeWarm` removes.

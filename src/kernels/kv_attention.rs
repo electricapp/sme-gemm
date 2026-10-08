@@ -469,11 +469,11 @@ impl KvCache {
         self.len = self.len.min(len);
     }
 
-    /// Appends one position's key and value rows (f32 or f16).
+    /// Appends one position's key and value rows (each f32 or f16).
     ///
     /// # Panics
     /// Panics if the cache is full or a row is not [`KvCache::row_len`] long.
-    pub fn push<T: ModelFloat>(&mut self, k: &[T], v: &[T]) {
+    pub fn push<K: ModelFloat, V: ModelFloat>(&mut self, k: &[K], v: &[V]) {
         self.extend(k, v);
     }
 
@@ -483,7 +483,7 @@ impl KvCache {
     /// # Panics
     /// Panics if the rows do not fit, or `k`/`v` are not the same whole number
     /// of rows.
-    pub fn extend<T: ModelFloat>(&mut self, k: &[T], v: &[T]) {
+    pub fn extend<K: ModelFloat, V: ModelFloat>(&mut self, k: &[K], v: &[V]) {
         let row = self.row_len();
         assert!(
             k.len() == v.len() && k.len().is_multiple_of(row) && !k.is_empty(),
@@ -498,8 +498,8 @@ impl KvCache {
         );
         let at = self.len * row..(self.len + rows) * row;
         K16.with_borrow_mut(|f| {
-            self.k[at.clone()].copy_from_slice(T::as_f16(k, f));
-            self.v[at].copy_from_slice(T::as_f16(v, f));
+            self.k[at.clone()].copy_from_slice(K::as_f16(k, f));
+            self.v[at].copy_from_slice(V::as_f16(v, f));
         });
         self.len += rows;
     }

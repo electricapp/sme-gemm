@@ -208,8 +208,21 @@ unsafe extern "C" {
         dst: *mut u16,
         lhs: *const u16,
         codes: *const u8,
-        scales: *const f32,
+        scales: *const u16,
         codebook: *const i8,
+        block: usize,
+        ep: *const EpDesc16,
+    ) -> core::ffi::c_int;
+    /// The 1-bit GEMM (`csrc/gemm_q2.c`): `signs`/`scales` band-major as
+    /// [`Q1Weights`](crate::Q1Weights) holds them.
+    pub(crate) fn gemm_sme_f16_q1(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut u16,
+        lhs: *const u16,
+        signs: *const u8,
+        scales: *const u16,
         block: usize,
         ep: *const EpDesc16,
     ) -> core::ffi::c_int;

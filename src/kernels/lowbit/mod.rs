@@ -1,18 +1,22 @@
-//! 2-bit weights kept 2-bit resident ([`Q2Weights`]) and their GEMM
-//! ([`matmul_q2`]): codes expand to int8 and multiply int8-quantized
-//! activations, so a one-row call runs at the int8 dot-product rate.
+//! Weights kept 2-bit ([`Q2Weights`]) or 1-bit ([`Q1Weights`]) resident and
+//! their GEMMs ([`matmul_q2`], [`matmul_q1`]): codes expand to int8 and
+//! multiply int8-quantized activations, so a one-row call runs at the int8
+//! dot-product rate.
 //!
-//! The format fits models trained at two bits -- ternary `BitNet b1.58` style
-//! weights, llama.cpp's `TQ2_0` -- whose activations are int8 by design.
-//! Rounding an f32 model's weights to four levels after training is a
-//! different and much lossier thing; [`Q2Weights::quantize`] does it, but
-//! mainly to re-encode weights that are already on a 2-bit grid.
+//! The formats fit models trained at two bits or one -- ternary `BitNet b1.58`
+//! style weights and llama.cpp's `TQ2_0`, `PrismML`'s 1-bit Bonsai (`Q1_0`) --
+//! whose activations are int8 by design. Rounding an f32 model's weights to a
+//! few levels after training is a different and much lossier thing;
+//! [`Q2Weights::quantize`] and [`Q1Weights::quantize`] do it, but mainly to
+//! re-encode weights that are already on such a grid.
 
 mod matmul;
-mod weights;
+mod q1;
+mod q2;
 
-pub use matmul::{matmul_q2, matmul_q2_ep};
-pub use weights::Q2Weights;
+pub use matmul::{matmul_q1, matmul_q1_ep, matmul_q2, matmul_q2_ep};
+pub use q1::Q1Weights;
+pub use q2::Q2Weights;
 
 /// Default K-block size: one scale per 256-value block of a column, as
 /// llama.cpp's `TQ2_0`. [`Q2Params`] takes any power of two from 16.

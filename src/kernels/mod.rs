@@ -9,5 +9,5 @@ pub(crate) mod f32;
 pub(crate) mod f64;
 pub(crate) mod int;
 pub(crate) mod kv_attention;
-pub(crate) mod q2;
+pub(crate) mod lowbit;
 pub(crate) mod q4;

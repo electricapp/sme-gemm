@@ -21,9 +21,9 @@ fn bytes(s: &mut u64, len: usize) -> Vec<u8> {
 fn weights(s: &mut u64, n: usize, k: usize, p: Q2Params) -> (Q2Weights, Vec<f64>) {
     let nbk = k.div_ceil(p.block());
     let codes = bytes(s, (k * n).div_ceil(4));
-    let scales: Vec<f32> = bytes(s, n * nbk)
+    let scales: Vec<f16> = bytes(s, n * nbk)
         .iter()
-        .map(|&b| 0.005 + f32::from(b) * 1e-4)
+        .map(|&b| f16::from_f32(0.005 + f32::from(b) * 1e-4))
         .collect();
     let mut w = vec![0.0f64; k * n];
     for d in 0..k {

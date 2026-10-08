@@ -1,6 +1,8 @@
 //! The 2-bit-resident weight set: the band-major pack the kernel reads, from
 //! row-major codes or quantized from f32.
 
+use half::f16;
+
 use super::Q2Params;
 use crate::WeightLayout;
 
@@ -9,19 +11,27 @@ use crate::WeightLayout;
 /// one SDOT's int8 operand.
 pub(super) const BAND: usize = 64;
 
+/// Where column `j`'s scale for K-block `blk` sits among a weight set's
+/// band-major scales: each block's 64 in the order the kernel widens them
+/// (`csrc/gemm_q2.c`), column `c` of a band at `32(c/32) + 2(c%16) + (c%32)/16`.
+pub(super) const fn scale_index(sc_per_band: usize, blk: usize, j: usize) -> usize {
+    let c = j % BAND;
+    (j / BAND) * sc_per_band + blk * BAND + (c / 32) * 32 + 2 * (c % 16) + (c % 32) / 16
+}
+
 /// 2-bit weights kept **2-bit resident** for [`matmul_q2`].
 ///
 /// Codes are stored band-major (64 columns by four depths per 64 bytes) with
-/// one f32 scale per (column, K-block); a weight is `scale *
-/// codebook[code]` ([`Q2Params`]). That is 2.125 bits a weight at the default
-/// 256-value blocks.
+/// one f16 scale per (column, K-block); a weight is `scale *
+/// codebook[code]` ([`Q2Params`]). That is 2.0625 bits a weight at the
+/// default 256-value blocks.
 ///
 /// [`matmul_q2`]: crate::matmul_q2
 #[derive(Debug)]
 pub struct Q2Weights {
     /// The band-major arrays cross the FFI from `matmul`, hence `pub(super)`.
     pub(super) codes: Vec<u8>,
-    pub(super) scales: Vec<f32>,
+    pub(super) scales: Vec<f16>,
     pub(super) n: usize,
     pub(super) k: usize,
     pub(super) params: Q2Params,
@@ -33,14 +43,14 @@ impl Q2Weights {
     /// The weights are logically `k x n` row-major (input-major, as
     /// [`WeightLayout::InOut`]). `codes` holds them four to a byte in that
     /// order, low bits first: weight `idx = d * n + j` is bits `2 * (idx % 4)`
-    /// of byte `idx / 4` (`len == (k*n).div_ceil(4)`). `scales` holds one f32
+    /// of byte `idx / 4` (`len == (k*n).div_ceil(4)`). `scales` holds one f16
     /// per (column, K-block): `scales[j * ceil(k/block) + d / block]`.
     ///
     /// # Panics
     /// Panics if `codes` or `scales` is inconsistent with `n`, `k` and the
     /// block size.
     #[must_use]
-    pub fn new(codes: &[u8], scales: &[f32], n: usize, k: usize, p: Q2Params) -> Self {
+    pub fn new(codes: &[u8], scales: &[f16], n: usize, k: usize, p: Q2Params) -> Self {
         let kn = k
             .checked_mul(n)
             .expect("q2 weight dimension product k*n overflows usize");
@@ -55,7 +65,7 @@ impl Q2Weights {
         let (band_bytes, sc_per_band) = Self::band_sizes(k, p.block);
         let n_bands = n.div_ceil(BAND);
         let mut packed = vec![0u8; n_bands * band_bytes];
-        let mut sc = vec![0f32; n_bands * sc_per_band];
+        let mut sc = vec![f16::ZERO; n_bands * sc_per_band];
         for d in 0..k {
             for j in 0..n {
                 let idx = d * n + j;
@@ -65,7 +75,7 @@ impl Q2Weights {
         }
         for j in 0..n {
             for blk in 0..nbk {
-                sc[(j / BAND) * sc_per_band + blk * BAND + j % BAND] = scales[j * nbk + blk];
+                sc[scale_index(sc_per_band, blk, j)] = scales[j * nbk + blk];
             }
         }
         Self {
@@ -82,7 +92,7 @@ impl Q2Weights {
     /// `w` holds `n` outputs by `k` inputs in `layout`. Each (output, K-block)
     /// gets the scale that maps its largest magnitude onto the codebook's, and
     /// each weight the code whose value is nearest. Weights already on a 2-bit
-    /// grid -- a ternary model's `{-t, 0, t}` -- come back exactly; for
+    /// grid -- a ternary model's `{-t, 0, t}`, `t` an f16 -- come back exactly; for
     /// full-precision weights this is plain rounding to four levels, no
     /// substitute for training at two bits.
     ///
@@ -112,13 +122,13 @@ impl Q2Weights {
         };
         let nbk = k.div_ceil(p.block);
         let mut codes = vec![0u8; (k * n).div_ceil(4)];
-        let mut scales = vec![0f32; n * nbk];
+        let mut scales = vec![f16::ZERO; n * nbk];
         for j in 0..n {
             for b in 0..nbk {
                 let (d0, d1) = (b * p.block, ((b + 1) * p.block).min(k));
                 let amax = (d0..d1).fold(0f32, |a, d| a.max(at(j, d).abs()));
-                let s = amax / cmax;
-                scales[j * nbk + b] = s;
+                scales[j * nbk + b] = f16::from_f32(amax / cmax);
+                let s = scales[j * nbk + b].to_f32();
                 for d in d0..d1 {
                     let x = at(j, d);
                     // Nearest value; ties go to the lower code.
@@ -134,7 +144,7 @@ impl Q2Weights {
     }
 
     /// Bytes of codes and scales per band: k padded to 16 depths at 16 bytes
-    /// a depth, and 64 f32 per K-block.
+    /// a depth, and 64 scales per K-block.
     pub(super) const fn band_sizes(k: usize, block: usize) -> (usize, usize) {
         (k.next_multiple_of(16) * 16, k.div_ceil(block) * BAND)
     }
@@ -153,7 +163,7 @@ impl Q2Weights {
     /// Column `j`'s scale for K-block `blk`.
     pub(super) fn scale(&self, blk: usize, j: usize) -> f32 {
         let (_, sc_per_band) = Self::band_sizes(self.k, self.params.block);
-        self.scales[(j / BAND) * sc_per_band + blk * BAND + j % BAND]
+        self.scales[scale_index(sc_per_band, blk, j)].to_f32()
     }
 
     /// The quantization layout these weights were packed with.
@@ -179,7 +189,7 @@ impl Q2Weights {
 mod tests {
     use super::Q2Weights;
     use crate::WeightLayout;
-    use crate::kernels::q2::Q2Params;
+    use crate::kernels::lowbit::Q2Params;
 
     /// The band-major pack keeps every row-major code and scale where `code`
     /// and `scale` read them, including ragged n, k and the last block.
@@ -190,7 +200,9 @@ mod tests {
             let codes: Vec<u8> = (0..(k * n).div_ceil(4))
                 .map(|i| (i * 37 % 251) as u8)
                 .collect();
-            let scales: Vec<f32> = (0..n * nbk).map(|i| i as f32 * 0.5).collect();
+            let scales: Vec<half::f16> = (0..n * nbk)
+                .map(|i| half::f16::from_f32(i as f32 * 0.5))
+                .collect();
             let q = Q2Weights::new(&codes, &scales, n, k, Q2Params::new(block));
             for d in 0..k {
                 for j in 0..n {
@@ -201,7 +213,10 @@ mod tests {
             }
             for j in 0..n {
                 for b in 0..nbk {
-                    assert_eq!(q.scale(b, j).to_bits(), scales[j * nbk + b].to_bits());
+                    assert_eq!(
+                        q.scale(b, j).to_bits(),
+                        scales[j * nbk + b].to_f32().to_bits()
+                    );
                 }
             }
         }
@@ -218,7 +233,7 @@ mod tests {
         ] {
             let p = Q2Params::new(64).with_codebook(cb);
             let w: Vec<f32> = (0..n * k)
-                .map(|i| levels[(i * 7 + i / 5) % levels.len()] * 0.03 * (1 + i / k % 3) as f32)
+                .map(|i| levels[(i * 7 + i / 5) % levels.len()] * 0.031_25 * (1 + i / k % 3) as f32)
                 .collect();
             let t: Vec<f32> = (0..k * n).map(|i| w[(i % n) * k + i / n]).collect();
             for (q, what) in [
