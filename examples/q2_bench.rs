@@ -1,8 +1,8 @@
 //! One-row 2-bit GEMM (`matmul_q2`) against the Q4 GEMV (`matmul_q4`) on the
 //! same shapes: weights hot in the P-cluster's L2 (one matrix, called again
 //! and again) and cold (cycling through enough matrices to stream from DRAM).
-//! The 2-bit call includes quantizing its row of A to int8. `Q2_BLOCK` sets
-//! its K-block size (default 256).
+//! The 2-bit call includes quantizing its rows of A to int8. `Q2_BLOCK` sets
+//! its K-block size (default 256), `Q2_ROWS` the rows per call (default 1).
 //!   cargo run --release --example `q2_bench`
 
 use std::time::Instant;
@@ -36,7 +36,11 @@ fn best(calls: usize, mut f: impl FnMut(usize)) -> f64 {
 }
 
 fn main() {
-    println!("{:?}\n", caps());
+    let m: usize = std::env::var("Q2_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    println!("{:?}\n{m} row(s)\n", caps());
     println!("  n x k        sets | Q4 GEMV          | 2-bit GEMV       | speedup");
     for &(n, k, sets) in &[
         (1536usize, 384usize, 1usize),
@@ -67,14 +71,14 @@ fn main() {
                 Q2Weights::new(&bytes(&mut s, (k * n).div_ceil(4)), &scales, n, k, p)
             })
             .collect();
-        let a: Vec<f16> = bytes(&mut s, k)
+        let a: Vec<f16> = bytes(&mut s, m * k)
             .iter()
             .map(|&b| f16::from_f32((f32::from(b) - 128.0) / 64.0))
             .collect();
-        let mut c = vec![f16::ZERO; n];
+        let mut c = vec![f16::ZERO; m * n];
         let calls = 64.max(sets * 8);
-        let t4 = best(calls, |i| matmul_q4(&a, &q4[i % sets], &mut c, 1));
-        let t2 = best(calls, |i| matmul_q2(&a, &q2[i % sets], &mut c, 1));
+        let t4 = best(calls, |i| matmul_q4(&a, &q4[i % sets], &mut c, m));
+        let t2 = best(calls, |i| matmul_q2(&a, &q2[i % sets], &mut c, m));
         let macs = (n * k) as f64;
         let (b4, b2) = (macs * (0.5 + 2.0 / 32.0), macs * (0.25 + 4.0 / 256.0));
         println!(
