@@ -1,5 +1,5 @@
 // The small/medium f32 path: B is packed per N-tile into a small scratch instead
-// of a full packed-B buffer, and the dispatch is lighter. Split out of gemm_f32.c
+// of a full packed-B buffer, and the dispatch is lighter. Split out of gemm_f32.cc
 // and included in place -- it closes over that file's packing helpers.
 #ifndef SME_GEMM_F32_SMALL_H
 #define SME_GEMM_F32_SMALL_H

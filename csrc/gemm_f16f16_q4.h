@@ -1,5 +1,5 @@
 // f16 Q4 path: C(f16) = A(f16) @ dequant(B), B kept 4-bit resident.
-// Included at the end of gemm_f16f16.c for its `f16` typedef, `packa` and the
+// Included at the end of gemm_f16f16.cc for its `f16` typedef, `packa` and the
 // dense kernels; the bf16 twin is gemm_b16b16_q4.h.
 //
 // B is resident band-major: bands of Q4_BAND = 128 columns, and for each depth a
@@ -14,7 +14,7 @@
 #ifndef SME_GEMM_F16F16_Q4_H
 #define SME_GEMM_F16F16_Q4_H
 
-#include <stdatomic.h>
+#include <atomic>
 
 #include "neon_act.h"
 
@@ -25,8 +25,8 @@
 // are stored; before each K-block the kernel waits (acquire) until `ready`
 // covers the block's depths of A. Either may be NULL.
 typedef struct {
-    _Atomic size_t *done;
-    const _Atomic size_t *ready;
+    std::atomic<size_t> *done;
+    const std::atomic<size_t> *ready;
 } q4_chain;
 
 // Raises `done` from streaming code, ordered after every store before it (the
@@ -36,7 +36,7 @@ typedef struct {
 #define Q4_PUBLISH(flag, v)                                                                        \
     do {                                                                                           \
         __asm__ volatile("dmb ishst" ::: "memory");                                                \
-        atomic_store_explicit((flag), (v), memory_order_relaxed);                                  \
+        (flag)->store((v), std::memory_order_relaxed);                                             \
     } while (0)
 
 // Code c -> f16(sign-extended c); 16-bit LUTI4 reads the low half of 32-bit entries.
@@ -247,8 +247,8 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv1(
     svfloat16_t vb = svdup_n_f16((f16)1.0f);
     svfloat16_t va = svdup_n_f16((f16)0.0f);
     svldr_zt(0, lut);
-    _Atomic size_t *done = chain ? chain->done : NULL;
-    const _Atomic size_t *ready = chain ? chain->ready : NULL;
+    std::atomic<size_t> *done = chain ? chain->done : NULL;
+    const std::atomic<size_t> *ready = chain ? chain->ready : NULL;
     if (!ready) Q4_TOUCH(a, k * sizeof(f16)); // gated A is not written yet
     size_t block = (size_t)1 << bshift, nbk = (k + block - 1) >> bshift;
     size_t per = q4_gemv1_per(b_hi - b_lo);
@@ -295,7 +295,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv1(
         for (size_t bk = 0; bk < nbk; bk++) {
             size_t d0 = bk << bshift, d1 = ((bk + 1) << bshift) < k ? (bk + 1) << bshift : k;
             while (avail < d1)
-                avail = atomic_load_explicit(ready, memory_order_acquire);
+                avail = ready->load(std::memory_order_acquire);
             if (bk == 1 && pending) {
                 Q4_PUBLISH(done, pending);
                 pending = 0;
@@ -372,8 +372,8 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
     svfloat16_t vb = svdup_n_f16((f16)1.0f);
     svfloat16_t va = svdup_n_f16((f16)0.0f);
     svldr_zt(0, lut);
-    _Atomic size_t *done = chain ? chain->done : NULL;
-    const _Atomic size_t *ready = chain ? chain->ready : NULL;
+    std::atomic<size_t> *done = chain ? chain->done : NULL;
+    const std::atomic<size_t> *ready = chain ? chain->ready : NULL;
     if (!ready) Q4_TOUCH(a, rows * k * sizeof(f16)); // gated A is not written yet
     size_t block = (size_t)1 << bshift;
     size_t nbk = (k + block - 1) >> bshift;
@@ -392,7 +392,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
         for (size_t bk = 0; bk < nbk; bk++) {
             size_t d1 = ((bk + 1) << bshift) < k ? (bk + 1) << bshift : k;
             while (avail < d1)
-                avail = atomic_load_explicit(ready, memory_order_acquire);
+                avail = ready->load(std::memory_order_acquire);
             if (bk == 1 && pending) {
                 Q4_PUBLISH(done, pending);
                 pending = 0;
@@ -461,7 +461,6 @@ static int q4_gemv_single(size_t m, size_t n, size_t k) {
     return ep_flops(m, n, k) < (1u << 21) || (n_bands + chunk - 1) / chunk < 3;
 }
 
-int gemm_sme_f16f16_q4_single(size_t m, size_t n, size_t k);
 int gemm_sme_f16f16_q4_single(size_t m, size_t n, size_t k) {
     return m <= Q4_GEMV_MAXR && q4_gemv_single(m, n, k);
 }
@@ -489,7 +488,7 @@ static int q4_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
     if (m <= Q4_GEMV_MAXR && block >= 4) {
         const f16 *a = (const f16 *)lhs;
         // The affine form's per-row, per-block sums of A. Shares the dense path's
-        // per-thread A-pack buffer (this header is included into gemm_f16f16.c):
+        // per-thread A-pack buffer (this header is included into gemm_f16f16.cc):
         // only one gemm call per thread is ever in flight.
         f16 *asum = NULL;
         if (mins) {
@@ -521,7 +520,7 @@ static int q4_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
     }
     // The MOPA path reads all of A up front and stores C at the end.
     if (chain && chain->ready)
-        while (atomic_load_explicit(chain->ready, memory_order_acquire) < k) {}
+        while (chain->ready->load(std::memory_order_acquire) < k) {}
     return run_q4_panels((f16 *)dst, (const f16 *)lhs, nibbles, (const f16 *)scales,
                          (const f16 *)mins, m, n, k, bshift, ep);
 }
@@ -544,11 +543,11 @@ int gemm_sme_f16f16_q4(size_t m, size_t n, size_t k, uint16_t *dst, const uint16
 // Nothing is split off: a trailing activation in ep runs in the kernel.
 int gemm_sme_f16f16_q4_chained(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
                                const uint8_t *nibbles, const uint16_t *scales, const uint16_t *mins,
-                               size_t block, const ep_desc16 *ep, _Atomic size_t *done,
-                               const _Atomic size_t *ready) {
+                               size_t block, const ep_desc16 *ep, std::atomic<size_t> *done,
+                               const std::atomic<size_t> *ready) {
     q4_chain chain = {done, ready};
     int rc = q4_core(m, n, k, dst, lhs, nibbles, scales, mins, block, ep, &chain);
-    if (rc == 0 && done) atomic_store_explicit(done, n, memory_order_release);
+    if (rc == 0 && done) done->store(n, std::memory_order_release);
     return rc;
 }
 

@@ -7,9 +7,10 @@
 #ifndef SME_GEMM_PANEL_RING_H
 #define SME_GEMM_PANEL_RING_H
 
+#include <atomic>
 #include <dispatch/dispatch.h>
+#include <new>
 #include <sched.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdlib.h>
 
@@ -19,15 +20,15 @@
 
 // Per-thread reusable pool (counters, then panels); a malloc per call shows up
 // directly in latency. Grows monotonically; only the calling thread resizes it.
-static _Thread_local void *g_ring_pool = NULL;
-static _Thread_local size_t g_ring_pool_cap = 0;
+static thread_local void *g_ring_pool = NULL;
+static thread_local size_t g_ring_pool_cap = 0;
 
 // `n_ctr` zeroed counters followed, 64-byte aligned, by `panel_bytes` of panels.
 // NULL on overflow or allocation failure.
 __attribute__((unused)) static void *ring_pool(size_t n_ctr, size_t panel_bytes,
-                                               _Atomic size_t **ctr) {
-    if (n_ctr > SIZE_MAX / sizeof(_Atomic size_t)) return NULL;
-    size_t ctr_pad = (n_ctr * sizeof(_Atomic size_t) + 63) & ~(size_t)63;
+                                               std::atomic<size_t> **ctr) {
+    if (n_ctr > SIZE_MAX / sizeof(std::atomic<size_t>)) return NULL;
+    size_t ctr_pad = (n_ctr * sizeof(std::atomic<size_t>) + 63) & ~(size_t)63;
     if (panel_bytes > SIZE_MAX - ctr_pad) return NULL;
     size_t bytes = ctr_pad + panel_bytes;
     if (g_ring_pool_cap < bytes) {
@@ -36,9 +37,9 @@ __attribute__((unused)) static void *ring_pool(size_t n_ctr, size_t panel_bytes,
         g_ring_pool_cap = g_ring_pool ? bytes : 0;
         if (!g_ring_pool) return NULL;
     }
-    *ctr = (_Atomic size_t *)g_ring_pool;
+    *ctr = static_cast<std::atomic<size_t> *>(g_ring_pool);
     for (size_t i = 0; i < n_ctr; i++)
-        atomic_init(&(*ctr)[i], 0);
+        new (*ctr + i) std::atomic<size_t>(0);
     return (char *)g_ring_pool + ctr_pad;
 }
 
@@ -53,40 +54,39 @@ static inline int use_cols(size_t m, size_t n, size_t a_bytes) {
 // Runs n_blocks blocks of n_d build units and n_g GEMM items each; block b lives
 // in slot b % RING_SLOTS. `ctr` holds 2*n_blocks + 2 zeroed counters.
 __attribute__((unused)) static void ring_run(size_t n_blocks, size_t n_d, size_t n_g,
-                                             _Atomic size_t *ctr,
+                                             std::atomic<size_t> *ctr,
                                              void (^build)(size_t blk, size_t unit),
                                              void (^gemm)(size_t blk, size_t item)) {
-    _Atomic size_t *d_done = ctr, *g_done = d_done + n_blocks;
-    _Atomic size_t *d_cur = g_done + n_blocks, *g_cur = d_cur + 1;
+    std::atomic<size_t> *d_done = ctr, *g_done = d_done + n_blocks;
+    std::atomic<size_t> *d_cur = g_done + n_blocks, *g_cur = d_cur + 1;
     size_t n_dt = n_blocks * n_d, n_gt = n_blocks * n_g;
     // Extra workers are harmless: a late one finds both cursors exhausted.
     dispatch_apply(
         n_gt < 64 ? n_gt : 64, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t w) {
           (void)w;
           for (unsigned spins = 0;;) {
-              size_t di = atomic_load_explicit(d_cur, memory_order_relaxed);
-              size_t gi = atomic_load_explicit(g_cur, memory_order_relaxed);
+              size_t di = d_cur->load(std::memory_order_relaxed);
+              size_t gi = g_cur->load(std::memory_order_relaxed);
               if (gi >= n_gt) return;
               size_t sd = di / n_d, sg = gi / n_g;
-              int d_ok = di < n_dt &&
-                         (sd < RING_SLOTS || atomic_load_explicit(&g_done[sd - RING_SLOTS],
-                                                                  memory_order_acquire) == n_g);
-              int g_ok = atomic_load_explicit(&d_done[sg], memory_order_acquire) == n_d;
+              int d_ok = di < n_dt && (sd < RING_SLOTS || g_done[sd - RING_SLOTS].load(
+                                                              std::memory_order_acquire) == n_g);
+              int g_ok = d_done[sg].load(std::memory_order_acquire) == n_d;
               if (d_ok && (!g_ok || sd <= sg + RING_AHEAD)) {
-                  if (!atomic_compare_exchange_weak_explicit(
-                          d_cur, &di, di + 1, memory_order_relaxed, memory_order_relaxed))
+                  if (!d_cur->compare_exchange_weak(di, di + 1, std::memory_order_relaxed,
+                                                    std::memory_order_relaxed))
                       continue;
                   build(sd, di % n_d);
-                  atomic_fetch_add_explicit(&d_done[sd], 1, memory_order_release);
+                  d_done[sd].fetch_add(1, std::memory_order_release);
                   spins = 0;
                   continue;
               }
               if (g_ok) {
-                  if (!atomic_compare_exchange_weak_explicit(
-                          g_cur, &gi, gi + 1, memory_order_relaxed, memory_order_relaxed))
+                  if (!g_cur->compare_exchange_weak(gi, gi + 1, std::memory_order_relaxed,
+                                                    std::memory_order_relaxed))
                       continue;
                   gemm(sg, gi % n_g);
-                  atomic_fetch_add_explicit(&g_done[sg], 1, memory_order_release);
+                  g_done[sg].fetch_add(1, std::memory_order_release);
                   spins = 0;
                   continue;
               }

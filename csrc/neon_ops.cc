@@ -1,5 +1,7 @@
 // Elementwise passes the Rust layer calls between kernels: plain NEON, on
 // the calling thread or spread over the cores for large outputs.
+#include "sme_gemm_api.h"
+
 #include <arm_neon.h>
 #include <dispatch/dispatch.h>
 #include <math.h>
@@ -7,16 +9,6 @@
 #include <stdint.h>
 
 #include "neon_act.h"
-
-void neon_glu_f16(__fp16 *out, const __fp16 *in, size_t m, size_t n, uint32_t act);
-void neon_f32_to_f16(__fp16 *dst, const float *src, size_t n);
-void neon_f16_to_f32(float *dst, const __fp16 *src, size_t n);
-void neon_add_f16_to_f32(float *dst, const __fp16 *src, size_t n);
-void neon_act_f16(__fp16 *dst, const __fp16 *src, size_t n, uint32_t act);
-void neon_norm_row_f32(float *y, const float *x, const float *w, const float *b, size_t n,
-                       float eps, int rms);
-void neon_norm_row_f16(__fp16 *y, const float *x, const float *w, const float *b, size_t n,
-                       float eps, int rms);
 
 // Sum of x (or of (x - c)^2 when sq), 16 lanes at a time in four chains.
 static float row_sum(const float *x, size_t n, float c, int sq) {

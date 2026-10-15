@@ -6,14 +6,14 @@ use half::f16;
 use super::Q2Params;
 use crate::WeightLayout;
 
-/// Columns in a band (`Q2_BAND` in `csrc/gemm_q2.c`): per four depths, a
+/// Columns in a band (`Q2_BAND` in `csrc/gemm_q2.cc`): per four depths, a
 /// band's 64 bytes hold its 64 columns' codes, which one LUTI2 expands into
 /// one SDOT's int8 operand.
 pub(super) const BAND: usize = 64;
 
 /// Where column `j`'s scale for K-block `blk` sits among a weight set's
 /// band-major scales: each block's 64 in the order the kernel widens them
-/// (`csrc/gemm_q2.c`), column `c` of a band at `32(c/32) + 2(c%16) + (c%32)/16`.
+/// (`csrc/gemm_q2.cc`), column `c` of a band at `32(c/32) + 2(c%16) + (c%32)/16`.
 pub(super) const fn scale_index(sc_per_band: usize, blk: usize, j: usize) -> usize {
     let c = j % BAND;
     (j / BAND) * sc_per_band + blk * BAND + (c / 32) * 32 + 2 * (c % 16) + (c % 32) / 16

@@ -3,9 +3,9 @@
 // Vector FMLAs only, no ZA: they share the unit with a call in flight without
 // slowing it, so the helper never has to stand aside. (A ZA burst does slow
 // it, by 2x on a one-row Q4 GEMV, measured on M5.)
-#include <arm_sme.h>
+#include "sme_gemm_api.h"
 
-float sme_warm_tick(void);
+#include <arm_sme.h>
 
 __arm_locally_streaming float sme_warm_tick(void) {
     svbool_t pg = svptrue_b32();

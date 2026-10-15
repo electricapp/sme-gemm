@@ -1,14 +1,14 @@
 # Architecture
 
 `sme-gemm` is an Apple-Silicon GEMM library: streaming-mode **SME** (Scalable
-Matrix Extension) kernels written in C against `arm_sme.h`, driven from a thin
+Matrix Extension) kernels written in C++ against `arm_sme.h`, driven from a thin
 Rust crate. It exists because the Rust ecosystem (gemm, faer, candle, ndarray)
 has no on-CPU SME path on Apple M4+.
 
 This document is the design overview. The public API is documented in the
 rustdoc on `lib.rs`, the in-kernel epilogue interpreter in the header comment of
 `csrc/epilogue.h`, and the SME hot loop in the comment above `run_streaming` in
-`csrc/gemm_f16f16.c`.
+`csrc/gemm_f16f16.cc`.
 
 ---
 
@@ -132,7 +132,7 @@ Scalar code inside a streaming region runs at roughly a tenth of its normal
 rate, so an `__arm_streaming` or `__arm_locally_streaming` function contains
 MOPAs, ZA reads and writes, and the vectorized store epilogue. Elementwise work
 that does not map onto ZA runs outside the region: the attention softmax is
-parallel NEON in `csrc/attention.c`. Elementwise work that does map onto ZA
+parallel NEON in `csrc/attention.cc`. Elementwise work that does map onto ZA
 stays in: the Q4 unpack is LUTI4, an FMLA into ZA and a MOVA out (§2.9). The
 same holds for a trailing gelu, silu, sigmoid or tanh on the 16-bit paths: in a
 streaming epilogue they cost ~2.5 ns an output, so the entry points split them
@@ -344,7 +344,7 @@ streaming instruction and the next call pays about a microsecond to wake it, so
 a loop of short GEMVs alternating with NEON layernorm, attention and activations
 pays it on every call. While an `SmeWarm` guard is alive, a helper thread at
 user-interactive QoS issues short bursts of streaming vector FMLAs back to back
-(`csrc/sme_warm.c`, `src/warm.rs`). The bursts leave ZA alone, which is what
+(`csrc/sme_warm.cc`, `src/warm.rs`). The bursts leave ZA alone, which is what
 lets them run beside a call: a call sharing the unit with vector work loses
 nothing measurable, but sharing it with ZA work halves a one-row Q4 GEMV. So the
 helper never tracks calls in flight; an entry point only sets an activity flag
@@ -430,7 +430,7 @@ come from user code touch it up front (§2.8).
 `Q2Weights` holds a 2-bit code per weight and four int8 values the codes stand
 for (ternary by default); `Q1Weights` holds a sign bit per weight (llama.cpp's
 `Q1_0`). Both keep an f16 scale per (column, K-block), and one kernel
-(`csrc/gemm_q2.c`) runs both, computing with int8 products rather than f16
+(`csrc/gemm_q2.cc`) runs both, computing with int8 products rather than f16
 ones, because the expansion is cheap enough to let them pay:
 
 - **Why int8.** A lane-indexed int8 SDOT vg1x4 is 256 multiply-adds, twice the
@@ -487,22 +487,32 @@ ones, because the expansion is cheap enough to let them pay:
 
 There are no stable Rust SME intrinsics — `core::arch` does not expose
 `svmopa_za16_m` and inline asm for the full streaming ABI is impractical — so
-all kernels are C, compiled by `build.rs` with `cc` against `arm_sme.h` on Apple
-aarch64 and skipped elsewhere.
+all kernels are C++26, compiled by `build.rs` with `cc` against `arm_sme.h` on
+Apple aarch64 and skipped elsewhere. They build without exceptions or RTTI and
+use only the header-only parts of the standard library (`std::atomic` for the
+cross-thread counters), so nothing links libc++. Every function Rust calls is
+declared once, `extern "C"`, in `csrc/sme_gemm_api.h`, which each TU includes
+first; the Rust `extern` blocks (`src/ffi.rs`, `src/probe.rs`, `src/warm.rs`)
+mirror it.
+
+`tools/asm_gate.sh` compiles two copies of `csrc/` with `build.rs`'s flags and
+diffs the disassembly per function. A refactor that leaves a function's
+instructions unchanged leaves its speed unchanged; the functions that differ are
+the ones to benchmark.
 
 The gating scheme keeps the M4 floor while shipping M5-only instructions in the
 same binary:
 
-- **Base `FEAT_SME` TUs (M4+).** `gemm_f16f32.c`, `gemm_bf16f32.c`,
-  `gemm_i8i32.c`, `gemm_f32.c`, `attention.c`, `sme_probe.c` and
-  `sme_runtime_shims.c` compile together with
+- **Base `FEAT_SME` TUs (M4+).** `gemm_f16f32.cc`, `gemm_bf16f32.cc`,
+  `gemm_i8i32.cc`, `gemm_f32.cc`, `attention.cc`, `sme_probe.cc` and
+  `sme_runtime_shims.cc` compile together with
   `-mcpu=apple-m4 -ffp-contract=fast -O3` into `sme_gemm_base`, using only
   instructions present on every M4.
 - **M5 extension TUs.** Each M5-only kernel is its own TU with its target
   feature layered on the same base flags, linked as its own static lib:
-  `gemm_f16f16.c` → `+sme-f16f16`; `gemm_b16b16.c` → `+sme-b16b16 +sve-b16b16`
+  `gemm_f16f16.cc` → `+sme-f16f16`; `gemm_b16b16.cc` → `+sme-b16b16 +sve-b16b16`
   (the SVE feature covers `svmul_bf16`/`svmla_bf16` in the bf16 epilogue);
-  `gemm_f64.c` → `+sme-f64f64`; `gemm_i16i64.c` → `+sme-i16i64`; `gemm_q2.c` →
+  `gemm_f64.cc` → `+sme-f64f64`; `gemm_i16i64.cc` → `+sme-i16i64`; `gemm_q2.cc` →
   `+sme2p1` (MOVAZ; LUTI2 is base SME2). Each is called
   only behind a runtime probe, so compiling it with newer features does not
   raise the binary's floor — an M4 never enters those symbols.
@@ -515,14 +525,14 @@ streaming functions call `__arm_tpidr2_{save,restore}` from compiler-rt.
 Several kernels are split across `.h` fragments `#include`d into the TU that
 owns them:
 
-| TU              | fragments                              |
-| --------------- | -------------------------------------- |
-| `epilogue.h`    | `epilogue_{scalar,f16,bf16,f32,f64}.h` |
-| `gemm_f32.c`    | `gemm_f32_{small,batched}.h`           |
-| `gemm_f64.c`    | `gemm_f64_{small,batched}.h`           |
-| `gemm_f16f16.c` | `gemm_f16f16_{batched,q4}.h`           |
-| `gemm_b16b16.c` | `gemm_b16b16_q4.h`                     |
-| `gemm_i16i64.c` | `gemm_i16i64_batched.h`                |
+| TU               | fragments                              |
+| ---------------- | -------------------------------------- |
+| `epilogue.h`     | `epilogue_{scalar,f16,bf16,f32,f64}.h` |
+| `gemm_f32.cc`    | `gemm_f32_{small,batched}.h`           |
+| `gemm_f64.cc`    | `gemm_f64_{small,batched}.h`           |
+| `gemm_f16f16.cc` | `gemm_f16f16_{batched,q4}.h`           |
+| `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                     |
+| `gemm_i16i64.cc` | `gemm_i16i64_batched.h`                |
 
 The split is for navigability, not compilation. Each fragment closes over its
 parent's `static` packing helpers, per-thread scratch and typedefs, so it cannot
@@ -536,7 +546,7 @@ tracking, since `cc` never sees it.
 
 ### 3.2 The runtime probe
 
-`src/probe.rs` and `csrc/sme_probe.c` detect capabilities via `sysctlbyname` on
+`src/probe.rs` and `csrc/sme_probe.cc` detect capabilities via `sysctlbyname` on
 the `hw.optional.arm.FEAT_SME*` flags, cached once in a `OnceLock`. `Caps` holds
 one bool per group: `sme` (base, M4+), and `sme_f16f16`, `sme_b16b16`,
 `sme_i16i64`, `sme_f64f64`, `sme2p1` (M5+). On non-Apple targets every flag is false and
@@ -605,7 +615,7 @@ P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
   `WeightLayout::scale_inputs`). `GatedLinear` stores gate and up interleaved in
   whole 32-column tiles of one `Linear`, so each column quantizes and
   accumulates exactly as it would alone, then runs the gated activation as a
-  NEON pass (`csrc/neon_ops.c`, with `neon_act.h`'s activations). `ModelFloat`
+  NEON pass (`csrc/neon_ops.cc`, with `neon_act.h`'s activations). `ModelFloat`
   lets the helpers take f32 or f16 and convert at their edges in thread-local
   scratch. `WeightLayout` / `prepack` accept weights as checkpoints store them;
   `Q4Weights::quantize` lives with the Q4 kernels (`q4/quantize.rs`). `KvCache`
@@ -752,7 +762,7 @@ ragged M/N/K tails, where tail-predicate handling is exercised.
 
 The suite should run in debug as well as release: debug enables the flash
 scratch poison (§2.7) and Rust's overflow checks, neither live in release.
-`SME_GEMM_C_ASAN=1` additionally builds the C kernels under AddressSanitizer.
+`SME_GEMM_C_ASAN=1` additionally builds the kernels under AddressSanitizer.
 
 ---
 
@@ -794,9 +804,9 @@ their feature flags.
 
 - **Add a dtype:** an `Element`/`PackedEpilogue`/`MapElem` impl in
   `src/element.rs` and `src/exec/mod.rs`; a reference GEMM in
-  `src/reference.rs`; the C kernel TU in `csrc/` wired into `build.rs` (base TU
+  `src/reference.rs`; the kernel TU in `csrc/` wired into `build.rs` (base TU
   for an M4 instruction, `feat_tu` for an M5 one); the `extern "C"` decls in
-  `src/ffi.rs`; the probe flag in `src/probe.rs`; and the entry points in a
+  `csrc/sme_gemm_api.h` and `src/ffi.rs`; the probe flag in `src/probe.rs`; and the entry points in a
   `src/kernels/` module re-exported from `src/lib.rs`.
 - **Add an epilogue op:** the opcode in `enum ep_op` (`csrc/epilogue.h`) and the
   mirrored `EpOp` (`src/epilogue/mod.rs`) at the same numeric value; the
@@ -809,6 +819,6 @@ their feature flags.
   an activation, extend `enum ep_act`, the `EP_ACT_*` constants, and the f32/f64
   `act_apply_*` evaluators.
 - **A perf change:** the hot loop is `run_streaming` in the per-dtype
-  `csrc/gemm_*.c` — start with `gemm_f16f16.c` and read its header comment
+  `csrc/gemm_*.cc` — start with `gemm_f16f16.cc` and read its header comment
   first. The monolithic structure and the node-major store are both
   load-bearing; splitting either costs throughput. Measure per §7.

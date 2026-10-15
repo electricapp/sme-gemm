@@ -4,10 +4,12 @@
 //
 // Computes dst = alpha*dst + beta*(A @ B).
 
+#include "sme_gemm_api.h"
+
 #include <arm_neon.h>
 #include <arm_sme.h>
+#include <atomic>
 #include <dispatch/dispatch.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -97,14 +99,14 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p64, const double *b
     svmopa_za64_f64_m(1, p64, p64, al, bh)
 
 // Largest B (n*k*8 bytes) the direct-B path may read unpacked, and the flop
-// count below which it stays on one cluster; see gemm_f32.c. The budget is well
+// count below which it stays on one cluster; see gemm_f32.cc. The budget is well
 // under f32's because an f64 N-tile is 8 lanes, not 32: unpacked B yields 64
 // useful bytes per n*8 stride against f32's 128 per n*4, so an equal footprint
 // costs twice the address span.
 #define SME_F64_DIRECT_B_BYTES ((size_t)4 * 1024 * 1024)
 #define SME_F64_SERIAL_FLOPS ((uint64_t)1 << 22)
 
-// Workers for the dynamic M-chunk claiming; see gemm_f32.c.
+// Workers for the dynamic M-chunk claiming; see gemm_f32.cc.
 #define SME_F64_MAX_WORKERS 8
 static size_t f64_workers(size_t chunks) {
     if (chunks <= 3) return chunks;
@@ -122,7 +124,7 @@ static size_t f64_budget(size_t k) {
 
 // N-block width, shared by the driver's outer jc loop and run_streaming's inner
 // one so the two agree on block boundaries. Rounded down to an even split (see
-// gemm_f32.c): the budget is a ceiling, not a target.
+// gemm_f32.cc): the budget is a ceiling, not a target.
 static size_t f64_nc_blk(size_t k, size_t n_tiles) {
     size_t nc = f64_budget(k) / 2;
     if (nc < 1) nc = 1;
@@ -132,7 +134,7 @@ static size_t f64_nc_blk(size_t k, size_t n_tiles) {
 }
 
 // m == 1: SME2 multi-vector FMLA into ZA vector groups instead of MOPA; see
-// run_gemv in gemm_f16f16.c. 8-column bands, two per 16-wide tile; `abc` is
+// run_gemv in gemm_f16f16.cc. 8-column bands, two per 16-wide tile; `abc` is
 // [k][8] broadcast A. Past one row the 8x8 MOPA is cheaper.
 __arm_locally_streaming __arm_new("za") static void run_gemv(double *dst, const double *abc,
                                                              const double *b_pack, size_t n,
@@ -509,8 +511,8 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     }
 }
 
-static _Thread_local double *g_apack = NULL;
-static _Thread_local size_t g_apack_cap = 0;
+static thread_local double *g_apack = NULL;
+static thread_local size_t g_apack_cap = 0;
 static double *apack_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1; // k==0: return a real (tiny) buffer, not a
                                // history-dependent NULL that looks like OOM.
@@ -533,14 +535,6 @@ static void *xmalloc(size_t bytes) { return malloc(bytes ? bytes : 1); }
 // Batched f64: `count` independent same-shape GEMMs in ONE streaming session, so
 #include "gemm_f64_batched.h"
 
-size_t gemm_sme_f64_packed_b_elems(size_t n, size_t k);
-void gemm_sme_f64_packb(double *b_pack, const double *rhs, size_t n, size_t k, long rhs_rs,
-                        long rhs_cs);
-int gemm_sme_f64_run_packed(size_t m, size_t n, size_t k, double *dst, long dst_cs, long dst_rs,
-                            int read_dst, const double *lhs, long lhs_cs, long lhs_rs,
-                            const double *b_pack, double alpha, double beta,
-                            const ep_desc_f64 *ep);
-
 int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, long dst_rs,
                      int read_dst, const double *lhs, long lhs_cs, long lhs_rs, const double *rhs,
                      long rhs_cs, long rhs_rs, double alpha, double beta, const ep_desc_f64 *ep) {
@@ -550,7 +544,7 @@ int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, lon
     size_t m_tiles = (m + 15) / 16;
     size_t per_tile = ep_cmul(k, 8);
 
-    // Small + row-major B: direct B load (no B pack), light dispatch. See gemm_f32.c.
+    // Small + row-major B: direct B load (no B pack), light dispatch. See gemm_f32.cc.
 #define PACKA_SMALL(AP, MT0, MT1)                                                                  \
     for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                             \
         size_t r0 = st * 8;                                                                        \
@@ -558,7 +552,7 @@ int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, lon
         pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr); \
     }
     // Direct-B gate is B's footprint, and the serial gate a flop floor; see
-    // gemm_f32.c for why.
+    // gemm_f32.cc for why.
     size_t b_budget = SME_F64_DIRECT_B_BYTES / sizeof(double);
     if (rhs_cs == 1 && ep_cmul(n, k) <= b_budget) {
         size_t sc_chunk = 2;
@@ -576,15 +570,14 @@ int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, lon
             if (a_pack) {
                 // Chunks claimed off a shared cursor, packing kept with compute;
                 // see gemm_sme_f32_run for why.
-                _Atomic size_t cursor = 0;
-                _Atomic size_t *cur = &cursor;
+                std::atomic<size_t> cursor = 0;
+                std::atomic<size_t> *cur = &cursor;
                 dispatch_apply(f64_workers(sc_n),
                                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                                ^(size_t w) {
                                  (void)w;
                                  for (;;) {
-                                     size_t ci = atomic_fetch_add_explicit(cur, 1,
-                                                                           memory_order_relaxed);
+                                     size_t ci = cur->fetch_add(1, std::memory_order_relaxed);
                                      size_t mt0 = ci * sc_chunk;
                                      if (mt0 >= m_tiles) break;
                                      size_t mt1 =
@@ -611,7 +604,7 @@ int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, lon
     return rc;
 }
 
-// Elements in a packed-B buffer for (n, k). Saturating (see gemm_i8i32.c).
+// Elements in a packed-B buffer for (n, k). Saturating (see gemm_i8i32.cc).
 size_t gemm_sme_f64_packed_b_elems(size_t n, size_t k) {
     return ep_cmul(2 * ((n + 15) / 16), ep_cmul(k, 8));
 }
@@ -712,7 +705,7 @@ int gemm_sme_f64_run_packed(size_t m, size_t n, size_t k, double *dst, long dst_
     if (!a_pack) return -1;
 
     // N-block loop OUTSIDE the M dispatch, so one B-block serves every M-chunk
-    // while it is still L2-resident; see gemm_f32.c for the traffic argument.
+    // while it is still L2-resident; see gemm_f32.cc for the traffic argument.
     size_t nc_blk = f64_nc_blk(k, n_tiles);
     size_t n_blocks = (n_tiles + nc_blk - 1) / nc_blk;
     if (n_blocks > 1)
@@ -720,7 +713,7 @@ int gemm_sme_f64_run_packed(size_t m, size_t n, size_t k, double *dst, long dst_
           size_t mt0 = ci * M_CHUNK;
           PACKA_RANGE(a_pack, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
         });
-    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.c.
+    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.cc.
     dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
       size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
       size_t mt0 = ci * M_CHUNK;

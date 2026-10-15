@@ -83,9 +83,9 @@ const _: () = {
 // ---- C kernels (Apple aarch64 only) ----------------------------------------
 unsafe extern "C" {
     /// `out = act(gate) * up` over rows of gate/up interleaved 32 columns at a
-    /// time (`neon_ops.c`); `act` is an `EP_ACT_*` kind.
+    /// time (`neon_ops.cc`); `act` is an `EP_ACT_*` kind.
     pub(crate) fn neon_glu_f16(out: *mut u16, input: *const u16, m: usize, n: usize, act: u32);
-    /// `dst[i] = src[i]` rounded to f16, `n` values (`neon_ops.c`).
+    /// `dst[i] = src[i]` rounded to f16, `n` values (`neon_ops.cc`).
     pub(crate) fn neon_f32_to_f16(dst: *mut u16, src: *const f32, n: usize);
     /// `dst[i] = src[i]` widened to f32, `n` values.
     pub(crate) fn neon_f16_to_f32(dst: *mut f32, src: *const u16, n: usize);
@@ -199,7 +199,7 @@ unsafe extern "C" {
         block: usize,
         ep: *const EpDesc16,
     ) -> core::ffi::c_int;
-    /// The 2-bit GEMM (`csrc/gemm_q2.c`): `codes`/`scales` band-major as
+    /// The 2-bit GEMM (`csrc/gemm_q2.cc`): `codes`/`scales` band-major as
     /// [`Q2Weights`](crate::Q2Weights) holds them, `codebook` its four values.
     pub(crate) fn gemm_sme_f16_q2(
         m: usize,
@@ -213,7 +213,7 @@ unsafe extern "C" {
         block: usize,
         ep: *const EpDesc16,
     ) -> core::ffi::c_int;
-    /// The 1-bit GEMM (`csrc/gemm_q2.c`): `signs`/`scales` band-major as
+    /// The 1-bit GEMM (`csrc/gemm_q2.cc`): `signs`/`scales` band-major as
     /// [`Q1Weights`](crate::Q1Weights) holds them.
     pub(crate) fn gemm_sme_f16_q1(
         m: usize,
@@ -462,7 +462,7 @@ unsafe extern "C" {
         hd: usize,
         scale: f32,
     ) -> i32;
-    /// One query row against an f16 KV cache (`attention.c`).
+    /// One query row against an f16 KV cache (`attention.cc`).
     pub(crate) fn attn_kv_f16(
         out: *mut f32,
         q: *const f32,

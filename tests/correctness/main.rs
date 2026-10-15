@@ -100,7 +100,7 @@ const SIZES: &[(usize, usize, usize)] = &[
 //
 // (33, 161, 401) is there for a dispatch reason, not a tail one: m_tiles=2 and
 // n_tiles_pad=6 is the one flat-M band that splits exactly two ways, which the
-// f16f16/b16b16 packed paths deliberately run serially (see gemm_f16f16.c).
+// f16f16/b16b16 packed paths deliberately run serially (see gemm_f16f16.cc).
 // Nothing else here lands in it, so without it that branch is never taken.
 const TAIL_SIZES: &[(usize, usize, usize)] = &[
     (65, 257, 257),

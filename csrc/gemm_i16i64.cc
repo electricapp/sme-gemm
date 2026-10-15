@@ -4,6 +4,8 @@
 // 8 rows x 4 K-slices, panels are [ceil(K/4), 32] 4-way interleaved, and a
 // 16x16 super-tile is four 8x8 i64 ZA quadrants. Output is raw i64.
 
+#include "sme_gemm_api.h"
+
 #include "epilogue.h"
 #include <arm_neon.h>
 #include <arm_sme.h>
@@ -77,7 +79,7 @@ static void pack_band(int16_t *dst, const int16_t *src, long lane_stride, long d
     svmopa_za64_s16_m(1, pb, pb, al, bh)
 
 // m == 1: SME2 multi-vector SDOT into ZA64 vector groups instead of SMOPA;
-// see run_gemv in gemm_f16f16.c. 8-column bands of 4-deep groups, two per
+// see run_gemv in gemm_f16f16.cc. 8-column bands of 4-deep groups, two per
 // 16-wide tile; `abc` is [kp4][32]: A[4p..4p+3] repeated across the vector.
 // Past one row the SMOPA is cheaper.
 __arm_locally_streaming __arm_new("za") static void run_gemv(void *dst_v, const int16_t *abc,
@@ -339,7 +341,7 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                         svbool_t phi = svwhilelt_b64((uint64_t)0, (uint64_t)mr_hi);
                         // Clamp the hi-band base: when the band is empty (phi
                         // all-false) no lane is stored, but forming col+8 past
-                        // one-past-end is still UB (see gemm_f64.c).
+                        // one-past-end is still UB (see gemm_f64.cc).
                         for (size_t c = 0; c < (nc < 8 ? nc : 8); c++) {
                             int64_t *col = dst + (long)(n0 + c) * dst_cs + (long)m0 * dst_rs;
                             int64_t *colh = mr_hi ? col + 8 : col;
@@ -391,8 +393,8 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     }
 }
 
-static _Thread_local int16_t *g_apack = NULL;
-static _Thread_local size_t g_apack_cap = 0;
+static thread_local int16_t *g_apack = NULL;
+static thread_local size_t g_apack_cap = 0;
 static int16_t *apack_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1; // k==0: return a real (tiny) buffer, not a
                                // history-dependent NULL on fresh threads
@@ -410,7 +412,7 @@ static int16_t *apack_scratch(size_t bytes) {
 static void *xmalloc(size_t bytes) { return malloc(bytes ? bytes : 1); }
 
 // Small-GEMM fast path: A pre-packed, B packed per-nt into a small scratch
-// straight from row-major rhs (no full B-pack malloc/pass). See gemm_f64.c.
+// straight from row-major rhs (no full B-pack malloc/pass). See gemm_f64.cc.
 __arm_locally_streaming __arm_new("za") static void run_small(
     void *dst_v, long dst_cs, long dst_rs, const int16_t *a_pack, const int16_t *rhs, long rhs_rs,
     int16_t *b_scratch, size_t m, size_t n, size_t k, size_t mt_lo, size_t mt_hi, size_t kp4,
@@ -617,13 +619,6 @@ __arm_locally_streaming __arm_new("za") static void run_small(
 // dequantized (per-tensor `scale` or per-N `scale_n`) and the op-graph applied
 // in f32 at the store (scalar path), f32 output. Riding the existing non-packed
 // i16 run -- no new packed path.
-size_t gemm_sme_i16i64_packed_b_elems(size_t n, size_t k);
-void gemm_sme_i16i64_packb(int16_t *b_pack, const int16_t *rhs, size_t n, size_t k, long rhs_rs,
-                           long rhs_cs);
-int gemm_sme_i16i64_run_packed_impl(size_t m, size_t n, size_t k, void *dst, long dst_cs,
-                                    long dst_rs, const int16_t *lhs, long lhs_cs, long lhs_rs,
-                                    const int16_t *b_pack, const ep_dq_f32 *dq);
-
 static int gemm_sme_i16i64_run_impl(size_t m, size_t n, size_t k, void *dst, long dst_cs,
                                     long dst_rs, const int16_t *lhs, long lhs_cs, long lhs_rs,
                                     const int16_t *rhs, long rhs_cs, long rhs_rs,
@@ -634,7 +629,7 @@ static int gemm_sme_i16i64_run_impl(size_t m, size_t n, size_t k, void *dst, lon
     size_t per_tile = ep_cmul(kp4, 32);
 
     // Small + row-major B: pack B per-tile into a small scratch (no full B-pack
-    // malloc/pass), light dispatch. See gemm_f64.c.
+    // malloc/pass), light dispatch. See gemm_f64.cc.
 #define PACKA_SMALL(AP, MT0, MT1)                                                                   \
     for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                             \
         size_t r0 = st * 8;                                                                        \
@@ -695,7 +690,7 @@ static int gemm_sme_i16i64_run_impl(size_t m, size_t n, size_t k, void *dst, lon
     return rc;
 }
 
-// Elements in a packed-B buffer for (n, k). Saturating (see gemm_i8i32.c).
+// Elements in a packed-B buffer for (n, k). Saturating (see gemm_i8i32.cc).
 size_t gemm_sme_i16i64_packed_b_elems(size_t n, size_t k) {
     return ep_cmul(2 * ((n + 15) / 16), ep_cmul((k + 3) / 4, 32));
 }

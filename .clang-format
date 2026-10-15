@@ -1,4 +1,4 @@
-# C formatting for the SME kernels. Tuned to the existing hand-written style
+# Formatting for the SME kernels. Tuned to the existing hand-written style
 # (4-space indent, ~100 col, K&R braces, right-aligned pointers) so it formats
 # rather than rewrites.
 Language: Cpp

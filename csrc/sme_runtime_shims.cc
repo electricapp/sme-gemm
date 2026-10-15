@@ -13,6 +13,8 @@
 // down with them — every SME TU, F16F16 and F16F32 alike, links against
 // these symbols.
 
+#include "sme_gemm_api.h"
+
 #include <arm_sme.h>
 #include <stddef.h>
 #include <string.h>

@@ -208,7 +208,7 @@ fn lowbit_impl(a: &[f16], w: Codes<'_>, c: &mut [f16], m: usize, ep: &Epilogue<'
     crate::exec::apply_ep_scalar(c, m, n, n, 1, ep);
 }
 
-/// One row's int8 activations and per-block scales, as `csrc/gemm_q2.c`
+/// One row's int8 activations and per-block scales, as `csrc/gemm_q2.cc`
 /// quantizes them: `amax` NaN if any value is.
 fn quantize_row(a: &[f16], block: usize, q: &mut [i8], s: &mut [f32]) {
     for ((ab, qb), sb) in a.chunks(block).zip(q.chunks_mut(block)).zip(s.iter_mut()) {

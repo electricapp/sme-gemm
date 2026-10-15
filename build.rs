@@ -17,7 +17,7 @@ fn main() {
     }
 }
 
-/// Every C source and included fragment under `csrc/`. Fragments are `.h` files
+/// Every kernel source and included fragment under `csrc/`. Fragments are `.h` files
 /// `#include`d into the TU that owns their statics (see `csrc/epilogue.h` and
 /// the `gemm_*_{batched,small,q4}.h` splits), so they need rerun tracking even
 /// though they are never compiled on their own.
@@ -31,29 +31,29 @@ const CSRC: &[&str] = &[
     "epilogue_f32.h",
     "epilogue_f64.h",
     "neon_act.h",
-    "sme_probe.c",
-    "sme_runtime_shims.c",
-    "sme_warm.c",
-    "neon_ops.c",
-    "attention.c",
-    "attention.h",
-    "gemm_f16f32.c",
-    "gemm_bf16f32.c",
-    "gemm_i8i32.c",
-    "gemm_f32.c",
+    "sme_gemm_api.h",
+    "sme_probe.cc",
+    "sme_runtime_shims.cc",
+    "sme_warm.cc",
+    "neon_ops.cc",
+    "attention.cc",
+    "gemm_f16f32.cc",
+    "gemm_bf16f32.cc",
+    "gemm_i8i32.cc",
+    "gemm_f32.cc",
     "gemm_f32_batched.h",
     "gemm_f32_small.h",
-    "gemm_f16f16.c",
+    "gemm_f16f16.cc",
     "gemm_f16f16_batched.h",
     "gemm_f16f16_q4.h",
-    "gemm_b16b16.c",
+    "gemm_b16b16.cc",
     "gemm_b16b16_q4.h",
-    "gemm_f64.c",
+    "gemm_f64.cc",
     "gemm_f64_batched.h",
     "gemm_f64_small.h",
-    "gemm_i16i64.c",
+    "gemm_i16i64.cc",
     "gemm_i16i64_batched.h",
-    "gemm_q2.c",
+    "gemm_q2.cc",
 ];
 
 fn compile_sme_kernels() {
@@ -74,8 +74,15 @@ fn compile_sme_kernels() {
 
     require_apple_m4();
 
+    // C++26 without exceptions or RTTI, and nothing from libc++ that needs
+    // linking: `std::atomic` and the templates are header-only.
     let base = move |b: &mut cc::Build| {
-        b.flag("-mcpu=apple-m4")
+        b.cpp(true)
+            .std("c++2c")
+            .cpp_link_stdlib(None)
+            .flag("-fno-exceptions")
+            .flag("-fno-rtti")
+            .flag("-mcpu=apple-m4")
             .flag("-ffp-contract=fast")
             .opt_level(3);
         if c_asan {
@@ -89,13 +96,9 @@ fn compile_sme_kernels() {
             "-Wpointer-arith",
             "-Wcast-qual",
             "-Wwrite-strings",
-            "-Wstrict-prototypes",
             "-Wvla",
             "-Wdouble-promotion",
-            "-Wold-style-definition",
             "-Wredundant-decls",
-            "-Wnested-externs",
-            "-Wbad-function-cast",
             "-Wundef",
             "-Wformat=2",
             "-Wcast-align",
@@ -130,16 +133,16 @@ fn compile_sme_kernels() {
     // Base FEAT_SME translation units + the streaming-ABI shims.
     let mut sme = cc::Build::new();
     base(&mut sme);
-    sme.file("csrc/sme_runtime_shims.c")
-        .file("csrc/sme_probe.c")
-        .file("csrc/sme_warm.c")
-        .file("csrc/neon_ops.c");
+    sme.file("csrc/sme_runtime_shims.cc")
+        .file("csrc/sme_probe.cc")
+        .file("csrc/sme_warm.cc")
+        .file("csrc/neon_ops.cc");
     for f in [
-        "gemm_f16f32.c",
-        "gemm_bf16f32.c",
-        "gemm_i8i32.c",
-        "gemm_f32.c",
-        "attention.c",
+        "gemm_f16f32.cc",
+        "gemm_bf16f32.cc",
+        "gemm_i8i32.cc",
+        "gemm_f32.cc",
+        "attention.cc",
     ] {
         assert!(have(f), "required SME kernel csrc/{f} is missing");
         sme.file(format!("csrc/{f}"));
@@ -147,15 +150,15 @@ fn compile_sme_kernels() {
     sme.compile("sme_gemm_base");
 
     // b16b16 needs +sve-b16b16 too (svmul_bf16/svmla_bf16 in the epilogue).
-    feat_tu("gemm_f16f16.c", "sme_gemm_f16f16", &["+sme-f16f16"]);
+    feat_tu("gemm_f16f16.cc", "sme_gemm_f16f16", &["+sme-f16f16"]);
     feat_tu(
-        "gemm_b16b16.c",
+        "gemm_b16b16.cc",
         "sme_gemm_b16b16",
         &["+sme-b16b16", "+sve-b16b16"],
     );
-    feat_tu("gemm_f64.c", "sme_gemm_f64", &["+sme-f64f64"]);
-    feat_tu("gemm_i16i64.c", "sme_gemm_i16i64", &["+sme-i16i64"]);
-    feat_tu("gemm_q2.c", "sme_gemm_q2", &["+sme2p1"]);
+    feat_tu("gemm_f64.cc", "sme_gemm_f64", &["+sme-f64f64"]);
+    feat_tu("gemm_i16i64.cc", "sme_gemm_i16i64", &["+sme-i16i64"]);
+    feat_tu("gemm_q2.cc", "sme_gemm_q2", &["+sme2p1"]);
 
     link_compiler_rt(c_asan);
 }
@@ -178,15 +181,15 @@ fn compile_dispatch_cmp() {
     println!("cargo:rustc-link-lib=framework=MLCompute");
 }
 
-// Every TU is built `-mcpu=apple-m4`, which is what enables SME in the first
-// place. Clang gained that CPU name in 16; older ones reject the flag with a
-// bare "unsupported argument", once per source file and with no indication of
-// what to do about it. Check once, up front, and say so.
+// Every TU is built `-mcpu=apple-m4 -std=c++2c`; the CPU name is what enables
+// SME in the first place. Clang gained it in 16; older ones reject the flag
+// with a bare "unsupported argument", once per source file and with no
+// indication of what to do about it. Check once, up front, and say so.
 fn require_apple_m4() {
-    let cc = cc::Build::new().get_compiler();
+    let cc = cc::Build::new().cpp(true).get_compiler();
     let path = cc.path().to_string_lossy().into_owned();
     let ok = std::process::Command::new(&path)
-        .args(["-mcpu=apple-m4", "-x", "c", "-c", "-o"])
+        .args(["-mcpu=apple-m4", "-std=c++2c", "-x", "c++", "-c", "-o"])
         .arg(std::env::temp_dir().join("sme_gemm_mcpu_probe.o"))
         .arg("-")
         .stdin(std::process::Stdio::null())
@@ -194,7 +197,7 @@ fn require_apple_m4() {
         .is_ok_and(|o| o.status.success());
     assert!(
         ok,
-        "`{path}` does not accept -mcpu=apple-m4, so it cannot build the SME \
+        "`{path}` does not accept -mcpu=apple-m4 -std=c++2c, so it cannot build the SME \
          kernels. Apple clang 16 (Xcode 16) or a matching upstream clang is the \
          minimum; select one via $CC or `xcode-select`."
     );
@@ -206,6 +209,7 @@ fn require_apple_m4() {
 // toolchain than the one that built the objects.
 fn link_compiler_rt(c_asan: bool) {
     let cc_path = cc::Build::new()
+        .cpp(true)
         .get_compiler()
         .path()
         .to_string_lossy()

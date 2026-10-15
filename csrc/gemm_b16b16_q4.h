@@ -1,5 +1,5 @@
 // bf16 Q4 path: C(bf16) = A(bf16) @ dequant(B), B kept 4-bit resident.
-// Included at the end of gemm_b16b16.c for its `bf16` typedef, `packa` and the
+// Included at the end of gemm_b16b16.cc for its `bf16` typedef, `packa` and the
 // dense kernels; the f16 twin is gemm_f16f16_q4.h, which describes the
 // band-major resident layout both read. Scales and mins stay f16 -- that is the
 // GGUF Q4_0/Q4_1 on-disk type, and it carries more mantissa than bf16, so one

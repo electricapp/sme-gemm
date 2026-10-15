@@ -1,11 +1,10 @@
 // Runtime probes via sysctl: SME capability flags and the core count.
+#include "sme_gemm_api.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/sysctl.h>
-
-int sme_sysctl_flag(const char *name);
-int64_t sme_sysctl_int(const char *name);
 
 // The named integer sysctl (32- or 64-bit), or -1 if it does not exist.
 int64_t sme_sysctl_int(const char *name) {

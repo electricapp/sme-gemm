@@ -14,15 +14,15 @@
 // 0.095 ns/element this draws ~84 GB/s of a ~150 GB/s machine: compute-bound,
 // not bandwidth-bound.
 
+#include "sme_gemm_api.h"
+
 #include <arm_neon.h>
+#include <atomic>
 #include <dispatch/dispatch.h>
 #include <math.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-
-#include "attention.h"
 
 // Below this many elements the dispatch_apply round trip costs more than the
 // work it spreads.
@@ -457,12 +457,13 @@ int attn_kv_causal_f16(float *out, const float *q, const __fp16 *k, const __fp16
     // Work ~ head-keys at ~3.5 ns each; below ~16K (~60 us) one thread does it.
     size_t work = n_heads * (rows * start + rows * (rows + 1) / 2);
     size_t chunks = work < (1u << 14) ? 1 : rows < ATTN_MAX_CHUNKS ? rows : ATTN_MAX_CHUNKS;
-    __block atomic_int failed = 0;
+    // A block copies what it captures and an atomic can't be copied: share it by pointer.
+    std::atomic<int> failed_flag{0}, *failed = &failed_flag;
     void (^body)(size_t) = ^(size_t ci) {
       // Later rows hold more keys: interleave rows across chunks to balance.
-      float *scores = malloc((start + rows) * sizeof(float));
+      float *scores = static_cast<float *>(malloc((start + rows) * sizeof(float)));
       if (!scores) {
-          atomic_store_explicit(&failed, 1, memory_order_relaxed);
+          failed->store(1, std::memory_order_relaxed);
           return;
       }
       for (size_t i = ci; i < rows; i += chunks)
@@ -474,5 +475,5 @@ int attn_kv_causal_f16(float *out, const float *q, const __fp16 *k, const __fp16
         body(0);
     else
         dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), body);
-    return atomic_load_explicit(&failed, memory_order_relaxed) ? -1 : 0;
+    return failed->load(std::memory_order_relaxed) ? -1 : 0;
 }

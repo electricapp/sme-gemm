@@ -4,7 +4,7 @@
 //! parameters, write f32 or straight to f16 for the next
 //! [`Linear`](crate::Linear).
 //!
-//! NEON on the calling thread (`csrc/neon_ops.c`; plain Rust elsewhere): one
+//! NEON on the calling thread (`csrc/neon_ops.cc`; plain Rust elsewhere): one
 //! row is tens of nanoseconds of work, far below what spreading it across
 //! cores or entering a streaming region would cost.
 

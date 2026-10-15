@@ -1,12 +1,12 @@
 // Batched i16: `count` independent same-shape GEMMs in ONE streaming session, so
 // the streaming entry/exit is paid once for the whole batch rather than per item.
-// Split out of gemm_i16i64.c (which owns the packing helpers and scratch this
+// Split out of gemm_i16i64.cc (which owns the packing helpers and scratch this
 // closes over) purely to keep both files navigable; it is included in place.
 #ifndef SME_GEMM_I16I64_BATCHED_H
 #define SME_GEMM_I16I64_BATCHED_H
 
 // One row-major GEMM (C(i64) = A(i16) @ B(i16)), already in streaming mode -- a
-// batch pays the streaming entry once. See gemm_i8i32.c batch_one. When `dq` is
+// batch pays the streaming entry once. See gemm_i8i32.cc batch_one. When `dq` is
 // NULL the raw i64 tile is stored; when set, the four i64 quadrants are read into
 // a scratch and dequantized via the f32 op-graph (ep_dequant_cell_i64) into the
 // f32 output `fdst` (row-major). This mirrors run_streaming's dq branch. A/B are

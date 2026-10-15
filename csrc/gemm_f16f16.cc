@@ -7,6 +7,8 @@
 // Computes dst = alpha*dst + beta*(A @ B); fp16 accumulate, fp16 alpha/beta
 // combine. Single pass over K, single-threaded per cluster.
 
+#include "sme_gemm_api.h"
+
 #include "epilogue.h"
 #include "neon_act.h"
 #include "panel_ring.h"
@@ -927,8 +929,8 @@ static void packb(f16 *b_pack, const f16 *b, size_t n, size_t k, long rhs_rs, lo
 
 // Per-thread reusable A-pack scratch (no per-call malloc/free on the serial
 // small/medium path). Grows monotonically, lives for the thread's lifetime.
-static _Thread_local f16 *g_apack = NULL;
-static _Thread_local size_t g_apack_cap = 0;
+static thread_local f16 *g_apack = NULL;
+static thread_local size_t g_apack_cap = 0;
 static f16 *apack_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1; // k==0: return a real (tiny) buffer, not a
                                // history-dependent NULL on fresh threads
@@ -1104,7 +1106,7 @@ static int run_packed_core(size_t m, size_t n, size_t k, uint16_t *dst, long dst
           packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles,
                 per_tile);
         });
-    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.c.
+    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.cc.
     dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
       size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
       size_t mt0 = ci * M_CHUNK;
@@ -1208,12 +1210,12 @@ static int run_panels(f16 *dst, long dst_cs, long dst_rs, const f16 *a, long lhs
     size_t n_d = (slot_tiles + dt - 1) / dt;
 
     size_t slot_elems = ep_cmul(slot_tiles, per_tile);
-    _Atomic size_t *ctr;
+    std::atomic<size_t> *ctr;
     f16 *pool = (f16 *)ring_pool(2 * n_blocks + 2 + n_chunks,
                                  ep_cmul(ep_cmul(n_slots, slot_elems), sizeof(f16)), &ctr);
     f16 *a_pack = apack_scratch(ep_cmul(ep_cmul(m_tiles, per_tile), sizeof(f16)));
     if (!pool || !a_pack) return -1;
-    _Atomic size_t *a_done = ctr + 2 * n_blocks + 2;
+    std::atomic<size_t> *a_done = ctr + 2 * n_blocks + 2;
     if (n_chunks <= 1) packa(a_pack, a, m, k, lhs_rs, lhs_cs, 0, m_tiles, per_tile);
 
     ring_run(
@@ -1240,9 +1242,9 @@ static int run_panels(f16 *dst, long dst_cs, long dst_rs, const f16 *a, long lhs
           // only for the pack, not for the item's MOPAs.
           if (n_chunks > 1 && sg == 0 && sj == 0) {
               packa(a_pack, a, m, k, lhs_rs, lhs_cs, mt0, mt1, per_tile);
-              atomic_store_explicit(&a_done[ci], 1, memory_order_release);
+              a_done[ci].store(1, std::memory_order_release);
           } else if (n_chunks > 1) {
-              while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+              while (!a_done[ci].load(std::memory_order_acquire))
                   __builtin_arm_yield();
           }
           if (n0 < n1)
@@ -1280,19 +1282,19 @@ static int run_cols(f16 *dst, long dst_cs, long dst_rs, const f16 *a, long lhs_r
     size_t n_units = n_chunks + n_items;
     size_t W = n_units < 12 ? n_units : 12;
     size_t panel = ep_cmul(NC + 1, per_tile);
-    _Atomic size_t *ctr;
+    std::atomic<size_t> *ctr;
     f16 *pool = (f16 *)ring_pool(2 + n_chunks, ep_cmul(ep_cmul(W, panel), sizeof(f16)), &ctr);
     f16 *a_pack = apack_scratch(ep_cmul(ep_cmul(m_tiles, per_tile), sizeof(f16)));
     if (!pool || !a_pack) return -1;
-    _Atomic size_t *cur = ctr, *a_cnt = ctr + 1, *a_done = ctr + 2;
+    std::atomic<size_t> *cur = ctr, *a_cnt = ctr + 1, *a_done = ctr + 2;
     dispatch_apply(W, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t w) {
       f16 *bt = pool + w * panel;
-      for (size_t i; (i = atomic_fetch_add_explicit(cur, 1, memory_order_relaxed)) < n_units;) {
+      for (size_t i; (i = cur->fetch_add(1, std::memory_order_relaxed)) < n_units;) {
           if (i < n_chunks) {
               size_t mt1 = (i + 1) * M_CHUNK < m_tiles ? (i + 1) * M_CHUNK : m_tiles;
               packa(a_pack, a, m, k, lhs_rs, lhs_cs, i * M_CHUNK, mt1, per_tile);
-              atomic_store_explicit(&a_done[i], 1, memory_order_release);
-              atomic_fetch_add_explicit(a_cnt, 1, memory_order_release);
+              a_done[i].store(1, std::memory_order_release);
+              a_cnt->fetch_add(1, std::memory_order_release);
               continue;
           }
           size_t it = i - n_chunks, mt_lo = 0;
@@ -1303,7 +1305,7 @@ static int run_cols(f16 *dst, long dst_cs, long dst_rs, const f16 *a, long lhs_r
               // M-tile 0 multiplies straight from B's rows, capturing the pair as
               // packed tiles when more M-tiles follow; those run the packed kernel.
               t0 = 2 * it, t1 = t0 + 2, mt_lo = 1;
-              while (!atomic_load_explicit(&a_done[0], memory_order_acquire))
+              while (!a_done[0].load(std::memory_order_acquire))
                   __builtin_arm_yield();
               run_direct(dst, dst_rs, a_pack, b, rhs_rs, m, n, k, 0, 1, t0, m_tiles > 1 ? bt : NULL,
                          alpha, beta, read_dst);
@@ -1316,14 +1318,14 @@ static int run_cols(f16 *dst, long dst_cs, long dst_rs, const f16 *a, long lhs_r
               if (tail) pack_b_range(bo, b, rhs_rs, rhs_cs, n, k, n_tiles - 1, n_tiles, per_tile);
           }
           // All of A packed: one pass. Otherwise M-chunk by M-chunk as each lands.
-          int all = atomic_load_explicit(a_cnt, memory_order_acquire) == n_chunks;
+          int all = a_cnt->load(std::memory_order_acquire) == n_chunks;
           for (size_t ci = 0; ci < (all ? 1 : n_chunks); ci++) {
               size_t mt0 = all ? 0 : ci * M_CHUNK;
               size_t mt1 = all ? m_tiles : (mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
               if (mt0 < mt_lo) mt0 = mt_lo;
               if (mt0 >= mt1) continue;
               if (!all)
-                  while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+                  while (!a_done[ci].load(std::memory_order_acquire))
                       __builtin_arm_yield();
               if (t0 < t1)
                   run_streaming(dst, dst_cs, dst_rs, a_pack, bt, m, n, k, mt0, mt1, n_tiles, t0, t1,
@@ -1345,7 +1347,7 @@ static int run_gemv_cols(f16 *dst, long dst_rs, const f16 *a, long lhs_rs, long 
     size_t n_tiles = (n + 31) / 32, per_tile = ep_cmul(k, 32);
     size_t G = 4, n_items = (n_tiles + G - 1) / G;
     size_t W = n_items < 12 ? n_items : 12;
-    _Atomic size_t *cur;
+    std::atomic<size_t> *cur;
     f16 *pool = (f16 *)ring_pool(1, ep_cmul(ep_cmul(W * G, per_tile), sizeof(f16)), &cur);
     f16 *abc = apack_scratch(ep_cmul(ep_cmul(m, per_tile), sizeof(f16)));
     if (!pool || !abc) return -1;
@@ -1353,7 +1355,7 @@ static int run_gemv_cols(f16 *dst, long dst_rs, const f16 *a, long lhs_rs, long 
         bcast_row(abc + r * per_tile, a + (long)r * lhs_rs, lhs_cs, k);
     dispatch_apply(W, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t w) {
       f16 *bt = pool + w * G * per_tile;
-      for (size_t i; (i = atomic_fetch_add_explicit(cur, 1, memory_order_relaxed)) < n_items;) {
+      for (size_t i; (i = cur->fetch_add(1, std::memory_order_relaxed)) < n_items;) {
           size_t t0 = i * G, t1 = t0 + G < n_tiles ? t0 + G : n_tiles;
           pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, t1, per_tile);
           run_gemv(dst, dst_rs, abc, NULL, 0, m, bt, n, k, t0, t1, alpha, beta, read_dst, NULL);

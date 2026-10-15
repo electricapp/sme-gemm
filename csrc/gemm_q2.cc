@@ -24,6 +24,8 @@
 // block edge the sum folds into an f32 total as total + f32(sum) * (scale*s),
 // fused, block by block in K order. Nothing in a column's result depends on how
 // rows, bands or threads are split, and src/kernels/q2 computes the same bits.
+#include "sme_gemm_api.h"
+
 #include "epilogue.h"
 #include "neon_act.h"
 #include <arm_neon.h>
@@ -41,8 +43,8 @@ typedef __fp16 f16;
 
 // Per-thread scratch for the quantized A and its scales. Grows monotonically;
 // dispatched chunks read the caller's buffer while the caller waits.
-static _Thread_local uint8_t *g_q2_scratch = NULL;
-static _Thread_local size_t g_q2_cap = 0;
+static thread_local uint8_t *g_q2_scratch = NULL;
+static thread_local size_t g_q2_cap = 0;
 static uint8_t *q2_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1;
     if (g_q2_cap < bytes) {
@@ -408,9 +410,6 @@ static int q2_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
 // the kernel (neon_act.h), as on the Q4 path.
 int gemm_sme_f16_q2(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
                     const uint8_t *codes, const uint16_t *scales, const int8_t *codebook,
-                    size_t block, const ep_desc16 *ep);
-int gemm_sme_f16_q2(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
-                    const uint8_t *codes, const uint16_t *scales, const int8_t *codebook,
                     size_t block, const ep_desc16 *ep) {
     ep_desc16 rest;
     uint32_t act = na_split(ep, &rest);
@@ -421,9 +420,6 @@ int gemm_sme_f16_q2(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t 
 }
 
 // The 1-bit GEMM: weights scale * (+1 or -1), signs packed as above.
-int gemm_sme_f16_q1(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
-                    const uint8_t *signs, const uint16_t *scales, size_t block,
-                    const ep_desc16 *ep);
 int gemm_sme_f16_q1(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
                     const uint8_t *signs, const uint16_t *scales, size_t block,
                     const ep_desc16 *ep) {

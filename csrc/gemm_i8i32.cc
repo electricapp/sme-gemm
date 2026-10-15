@@ -7,6 +7,8 @@
 // ZA quadrants. Output is raw i32 (overwrite); scale/zero-point dequant is a
 // separate epilogue concern.
 
+#include "sme_gemm_api.h"
+
 #include "epilogue.h"
 #include <arm_neon.h>
 #include <arm_sme.h>
@@ -439,7 +441,7 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                         svbool_t phi = svwhilelt_b32((uint32_t)0, (uint32_t)mr_hi);
                         // Clamp the hi-band base: when the band is empty (phi
                         // all-false) no lane is stored, but forming col+16 past
-                        // one-past-end is still UB (see gemm_f32.c).
+                        // one-past-end is still UB (see gemm_f32.cc).
                         for (size_t c = 0; c < (nc < 16 ? nc : 16); c++) {
                             int32_t *col = dst + (long)(n0 + c) * dst_cs + (long)m0 * dst_rs;
                             int32_t *colh = mr_hi ? col + 16 : col;
@@ -526,8 +528,8 @@ void gemm_sme_i8i32_packb(int8_t *b_pack, const int8_t *rhs, size_t n, size_t k,
 // malloc/free per call is a measurable fraction of a tiny problem's time. The
 // buffer grows monotonically and lives for the thread's lifetime (each GCD
 // worker keeps its own, so the parallel path is unaffected).
-static _Thread_local int8_t *g_apack = NULL;
-static _Thread_local size_t g_apack_cap = 0;
+static thread_local int8_t *g_apack = NULL;
+static thread_local size_t g_apack_cap = 0;
 static int8_t *apack_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1; // k==0: return a real (tiny) buffer, not a
                                // history-dependent NULL on fresh threads
@@ -544,8 +546,8 @@ static int8_t *apack_scratch(size_t bytes) {
 // calling thread resizes or frees it; the dispatch_apply workers just READ it
 // and finish before the call returns, so handing them a pointer into the
 // owner's TLS is safe.
-static _Thread_local int8_t *g_bpack = NULL;
-static _Thread_local size_t g_bpack_cap = 0;
+static thread_local int8_t *g_bpack = NULL;
+static thread_local size_t g_bpack_cap = 0;
 static int8_t *bpack_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1; // k==0 / n==0: a real (tiny) buffer, never a
                                // history-dependent NULL on fresh threads
@@ -655,7 +657,7 @@ int gemm_sme_i8i32_run_packed_impl(size_t m, size_t n, size_t k, void *dst, long
               size_t mt0 = ci * M_CHUNK;
               PACKA_RANGE(a_pack, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
             });
-        // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.c.
+        // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.cc.
         dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
                        ^(size_t it) {
                          size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
@@ -704,7 +706,7 @@ int gemm_sme_i8i32_run(size_t m, size_t n, size_t k, int32_t *dst, long dst_cs, 
 }
 
 // One row-major GEMM (C(i32) = A(i8) @ B(i8)), already in streaming mode -- a
-// batch pays the streaming entry once. See gemm_f16f16.c batch_one. When `dq` is
+// batch pays the streaming entry once. See gemm_f16f16.cc batch_one. When `dq` is
 // NULL the raw i32 tile is stored; when set, the four i32 quadrants are read into
 // a scratch and dequantized via the f32 op-graph (ep_dequant_cell) into the f32
 // output `fdst` (row-major). This mirrors run_streaming's dq branch.

@@ -25,7 +25,7 @@
 // NAVIGABILITY MAP: what lives where across epilogue*.h
 // =============================================================================
 //
-// CONCEPT. This file is the op-graph INTERPRETER that every gemm_*.c kernel
+// CONCEPT. This file is the op-graph INTERPRETER that every gemm_*.cc kernel
 // includes. The Rust side (src/epilogue/mod.rs) builds an array of EpNode and hands
 // it across FFI in an ep_desc{16,_f32,_f64}. At the ZA->C store, the kernel reads
 // the live accumulator slice into registers and walks the node list, mutating the
@@ -232,12 +232,12 @@ typedef struct {
 
 // Pin the layout the Rust #[repr(C)] mirror (src/epilogue/mod.rs) asserts against:
 // 32 bytes on arm64, with the 4-byte hole before `ptr`. Drift = silent FFI UB.
-_Static_assert(sizeof(EpNode) == 32, "EpNode must match the Rust mirror (32 bytes)");
-_Static_assert(offsetof(EpNode, op) == 0, "EpNode.op offset must match the Rust mirror");
-_Static_assert(offsetof(EpNode, aux) == 4, "EpNode.aux offset must match the Rust mirror");
-_Static_assert(offsetof(EpNode, scalar) == 8, "EpNode.scalar offset must match the Rust mirror");
-_Static_assert(offsetof(EpNode, ptr) == 16, "EpNode.ptr offset must match the Rust mirror");
-_Static_assert(offsetof(EpNode, ld) == 24, "EpNode.ld offset must match the Rust mirror");
+static_assert(sizeof(EpNode) == 32, "EpNode must match the Rust mirror (32 bytes)");
+static_assert(offsetof(EpNode, op) == 0, "EpNode.op offset must match the Rust mirror");
+static_assert(offsetof(EpNode, aux) == 4, "EpNode.aux offset must match the Rust mirror");
+static_assert(offsetof(EpNode, scalar) == 8, "EpNode.scalar offset must match the Rust mirror");
+static_assert(offsetof(EpNode, ptr) == 16, "EpNode.ptr offset must match the Rust mirror");
+static_assert(offsetof(EpNode, ld) == 24, "EpNode.ld offset must match the Rust mirror");
 
 // 16-bit epilogue descriptor (f16 and bf16 share the layout): an ordered list of
 // op-graph nodes. NULL nodes / n_nodes==0 means identity.
@@ -256,17 +256,17 @@ typedef struct {
 } ep_dq_f32;
 
 // Pinned against the Rust #[repr(C)] mirror (src/ffi.rs DqF32).
-_Static_assert(sizeof(ep_dq_f32) == 32, "ep_dq_f32 must match the Rust mirror");
-_Static_assert(offsetof(ep_dq_f32, scale) == 0, "ep_dq_f32.scale offset");
-_Static_assert(offsetof(ep_dq_f32, scale_n) == 8, "ep_dq_f32.scale_n offset");
-_Static_assert(offsetof(ep_dq_f32, n_nodes) == 16, "ep_dq_f32.n_nodes offset");
-_Static_assert(offsetof(ep_dq_f32, nodes) == 24, "ep_dq_f32.nodes offset");
+static_assert(sizeof(ep_dq_f32) == 32, "ep_dq_f32 must match the Rust mirror");
+static_assert(offsetof(ep_dq_f32, scale) == 0, "ep_dq_f32.scale offset");
+static_assert(offsetof(ep_dq_f32, scale_n) == 8, "ep_dq_f32.scale_n offset");
+static_assert(offsetof(ep_dq_f32, n_nodes) == 16, "ep_dq_f32.n_nodes offset");
+static_assert(offsetof(ep_dq_f32, nodes) == 24, "ep_dq_f32.nodes offset");
 
 // f32 epilogue descriptor: an ordered op-graph applied in the f32 accumulator
 // domain (operands are f32). NULL nodes / n_nodes==0 means identity.
 // row_sum / row_max are OPTIONAL per-M reduction outputs (length m, NULL to
 // skip), written once per row right after that row's last N-tile store, while
-// the row is still L1-hot. See the reduction block in gemm_f32.c for why it is
+// the row is still L1-hot. See the reduction block in gemm_f32.cc for why it is
 // there and not fused into the store itself.
 typedef struct {
     uint32_t n_nodes;

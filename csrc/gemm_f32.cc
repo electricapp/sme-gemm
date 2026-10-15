@@ -5,16 +5,17 @@
 //
 // Computes dst = alpha*dst + beta*(A @ B).
 
+#include "sme_gemm_api.h"
+
 #include <arm_neon.h>
 #include <arm_sme.h>
+#include <atomic>
 #include <dispatch/dispatch.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "attention.h"
 #include "epilogue.h"
 #include "panel_ring.h"
 
@@ -164,7 +165,7 @@ static size_t f32_nc_blk(size_t k, size_t n_tiles) {
 }
 
 // m <= 4: SME2 multi-vector FMLA into ZA vector groups instead of MOPA; see
-// run_gemv in gemm_f16f16.c. 16-column bands, two per 32-wide tile; `abc` is
+// run_gemv in gemm_f16f16.cc. 16-column bands, two per 32-wide tile; `abc` is
 // [rows][k][16] broadcast A; b_pack points at tile nt_lo. The bound is FMLA
 // issue (~3 cycles per vg1x4, measured), and the P-cluster's one SME unit is
 // shared, so more threads do not raise it.
@@ -268,7 +269,7 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(float *dst, long ds
 // same L2 bank (1.8x slower, measured). Each band still sums its four depth
 // phases in run_gemv's order, so the two agree bit for bit.
 //
-// One pass's accumulate, inlined per row count (see gemm_f16f16.c's twin).
+// One pass's accumulate, inlined per row count (see gemm_f16f16.cc's twin).
 __attribute__((always_inline)) static inline void
 gemv_rm_acc(size_t rows, const float *b, long b_rs, const float *abc, size_t per_band, size_t k,
             size_t G, svcount_t pc0, svcount_t pc1, svcount_t pc2,
@@ -751,8 +752,8 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
 
 // Per-thread reusable A-pack scratch (no per-call malloc/free on the serial
 // small/medium path). Grows monotonically, lives for the thread's lifetime.
-static _Thread_local float *g_apack = NULL;
-static _Thread_local size_t g_apack_cap = 0;
+static thread_local float *g_apack = NULL;
+static thread_local size_t g_apack_cap = 0;
 static float *apack_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1; // k==0: return a real (tiny) buffer, not a
                                // history-dependent NULL on fresh threads
@@ -819,13 +820,6 @@ __arm_locally_streaming __arm_new("za") static void packa_sme(float *a_pack, con
 // Batched f32: `count` independent same-shape GEMMs in ONE streaming session, so
 #include "gemm_f32_batched.h"
 
-size_t gemm_sme_f32_packed_b_elems(size_t n, size_t k);
-void gemm_sme_f32_packb(float *b_pack, const float *rhs, size_t n, size_t k, long rhs_rs,
-                        long rhs_cs);
-int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_cs, long dst_rs,
-                            int read_dst, const float *lhs, long lhs_cs, long lhs_rs,
-                            const float *b_pack, float alpha, float beta, const ep_desc_f32 *ep);
-
 // GEMV operand: abc[r][d*16 + j] = A[r, d], in the per-thread A scratch.
 static float *bcast_rows(const float *a, long rs, long cs, size_t m, size_t k) {
     size_t per_band = ep_cmul(k, 16);
@@ -865,7 +859,7 @@ static void pack_a_range(float *a_pack, const float *a, long rs, long cs, size_t
 // bands out packed ([2][k][16]) for the packed kernel to take the other
 // M-tiles, and prefetches B 16 rows ahead: the SME loads alone keep too few
 // misses in flight (128x8192x4096 1.45 -> 2.05 TF/s; neither the 16-bit kernels
-// nor a one-M-tile pass gain from it). See gemm_f16f16.c's twin.
+// nor a one-M-tile pass gain from it). See gemm_f16f16.cc's twin.
 // Row-major C, no epilogue.
 __arm_locally_streaming __arm_new("za") static void run_direct(float *dst, long dst_rs,
                                                                const float *a_pack, const float *b,
@@ -962,7 +956,7 @@ __arm_locally_streaming __arm_new("za") static void run_direct(float *dst, long 
     }
 }
 
-// Per-worker column items, as gemm_f16f16.c's run_cols: each worker packs its own
+// Per-worker column items, as gemm_f16f16.cc's run_cols: each worker packs its own
 // two super-tiles of B and multiplies them while they are in cache; the first
 // units pack A by M-chunk.
 static int run_cols(float *dst, long dst_cs, long dst_rs, const float *a, long lhs_rs, long lhs_cs,
@@ -982,26 +976,26 @@ static int run_cols(float *dst, long dst_cs, long dst_rs, const float *a, long l
     size_t n_items = (n_tiles + NC - 1) / NC, n_units = n_chunks + n_items;
     size_t W = n_units < 12 ? n_units : 12;
     size_t panel = ep_cmul(2 * NC, per_tile);
-    _Atomic size_t *ctr;
+    std::atomic<size_t> *ctr;
     float *pool = (float *)ring_pool(2 + n_chunks, ep_cmul(ep_cmul(W, panel), sizeof(float)), &ctr);
     float *a_pack = apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(float)));
     if (!pool || !a_pack) return -1;
-    _Atomic size_t *cur = ctr, *a_cnt = ctr + 1, *a_done = ctr + 2;
+    std::atomic<size_t> *cur = ctr, *a_cnt = ctr + 1, *a_done = ctr + 2;
     dispatch_apply(W, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t w) {
       float *bt = pool + w * panel;
-      for (size_t i; (i = atomic_fetch_add_explicit(cur, 1, memory_order_relaxed)) < n_units;) {
+      for (size_t i; (i = cur->fetch_add(1, std::memory_order_relaxed)) < n_units;) {
           if (i < n_chunks) {
               size_t mt1 = (i + 1) * M_CHUNK < m_tiles ? (i + 1) * M_CHUNK : m_tiles;
               pack_a_range(a_pack, a, lhs_rs, lhs_cs, m, k, i * M_CHUNK, mt1);
-              atomic_store_explicit(&a_done[i], 1, memory_order_release);
-              atomic_fetch_add_explicit(a_cnt, 1, memory_order_release);
+              a_done[i].store(1, std::memory_order_release);
+              a_cnt->fetch_add(1, std::memory_order_release);
               continue;
           }
           size_t t0 = (i - n_chunks) * NC, t1 = t0 + NC < n_tiles ? t0 + NC : n_tiles, mt_lo = 0;
           if (direct) {
               // M-tile 0 multiplies straight from B's rows, capturing the bands
               // when more M-tiles follow; those run the packed kernel.
-              while (!atomic_load_explicit(&a_done[0], memory_order_acquire))
+              while (!a_done[0].load(std::memory_order_acquire))
                   __builtin_arm_yield();
               for (size_t t = t0; t < t1; t++)
                   run_direct(dst, dst_rs, a_pack, b, rhs_rs, m, n, k, 0, 1, t,
@@ -1012,14 +1006,14 @@ static int run_cols(float *dst, long dst_cs, long dst_rs, const float *a, long l
               pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, t1);
           }
           // All of A packed: one pass. Otherwise M-chunk by M-chunk as each lands.
-          int all = atomic_load_explicit(a_cnt, memory_order_acquire) == n_chunks;
+          int all = a_cnt->load(std::memory_order_acquire) == n_chunks;
           for (size_t ci = 0; ci < (all ? 1 : n_chunks); ci++) {
               size_t mt0 = all ? 0 : ci * M_CHUNK;
               size_t mt1 = all ? m_tiles : (mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
               if (mt0 < mt_lo) mt0 = mt_lo;
               if (mt0 >= mt1) continue;
               if (!all)
-                  while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+                  while (!a_done[ci].load(std::memory_order_acquire))
                       __builtin_arm_yield();
               run_streaming(dst, dst_cs, dst_rs, a_pack, bt, m, n, mt0, mt1, t0, t1, k, alpha, beta,
                             read_dst, ep);
@@ -1030,7 +1024,7 @@ static int run_cols(float *dst, long dst_cs, long dst_rs, const float *a, long l
 }
 
 // Large A: B is built per N-block into a panel ring (panel_ring.h) and shared by
-// every M-chunk, as gemm_f16f16.c's run_panels.
+// every M-chunk, as gemm_f16f16.cc's run_panels.
 static int run_panels(float *dst, long dst_cs, long dst_rs, const float *a, long lhs_rs,
                       long lhs_cs, size_t m, size_t n, size_t k, float alpha, float beta,
                       int read_dst, const float *b, long rhs_rs, long rhs_cs,
@@ -1055,12 +1049,12 @@ static int run_panels(float *dst, long dst_cs, long dst_rs, const float *a, long
     if (dt > nc_blk) dt = nc_blk;
     size_t n_d = (nc_blk + dt - 1) / dt;
     size_t slot_elems = ep_cmul(nc_blk, tile);
-    _Atomic size_t *ctr;
+    std::atomic<size_t> *ctr;
     float *pool = (float *)ring_pool(2 * n_blocks + 2 + n_chunks,
                                      ep_cmul(ep_cmul(n_slots, slot_elems), sizeof(float)), &ctr);
     float *a_pack = apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(float)));
     if (!pool || !a_pack) return -1;
-    _Atomic size_t *a_done = ctr + 2 * n_blocks + 2;
+    std::atomic<size_t> *a_done = ctr + 2 * n_blocks + 2;
     if (n_chunks <= 1) pack_a_range(a_pack, a, lhs_rs, lhs_cs, m, k, 0, m_tiles);
 
     ring_run(
@@ -1080,9 +1074,9 @@ static int run_panels(float *dst, long dst_cs, long dst_rs, const float *a, long
           // Block 0's first item per M-chunk packs that chunk of A.
           if (n_chunks > 1 && sg == 0 && sj == 0) {
               pack_a_range(a_pack, a, lhs_rs, lhs_cs, m, k, mt0, mt1);
-              atomic_store_explicit(&a_done[ci], 1, memory_order_release);
+              a_done[ci].store(1, std::memory_order_release);
           } else if (n_chunks > 1) {
-              while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+              while (!a_done[ci].load(std::memory_order_acquire))
                   __builtin_arm_yield();
           }
           if (n0 < n1)
@@ -1163,10 +1157,10 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
                 // keeps the NEON pack overlapping MOPA issue -- splitting the
                 // pack into its own pass to allow finer scheduling costs more
                 // than the balance it buys.
-                _Atomic size_t cursor = 0;
+                std::atomic<size_t> cursor = 0;
                 // Blocks capture by const value, so capture the POINTER: taking
                 // &cursor inside the block would give each worker its own.
-                _Atomic size_t *cur = &cursor;
+                std::atomic<size_t> *cur = &cursor;
                 // ZA-transpose the A-pack while A is small enough to stay in
                 // cache; once it is DRAM-sized the NEON transpose's wider
                 // memory-level parallelism wins back more than the instruction
@@ -1178,8 +1172,7 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
                                ^(size_t w) {
                                  (void)w;
                                  for (;;) {
-                                     size_t ci = atomic_fetch_add_explicit(cur, 1,
-                                                                           memory_order_relaxed);
+                                     size_t ci = cur->fetch_add(1, std::memory_order_relaxed);
                                      size_t mt0 = ci * sc_chunk;
                                      if (mt0 >= m_tiles) break;
                                      size_t mt1 =
@@ -1221,7 +1214,7 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
     return rc;
 }
 
-// Elements in a packed-B buffer for (n, k). Saturating (see gemm_i8i32.c).
+// Elements in a packed-B buffer for (n, k). Saturating (see gemm_i8i32.cc).
 size_t gemm_sme_f32_packed_b_elems(size_t n, size_t k) {
     return ep_cmul(2 * ((n + 31) / 32), ep_cmul(k, 16));
 }
@@ -1333,7 +1326,7 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
           size_t mt0 = ci * M_CHUNK;
           PACKA_RANGE(a_pack, mt0, mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
         });
-    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.c.
+    // Flat dispatch over (N-block, M-chunk), block-major; see gemm_i16i64.cc.
     dispatch_apply(n_blocks * n_chunks, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t it) {
       size_t ci = it % n_chunks, jc = it / n_chunks * nc_blk;
       size_t mt0 = ci * M_CHUNK;
@@ -1349,7 +1342,7 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
 }
 
 // C = softmax_rows(A @ B), B pre-packed. One GEMM (whose store also produces the
-// per-row maxima) followed by the parallel NEON softmax pass in attention.c.
+// per-row maxima) followed by the parallel NEON softmax pass in attention.cc.
 int gemm_sme_f32_softmax(size_t m, size_t n, size_t k, float *dst, const float *lhs, long lhs_cs,
                          long lhs_rs, const float *b_pack, float *row_max) {
     if (m == 0 || n == 0) return 0;

@@ -1,6 +1,6 @@
 // Batched f16: `count` independent same-shape GEMMs in ONE streaming session, so
 // the streaming entry/exit is paid once for the whole batch rather than per item.
-// Split out of gemm_f16f16.c (which owns the packing helpers and scratch this
+// Split out of gemm_f16f16.cc (which owns the packing helpers and scratch this
 // closes over) purely to keep both files navigable; it is included in place.
 #ifndef SME_GEMM_F16F16_BATCHED_H
 #define SME_GEMM_F16F16_BATCHED_H

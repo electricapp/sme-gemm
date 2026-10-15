@@ -6,6 +6,8 @@
 //
 // Computes dst = alpha*dst + beta*(A @ B), bf16 in/out, fp32 accumulate.
 
+#include "sme_gemm_api.h"
+
 #include "panel_ring.h"
 #include "transpose16.h"
 #include <arm_neon.h>
@@ -22,27 +24,6 @@ static inline bf16 bf16_from_bits(uint16_t b) {
     bf16 h;
     __builtin_memcpy(&h, &b, sizeof h);
     return h;
-}
-
-// Saturating m*n*k flop estimate for the parallel-vs-serial threshold. m*n is
-// bounded by the validated C size, but the *k step can overflow uint64 for
-// absurd (unallocatable) shapes -- saturate rather than wrap so a huge problem
-// never misclassifies as "small". (This kernel is standalone -- no epilogue.h --
-// so the helper is local; it mirrors ep_flops there.)
-static inline uint64_t ep_flops(size_t m, size_t n, size_t k) {
-    uint64_t mn = (uint64_t)m * (uint64_t)n;
-    if (k != 0 && mn > UINT64_MAX / (uint64_t)k) {
-        return UINT64_MAX;
-    }
-    return mn * (uint64_t)k;
-}
-
-// a*b, or SIZE_MAX on overflow -> the following malloc/apack_scratch returns
-// NULL, handled as OOM (Rust falls back). Local copy (no epilogue.h); mirrors
-// ep_cmul there. Defense in depth for a direct C-FFI caller bypassing Rust.
-static inline size_t ep_cmul(size_t a, size_t b) {
-    size_t r;
-    return __builtin_mul_overflow(a, b, &r) ? SIZE_MAX : r;
 }
 
 // bf16 -> fp32 widen of the low / high 16 lanes: bf16 is the top 16 bits of
@@ -233,7 +214,7 @@ __arm_locally_streaming __arm_new("za") static void sme_run_streaming(
 
     // nc_blk/mc_blk count 32-wide SUPER-tiles (= 2 packed 16-lane bands each), so
     // tile_bytes is the full super-tile and the budget constant equals the total
-    // resident bytes (A-block + B-block). See gemm_f32.c. A band-sized tile_bytes would
+    // resident bytes (A-block + B-block). See gemm_f32.cc. A band-sized tile_bytes would
     // instead double the working set.
     size_t budget = bf16w_budget(kp);
     size_t nt_span = nt_hi - nt_lo;
@@ -381,8 +362,8 @@ __arm_locally_streaming __arm_new("za") static void sme_run_streaming(
 
 // Per-thread reusable A-pack scratch (no per-call malloc/free on the serial
 // small/medium path). Grows monotonically, lives for the thread's lifetime.
-static _Thread_local bf16 *g_apack = NULL;
-static _Thread_local size_t g_apack_cap = 0;
+static thread_local bf16 *g_apack = NULL;
+static thread_local size_t g_apack_cap = 0;
 static bf16 *apack_scratch(size_t bytes) {
     if (bytes == 0) bytes = 1; // k==0: return a real (tiny) buffer, not a
                                // history-dependent NULL on fresh threads
@@ -394,7 +375,7 @@ static bf16 *apack_scratch(size_t bytes) {
     return g_apack;
 }
 
-// Row-major B read in place for one M-tile; see gemm_f16f32.c.
+// Row-major B read in place for one M-tile; see gemm_f16f32.cc.
 __arm_locally_streaming __arm_new("za") static size_t
     run_direct(bf16 *dst, long dst_rs, const bf16 *a_pack, const bf16 *b, long b_rs, size_t m,
                size_t n, size_t k, size_t mt, size_t st, size_t nst, bf16 *buf, int keep,
@@ -468,7 +449,7 @@ __arm_locally_streaming __arm_new("za") static size_t
     return four ? 2 : 1;
 }
 
-// Per-worker column items; see gemm_f16f32.c.
+// Per-worker column items; see gemm_f16f32.cc.
 static int run_cols(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long lhs_rs, long lhs_cs,
                     size_t m, size_t n, size_t k, float alpha, float beta, int read_dst,
                     const bf16 *b, long rhs_rs, long rhs_cs) {
@@ -479,18 +460,18 @@ static int run_cols(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long lhs
     size_t n_items = (n_tiles + NC - 1) / NC, n_units = n_chunks + n_items;
     size_t W = n_units < 12 ? n_units : 12;
     size_t panel = ep_cmul(2 * NC, per_tile);
-    _Atomic size_t *ctr;
+    std::atomic<size_t> *ctr;
     bf16 *pool = (bf16 *)ring_pool(2 + n_chunks, ep_cmul(ep_cmul(W, panel), sizeof(bf16)), &ctr);
     bf16 *a_pack = apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(bf16)));
     if (!pool || !a_pack) return -1;
-    _Atomic size_t *cur = ctr, *a_cnt = ctr + 1, *a_done = ctr + 2;
+    std::atomic<size_t> *cur = ctr, *a_cnt = ctr + 1, *a_done = ctr + 2;
     // Row-major B and C: multiply straight from B's rows. Never more than ~6%
     // behind the pack below and up to 3x ahead at small m (16x4096x4096: 1.52
     // against 0.52 TF/s), so it is not gated on stride the way f16's is.
     int direct = rhs_cs == 1 && dst_cs == 1 && rhs_rs > 0;
     dispatch_apply(W, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(size_t w) {
       bf16 *bt = pool + w * panel;
-      for (size_t i; (i = atomic_fetch_add_explicit(cur, 1, memory_order_relaxed)) < n_units;) {
+      for (size_t i; (i = cur->fetch_add(1, std::memory_order_relaxed)) < n_units;) {
           if (i < n_chunks) {
               size_t mt1 = (i + 1) * M_CHUNK < m_tiles ? (i + 1) * M_CHUNK : m_tiles;
               for (size_t st = 2 * i * M_CHUNK; st < 2 * mt1; st++) {
@@ -498,15 +479,15 @@ static int run_cols(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long lhs
                   pack_a_band(a_pack + st * per_tile, vr ? a + (long)r0 * lhs_rs : a, lhs_rs,
                               lhs_cs, k, vr);
               }
-              atomic_store_explicit(&a_done[i], 1, memory_order_release);
-              atomic_fetch_add_explicit(a_cnt, 1, memory_order_release);
+              a_done[i].store(1, std::memory_order_release);
+              a_cnt->fetch_add(1, std::memory_order_release);
               continue;
           }
           size_t t0 = (i - n_chunks) * NC, t1 = t0 + NC < n_tiles ? t0 + NC : n_tiles, mt_lo = 0;
           if (direct) {
               // M-tile 0 multiplies straight from B's rows; the bands it captures
               // feed the packed kernel for whatever it left.
-              while (!atomic_load_explicit(&a_done[0], memory_order_acquire))
+              while (!a_done[0].load(std::memory_order_acquire))
                   __builtin_arm_yield();
               size_t done = run_direct(dst, dst_rs, a_pack, b, rhs_rs, m, n, k, 0, t0, t1 - t0, bt,
                                        m_tiles > 1, alpha, beta, read_dst);
@@ -522,14 +503,14 @@ static int run_cols(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long lhs
               }
           }
           // All of A packed: one pass. Otherwise M-chunk by M-chunk as each lands.
-          int all = atomic_load_explicit(a_cnt, memory_order_acquire) == n_chunks;
+          int all = a_cnt->load(std::memory_order_acquire) == n_chunks;
           for (size_t ci = 0; ci < (all ? 1 : n_chunks); ci++) {
               size_t mt0 = all ? 0 : ci * M_CHUNK;
               size_t mt1 = all ? m_tiles : (mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles);
               if (mt0 < mt_lo) mt0 = mt_lo;
               if (mt0 >= mt1) continue;
               if (!all)
-                  while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+                  while (!a_done[ci].load(std::memory_order_acquire))
                       __builtin_arm_yield();
               sme_run_streaming(dst, dst_cs, dst_rs, a_pack, bt, m, n, mt0, mt1, t0, t1, kp, alpha,
                                 beta, read_dst);
@@ -540,7 +521,7 @@ static int run_cols(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long lhs
 }
 
 // Large A: B is built per N-block into a panel ring (panel_ring.h) and shared by
-// every M-chunk, as gemm_f32.c's run_panels.
+// every M-chunk, as gemm_f32.cc's run_panels.
 static int run_panels(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long lhs_rs, long lhs_cs,
                       size_t m, size_t n, size_t k, float alpha, float beta, int read_dst,
                       const bf16 *b, long rhs_rs, long rhs_cs) {
@@ -562,12 +543,12 @@ static int run_panels(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long l
     if (dt > nc_blk) dt = nc_blk;
     size_t n_d = (nc_blk + dt - 1) / dt;
     size_t slot_elems = ep_cmul(nc_blk, tile);
-    _Atomic size_t *ctr;
+    std::atomic<size_t> *ctr;
     bf16 *pool = (bf16 *)ring_pool(2 * n_blocks + 2 + n_chunks,
                                    ep_cmul(ep_cmul(n_slots, slot_elems), sizeof(bf16)), &ctr);
     bf16 *a_pack = apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(bf16)));
     if (!pool || !a_pack) return -1;
-    _Atomic size_t *a_done = ctr + 2 * n_blocks + 2;
+    std::atomic<size_t> *a_done = ctr + 2 * n_blocks + 2;
     void (^pack_a)(size_t, size_t) = ^(size_t mt0, size_t mt1) {
       for (size_t st = 2 * mt0; st < 2 * mt1; st++) {
           size_t r0 = st * 16, vr = r0 < m ? (m - r0 < 16 ? m - r0 : 16) : 0;
@@ -597,9 +578,9 @@ static int run_panels(bf16 *dst, long dst_cs, long dst_rs, const bf16 *a, long l
           // Block 0's first item per M-chunk packs that chunk of A.
           if (n_chunks > 1 && sg == 0 && sj == 0) {
               pack_a(mt0, mt1);
-              atomic_store_explicit(&a_done[ci], 1, memory_order_release);
+              a_done[ci].store(1, std::memory_order_release);
           } else if (n_chunks > 1) {
-              while (!atomic_load_explicit(&a_done[ci], memory_order_acquire))
+              while (!a_done[ci].load(std::memory_order_acquire))
                   __builtin_arm_yield();
           }
           if (n0 < n1)

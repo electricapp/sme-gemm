@@ -420,7 +420,7 @@ cargo run --release --example bonsai -- --bench            # as llama-bench tg12
 - **Streaming mode, SVL=512.** Compiled `-mcpu=apple-m4`. M5 features
   (`+sme-f16f16`, `+sme-b16b16`, `+sme-f64f64`, `+sme-i16i64`, `+sme2p1`) are
   separate TUs behind a runtime probe, so the M4 floor stays.
-- **No stable Rust SME intrinsics** — kernels are C (`cc` + `arm_sme.h`).
+- **No stable Rust SME intrinsics** — kernels are C++26 (`cc` + `arm_sme.h`).
 
 Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
