@@ -9,7 +9,10 @@ mod scalar;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod unpack;
 
-pub use builder::{Gemm, MapElem, PackedEpilogue, PackedQuant, RowReduce, epilogue_map};
+pub use builder::{
+    ColMajor, Gemm, MapElem, OutputLayout, PackedEpilogue, PackedQuant, RowMajor, RowReduce,
+    epilogue_map,
+};
 pub(crate) use guard::{
     batched_count, check_strided, checked_dim2, checked_dims, dq_validate, sme_worth_it,
     validate_ep,

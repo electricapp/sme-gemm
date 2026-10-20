@@ -123,8 +123,16 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
 int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_cs, long dst_rs,
                             int read_dst, const float *lhs, long lhs_cs, long lhs_rs,
                             const float *b_pack, float alpha, float beta, const ep_desc_f32 *ep);
-int gemm_sme_f32_softmax(size_t m, size_t n, size_t k, float *dst, const float *lhs, long lhs_cs,
-                         long lhs_rs, const float *b_pack, float *row_max);
+// Dense row-major operands only (A m x k, B k x n, C m x n): C = nodes(beta*A@B)
+// plus each finished row's sum and max (length m, either NULL). A reduction
+// needs whole contiguous rows, so these entries have no strides to get wrong.
+int gemm_sme_f32_rows(size_t m, size_t n, size_t k, float *dst, const float *lhs, const float *rhs,
+                      float beta, const ep_desc_f32 *ep, float *row_sum, float *row_max);
+int gemm_sme_f32_rows_packed(size_t m, size_t n, size_t k, float *dst, const float *lhs,
+                             const float *b_pack, float beta, const ep_desc_f32 *ep, float *row_sum,
+                             float *row_max);
+int gemm_sme_f32_softmax(size_t m, size_t n, size_t k, float *dst, const float *lhs,
+                         const float *b_pack, float *row_max);
 
 // gemm_f64.cc (FEAT_SME_F64F64)
 int gemm_sme_f64_batched(size_t count, size_t m, size_t n, size_t k, double *dst, const double *lhs,

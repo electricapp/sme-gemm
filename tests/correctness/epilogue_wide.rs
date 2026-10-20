@@ -88,11 +88,12 @@ fn opgraph_f32_addcol_only() {
         for &cmaj in &[false, true] {
             let packed = prepack_f32(&b, n, k);
             let mut c = vec![0.0f32; m * n];
-            let mut g = Gemm::new(&a, &packed, m).add_col(&bias);
+            let g = Gemm::new(&a, &packed, m).add_col(&bias);
             if cmaj {
-                g = g.col_major_output();
+                g.col_major_output().run(&mut c);
+            } else {
+                g.run(&mut c);
             }
-            g.run(&mut c);
 
             let mut mr = 0.0f64;
             for i in 0..m {
@@ -126,14 +127,15 @@ fn opgraph_f32_multensor_addscalar_tanh() {
         for &cmaj in &[false, true] {
             let packed = prepack_f32(&b, n, k);
             let mut c = vec![0.0f32; m * n];
-            let mut g = Gemm::new(&a, &packed, m)
+            let g = Gemm::new(&a, &packed, m)
                 .mul_tensor(&gate)
                 .add_scalar(scalar)
                 .tanh();
             if cmaj {
-                g = g.col_major_output();
+                g.col_major_output().run(&mut c);
+            } else {
+                g.run(&mut c);
             }
-            g.run(&mut c);
 
             let mut mr = 0.0f64;
             for i in 0..m {
@@ -205,11 +207,12 @@ fn opgraph_f64_addcol_tanh() {
         for &cmaj in &[false, true] {
             let packed = prepack_f64(&b, n, k);
             let mut c = vec![0.0f64; m * n];
-            let mut g = Gemm::new(&a, &packed, m).add_col(&bias).tanh();
+            let g = Gemm::new(&a, &packed, m).add_col(&bias).tanh();
             if cmaj {
-                g = g.col_major_output();
+                g.col_major_output().run(&mut c);
+            } else {
+                g.run(&mut c);
             }
-            g.run(&mut c);
 
             let mut mr = 0.0f64;
             for i in 0..m {
@@ -243,11 +246,12 @@ fn opgraph_f64_addcol_only() {
         for &cmaj in &[false, true] {
             let packed = prepack_f64(&b, n, k);
             let mut c = vec![0.0f64; m * n];
-            let mut g = Gemm::new(&a, &packed, m).add_col(&bias);
+            let g = Gemm::new(&a, &packed, m).add_col(&bias);
             if cmaj {
-                g = g.col_major_output();
+                g.col_major_output().run(&mut c);
+            } else {
+                g.run(&mut c);
             }
-            g.run(&mut c);
 
             let mut mr = 0.0f64;
             for i in 0..m {

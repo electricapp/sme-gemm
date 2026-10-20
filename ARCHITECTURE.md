@@ -109,8 +109,8 @@ streams from DRAM once rather than once per opposing tile. The `jc` loop sits
 outside the M-chunks, so one B-block serves every M-chunk while it is
 L2-resident, and the (N-block, M-chunk) pairs run as one flat `dispatch_apply`
 in block-major order (GCD hands out indices in order). A dispatch per block
-would wait on its E-thread chunks every block. A reduction epilogue spans all of
-N and keeps a single block.
+would wait on its E-thread chunks every block. The f32 row reductions
+(`gemm_sme_f32_rows*`) span all of N and keep a single block.
 
 Block sizes come from a per-dtype byte budget over whole 32-wide super-tiles
 (one tile in f16f16/b16b16, two packed bands in the others), counting A-block
@@ -537,8 +537,6 @@ owns them:
 | TU               | fragments                              |
 | ---------------- | -------------------------------------- |
 | `epilogue.h`     | `epilogue_{scalar,f16,bf16,f32,f64}.h` |
-| `gemm_f32.cc`    | `gemm_f32_{small,batched}.h`           |
-| `gemm_f64.cc`    | `gemm_f64_{small,batched}.h`           |
 | `gemm_f16f16.cc` | `gemm_f16f16_{batched,q4}.h`           |
 | `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                     |
 | `gemm_i16i64.cc` | `gemm_i16i64_batched.h`                |
@@ -547,10 +545,13 @@ The split is for navigability, not compilation. Each fragment closes over its
 parent's `static` packing helpers, per-thread scratch and typedefs, so it cannot
 be its own TU without exporting all of that, and each is included at exactly the
 point its code would otherwise occupy, leaving the preprocessed TU and the
-generated code unchanged. `csrc/transpose16.h`, `csrc/panel_ring.h` and
-`csrc/sme_tile.h` are the exceptions: genuinely shared headers, the first
-included by every 16-bit driver, the second (the §2.9/§2.10 scheduler) by the
-f16, bf16, widening and f32 drivers, the third (§3) by the kernels built from it. Every fragment needs an entry in `build.rs`'s `CSRC` list for rerun
+generated code unchanged. `csrc/transpose16.h`, `csrc/panel_ring.h`,
+`csrc/sme_tile.h` and `csrc/gemm_float.h` are the exceptions: genuinely shared
+headers, the first included by every 16-bit driver, the second (the §2.9/§2.10
+scheduler) by the f16, bf16, widening and f32 drivers, the third (§3) by the
+kernels built from it, and the fourth -- the f32/f64 packed, small, batched and
+row-reduction kernels as one template over the element type -- by `gemm_f32.cc`
+and `gemm_f64.cc`, which instantiate it under their own target features. Every fragment needs an entry in `build.rs`'s `CSRC` list for rerun
 tracking, since `cc` never sees it.
 
 ### 3.2 The runtime probe
@@ -579,7 +580,9 @@ P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
   `graph.rs` is the element-typed `Epilogue<T>`; `dequant.rs` the i8/i16
   `Dequant`, whose operands are all f32 (the post-dequant domain).
 - **`exec/`** — execution glue, one concern per file. `builder.rs`: the
-  `Gemm<T>` builder and `RowReduce`. `packed.rs`: the f32/f64 fused
+  `Gemm<T, L>` builder and `RowReduce`. The output layout `L` (`RowMajor`,
+  `ColMajor`) is a type, so the row reductions, which need whole contiguous
+  rows, exist only on a row-major builder. `packed.rs`: the f32/f64 fused
   packed-epilogue paths and `softmax_gemm_f32`/`softmax_rows`. `scalar.rs`: node
   resolution (`resolve_nodes`) and the scalar evaluators (`ep_apply_cell`,
   `apply_ep_scalar`, f64 analogs). `guard.rs`: `sme_worth_it` and the pre-FFI

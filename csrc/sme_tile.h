@@ -21,21 +21,22 @@
 // A ZA tile number as a type, so it survives being passed to a lambda.
 template <int Z> using Tile = std::integral_constant<int, Z>;
 
-// The SVE vector of each element type, and a zero of it.
+// The SVE vector of each element type, a broadcast into it, and its zero.
 template <class T> struct Sve;
-#define SME_SVE_TYPE(T, V, ZERO)                                                                   \
+#define SME_SVE_TYPE(T, V, DUP)                                                                    \
     template <> struct Sve<T> {                                                                    \
         using Vec = V;                                                                             \
-        static SME_INLINE Vec zero() __arm_streaming { return ZERO; }                              \
+        static SME_INLINE Vec dup(T x) __arm_streaming { return DUP(x); }                          \
+        static SME_INLINE Vec zero() __arm_streaming { return DUP((T)0); }                         \
     }
-SME_SVE_TYPE(int8_t, svint8_t, svdup_n_s8(0));
-SME_SVE_TYPE(int16_t, svint16_t, svdup_n_s16(0));
-SME_SVE_TYPE(int32_t, svint32_t, svdup_n_s32(0));
-SME_SVE_TYPE(int64_t, svint64_t, svdup_n_s64(0));
-SME_SVE_TYPE(__fp16, svfloat16_t, svdup_n_f16(0));
-SME_SVE_TYPE(__bf16, svbfloat16_t, svreinterpret_bf16_u16(svdup_n_u16(0)));
-SME_SVE_TYPE(float, svfloat32_t, svdup_n_f32(0.0f));
-SME_SVE_TYPE(double, svfloat64_t, svdup_n_f64(0.0));
+SME_SVE_TYPE(int8_t, svint8_t, svdup_n_s8);
+SME_SVE_TYPE(int16_t, svint16_t, svdup_n_s16);
+SME_SVE_TYPE(int32_t, svint32_t, svdup_n_s32);
+SME_SVE_TYPE(int64_t, svint64_t, svdup_n_s64);
+SME_SVE_TYPE(__fp16, svfloat16_t, svdup_n_f16);
+SME_SVE_TYPE(__bf16, svbfloat16_t, svdup_n_bf16);
+SME_SVE_TYPE(float, svfloat32_t, svdup_n_f32);
+SME_SVE_TYPE(double, svfloat64_t, svdup_n_f64);
 #undef SME_SVE_TYPE
 template <class T> using Vec = typename Sve<T>::Vec;
 
@@ -82,14 +83,20 @@ template <class T_, class Acc_> struct Mopa {
     static constexpr size_t kTile = 64 / sizeof(Acc);
     static constexpr size_t kGroup = sizeof(Acc) / sizeof(T);
 
+    // ZA tile Z += a (rows, under pn) x b (columns, under pm).
+    template <int Z>
+    static SME_INLINE void mopa(svbool_t pn, svbool_t pm, Vec<T> a,
+                                Vec<T> b) __arm_streaming __arm_inout("za") {
+        if constexpr (sizeof(Acc) == 2)
+            svmopa_za16_m(Z, pn, pm, a, b);
+        else if constexpr (sizeof(Acc) == 4)
+            svmopa_za32_m(Z, pn, pm, a, b);
+        else
+            svmopa_za64_m(Z, pn, pm, a, b);
+    }
     template <int Z>
     static SME_INLINE void mopa(svbool_t p, Vec<T> a, Vec<T> b) __arm_streaming __arm_inout("za") {
-        if constexpr (sizeof(Acc) == 2)
-            svmopa_za16_m(Z, p, p, a, b);
-        else if constexpr (sizeof(Acc) == 4)
-            svmopa_za32_m(Z, p, p, a, b);
-        else
-            svmopa_za64_m(Z, p, p, a, b);
+        mopa<Z>(p, p, a, b);
     }
 };
 
@@ -122,6 +129,19 @@ SME_INLINE void za_st_col(uint32_t s, svbool_t p, Acc *x) __arm_streaming __arm_
         svst1_ver_za32(Z, s, p, x);
     else
         svst1_ver_za64(Z, s, p, x);
+}
+// za_row<Z, Acc> as a function object, for the stores that take a row reader.
+template <int Z, class Acc> struct ZaRow {
+    SME_INLINE Vec<Acc> operator()(uint32_t s) const __arm_streaming __arm_in("za") {
+        return za_row<Z, Acc>(s);
+    }
+};
+template <int Z, class Acc>
+SME_INLINE void za_ld_row(uint32_t s, svbool_t p, const Acc *x) __arm_streaming __arm_inout("za") {
+    if constexpr (sizeof(Acc) == 4)
+        svld1_hor_za32(Z, s, p, x);
+    else
+        svld1_hor_za64(Z, s, p, x);
 }
 
 // --- the 2x2 super-tile ------------------------------------------------------
@@ -207,6 +227,69 @@ SME_INLINE void quad_accumulate(size_t kd, const T *al, const T *ah, const T *bl
         quad_kloop<A, false, true, K::kNarrow>(d, kd, al, ah, bl, bh);
     else
         quad_kloop<A, true, true, K::kFull>(d, kd, al, ah, bl, bh);
+}
+
+// The same with B read in place from row-major B (one K value per MOPA only):
+// depth d of B's lo / hi band is bl + d*b_rs / bh + d*b_rs under pbl / pbh, so
+// pad columns load as zero. U depths per iteration, then the remainder.
+template <class A, bool HiM, bool HiN, int U, class T>
+SME_INLINE void quad_kloop_rowb(size_t &d, size_t kd, const T *al, const T *ah, const T *bl,
+                                const T *bh, long b_rs, svbool_t pbl,
+                                svbool_t pbh) __arm_streaming __arm_inout("za") {
+    static_assert(A::kGroup == 1, "B rows are only MOPA operands without a K interleave");
+    constexpr size_t R = A::kRow;
+    svbool_t p = ptrue<sizeof(T)>();
+    for (; d + U <= kd; d += U) {
+        Vec<T> al0 = svld1(p, al + d * R), ah0 = HiM ? svld1(p, ah + d * R) : al0;
+        Vec<T> bl0 = svld1(pbl, bl + (long)d * b_rs),
+               bh0 = HiN ? svld1(pbh, bh + (long)d * b_rs) : bl0;
+        if constexpr (U == 1) {
+            quad_mopa<A, HiM, HiN>(p, al0, ah0, bl0, bh0);
+        } else {
+            size_t e = d + 1;
+            Vec<T> al1 = svld1(p, al + e * R), ah1 = HiM ? svld1(p, ah + e * R) : al1;
+            Vec<T> bl1 = svld1(pbl, bl + (long)e * b_rs);
+            Vec<T> bh1 = HiN ? svld1(pbh, bh + (long)e * b_rs) : bl1;
+            quad_mopa<A, HiM, HiN>(p, al0, ah0, bl0, bh0);
+            quad_mopa<A, HiM, HiN>(p, al1, ah1, bl1, bh1);
+        }
+    }
+    if constexpr (U > 1) quad_kloop_rowb<A, HiM, HiN, 1>(d, kd, al, ah, bl, bh, b_rs, pbl, pbh);
+}
+template <class A, int U, class T>
+SME_INLINE void quad_accumulate_rowb(size_t kd, const T *al, const T *ah, const T *bl, const T *bh,
+                                     long b_rs, svbool_t pbl, svbool_t pbh, bool hi_m,
+                                     bool hi_n) __arm_streaming __arm_inout("za") {
+    size_t d = 0;
+    if (!hi_n && !hi_m)
+        quad_kloop_rowb<A, false, false, U>(d, kd, al, ah, bl, bh, b_rs, pbl, pbh);
+    else if (!hi_n)
+        quad_kloop_rowb<A, true, false, U>(d, kd, al, ah, bl, bh, b_rs, pbl, pbh);
+    else if (!hi_m)
+        quad_kloop_rowb<A, false, true, U>(d, kd, al, ah, bl, bh, b_rs, pbl, pbh);
+    else
+        quad_kloop_rowb<A, true, true, U>(d, kd, al, ah, bl, bh, b_rs, pbl, pbh);
+}
+
+// L2 blocking (BLIS jc -> ic) in super-tiles: how many fit in `bytes` of A-block
+// plus B-block, when a super-tile is two packed bands of 64 bytes per depth group.
+// A band-sized unit would double the working set. Never below 2.
+static inline size_t quad_budget(size_t kd, size_t bytes) {
+    size_t tile;
+    if (__builtin_mul_overflow(kd, (size_t)128, &tile)) tile = SIZE_MAX;
+    size_t b = bytes / (tile ? tile : 1);
+    return b < 2 ? 2 : b;
+}
+
+// The N-block width for a budget: half of it, rounded down to an even split of
+// n_tiles. The budget is a ceiling, not a target, and a ragged last block (64
+// tiles at width 48 -> 48+16) amortizes the A-block re-read over too little N.
+static inline size_t quad_nc_blk(size_t budget, size_t n_tiles) {
+    size_t nc = budget / 2;
+    if (nc < 1) nc = 1;
+    if (nc >= n_tiles) return n_tiles;
+    size_t blocks = (n_tiles + nc - 1) / nc;
+    return (n_tiles + blocks - 1) / blocks;
 }
 
 // Walk the live slices of a super-tile with T-row tiles. quad_rows visits output

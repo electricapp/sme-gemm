@@ -73,8 +73,8 @@ pub use warm::SmeWarm;
 pub use element::{Accum, Element, Packed};
 pub use epilogue::{Dequant, Epilogue};
 pub use exec::{
-    Gemm, MapElem, PackedEpilogue, PackedQuant, RowReduce, epilogue_map, softmax_gemm_f32,
-    softmax_rows, softmax_rows_with_max,
+    ColMajor, Gemm, MapElem, OutputLayout, PackedEpilogue, PackedQuant, RowMajor, RowReduce,
+    epilogue_map, softmax_gemm_f32, softmax_rows, softmax_rows_with_max,
 };
 
 pub use kernels::attention::{FlashParams, flash_attention_f32, flash_attention_f32_with};

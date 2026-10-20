@@ -160,22 +160,6 @@ SME_INLINE void store_vec(svbool_t p32, svbool_t pst, typename E::T *ptr, svfloa
     svst1(pst, ptr, E::narrow(p32, lo, hi));
 }
 
-// L2 blocking budget in 32-wide super-tiles.
-static size_t widen_budget(size_t kp) {
-    size_t tile_bytes = 2 * ep_cmul(kp, 32) * sizeof(uint16_t);
-    size_t b = (size_t)(16u * 1024 * 1024) / (tile_bytes ? tile_bytes : 1);
-    return b < 2 ? 2 : b;
-}
-
-// N-block width for run_streaming's jc loop.
-static size_t widen_nc_blk(size_t kp, size_t n_tiles) {
-    size_t nc = widen_budget(kp) / 2;
-    if (nc < 1) nc = 1;
-    if (nc >= n_tiles) return n_tiles;
-    size_t blocks = (n_tiles + nc - 1) / nc;
-    return (n_tiles + blocks - 1) / blocks;
-}
-
 // The streaming compute: one ZA lifetime for a tile range. b_pack points at
 // super-tile nt_lo's bands; [nt_lo, nt_hi) is the N-tile sub-range this
 // invocation owns. Each super-tile is independent (zero, accumulate, store), so
@@ -197,8 +181,8 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     // tile_bytes is the full super-tile and the budget constant equals the total
     // resident bytes (A-block + B-block) -- matching gemm_f32.cc. A band-sized
     // tile_bytes would instead double the working set.
-    size_t budget = widen_budget(kp);
-    size_t nc_blk = widen_nc_blk(kp, nt_hi - nt_lo);
+    size_t budget = quad_budget(kp, (size_t)16 << 20);
+    size_t nc_blk = quad_nc_blk(budget, nt_hi - nt_lo);
     size_t mc_blk = budget / 2;
     if (mc_blk < 1) mc_blk = 1;
     if (mc_blk > mt_hi - mt_lo) mc_blk = mt_hi - mt_lo;

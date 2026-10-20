@@ -206,10 +206,10 @@ pub fn matmul_f32_batched_ep(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if has_sme() {
         let fnodes = resolve_nodes(&ep.nodes, ep.act, n);
-        let desc = EpDescF32::nodes_only(
-            u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
-            fnodes.as_ptr(),
-        );
+        let desc = EpDescF32 {
+            n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
+            nodes: fnodes.as_ptr(),
+        };
         let _busy = crate::warm::busy("gemm_sme_f32_batched_ep", m, n, k);
         // SAFETY: contiguous row-major batches of `count` items, item strides
         // m*k / k*n / m*n; the kernel reads a/b and writes c in bounds. The

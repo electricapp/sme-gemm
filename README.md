@@ -81,7 +81,8 @@ matching f16).
   rounds). On the 16-bit paths a trailing gelu/silu/sigmoid/tanh runs as a NEON
   pass after the kernel, since streaming mode is slow at it (ARCHITECTURE.md
   §2.5). A leading per-column bias folds into the accumulator. `.beta(b)` scales
-  the product; `.col_major_output()` stores C column-major. `epilogue_map` is
+  the product; `.col_major_output()` stores C column-major (its builder has no
+  `run_reduce`/`run_softmax`, which need whole rows). `epilogue_map` is
   the non-fused escape hatch.
 - **Strided GEMM** — `gemm_{f16,bf16,f32,f64,i8,i16}`: `C = αC + β(A @ B)` with
   per-matrix row/col strides. Strides encode transpose, column-major, and

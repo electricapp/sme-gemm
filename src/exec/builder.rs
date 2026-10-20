@@ -1,6 +1,8 @@
 //! The [`Gemm`] builder, the [`PackedEpilogue`] / [`MapElem`] dispatch traits,
 //! [`RowReduce`], and the non-fused [`epilogue_map`] escape hatch.
 
+use core::marker::PhantomData;
+
 use half::{bf16, f16};
 
 use super::{
@@ -215,13 +217,37 @@ where
 /// Gemm::new(&a, &w, m).add_col(&bias).gelu().run(&mut c);
 /// ```
 #[derive(Debug)]
-pub struct Gemm<'a, T: PackedEpilogue> {
+pub struct Gemm<'a, T: PackedEpilogue, L: OutputLayout = RowMajor> {
     a: &'a [T],
     packed: &'a Packed<T>,
     m: usize,
     beta: T,
-    col_major: bool,
     epilogue: Epilogue<'a, T>,
+    layout: PhantomData<L>,
+}
+
+/// Output layout of a [`Gemm`]: [`RowMajor`] (the default) or [`ColMajor`].
+///
+/// Chosen with [`Gemm::col_major_output`]. A type rather than a flag, so the row
+/// reductions ([`Gemm::run_reduce`], [`Gemm::run_softmax`]), which need whole
+/// contiguous rows, exist only on a row-major builder.
+pub trait OutputLayout: crate::element::sealed::Sealed + core::fmt::Debug {
+    #[doc(hidden)]
+    const COL_MAJOR: bool;
+}
+/// Row-major output, `C[i,j] = c[i*n + j]` (the default).
+#[derive(Debug, Clone, Copy)]
+pub enum RowMajor {}
+/// Column-major output, `C[i,j] = c[i + j*m]`.
+#[derive(Debug, Clone, Copy)]
+pub enum ColMajor {}
+impl crate::element::sealed::Sealed for RowMajor {}
+impl crate::element::sealed::Sealed for ColMajor {}
+impl OutputLayout for RowMajor {
+    const COL_MAJOR: bool = false;
+}
+impl OutputLayout for ColMajor {
+    const COL_MAJOR: bool = true;
 }
 
 /// Sealed dispatch for the packed fused-**dequant** path: [`PackedEpilogue`]'s
@@ -323,16 +349,22 @@ impl<'r> RowReduce<'r> {
 }
 
 impl Gemm<'_, f32> {
-    /// Run into `c`, also producing the [`RowReduce`] outputs. Row-major only.
+    /// Run into `c`, also producing the [`RowReduce`] outputs. Row-major only:
+    /// a [`ColMajor`] builder has no `run_reduce`.
+    ///
+    /// ```compile_fail
+    /// # use sme_gemm::{prepack_f32, Gemm, RowReduce};
+    /// # let (m, n, k) = (4, 8, 4);
+    /// # let (a, b) = (vec![0.1f32; m * k], vec![0.2f32; k * n]);
+    /// let w = prepack_f32(&b, n, k);
+    /// let (mut c, mut sum) = (vec![0.0f32; m * n], vec![0.0f32; m]);
+    /// let g = Gemm::new(&a, &w, m).col_major_output();
+    /// g.run_reduce(&mut c, RowReduce::new().sum(&mut sum)); // no such method
+    /// ```
     ///
     /// # Panics
-    /// Panics as [`Gemm::run`], plus if a reduction slice is not length `m` or
-    /// `col_major_output()` was set.
+    /// Panics as [`Gemm::run`], plus if a reduction slice is not length `m`.
     pub fn run_reduce(self, c: &mut [f32], red: RowReduce<'_>) {
-        assert!(
-            !self.col_major,
-            "row reductions require a row-major output (drop col_major_output)"
-        );
         for o in [red.sum.as_deref(), red.max.as_deref()]
             .into_iter()
             .flatten()
@@ -350,7 +382,8 @@ impl Gemm<'_, f32> {
         );
     }
 
-    /// Run into `c`, then row-softmax it in place. Row-major only.
+    /// Run into `c`, then row-softmax it in place. Row-major only, as
+    /// [`Self::run_reduce`].
     ///
     /// The GEMM's store yields the per-row maxima as a by-product (~4% of the
     /// GEMM), so the softmax skips its own max sweep: two passes over `c`
@@ -371,12 +404,8 @@ impl Gemm<'_, f32> {
     /// ```
     ///
     /// # Panics
-    /// Panics as [`Gemm::run`], plus if `col_major_output()` was set.
+    /// Panics as [`Gemm::run`].
     pub fn run_softmax(self, c: &mut [f32]) {
-        assert!(
-            !self.col_major,
-            "row softmax requires a row-major output (drop col_major_output)"
-        );
         let (m, n) = (self.m, self.packed.n);
         let mut row_max = vec![f32::NEG_INFINITY; m];
         f32_packed_ep_reduce(
@@ -402,10 +431,26 @@ impl<'a, T: PackedEpilogue> Gemm<'a, T> {
             packed,
             m,
             beta: T::one(),
-            col_major: false,
             epilogue: Epilogue::new(),
+            layout: PhantomData,
         }
     }
+    /// Write the output column-major (`C[i,j] = c[i + j*m]`) instead of the
+    /// default row-major. The C kernels store either layout natively.
+    #[must_use]
+    pub fn col_major_output(self) -> Gemm<'a, T, ColMajor> {
+        Gemm {
+            a: self.a,
+            packed: self.packed,
+            m: self.m,
+            beta: self.beta,
+            epilogue: self.epilogue,
+            layout: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: PackedEpilogue, L: OutputLayout> Gemm<'a, T, L> {
     #[inline]
     #[must_use]
     fn activation(mut self, act: Activation) -> Self {
@@ -748,14 +793,7 @@ impl<'a, T: PackedEpilogue> Gemm<'a, T> {
         self.beta = beta;
         self
     }
-    /// Write the output column-major (`C[i,j] = c[i + j*m]`) instead of the
-    /// default row-major. The C kernels store either layout natively.
-    #[must_use]
-    pub const fn col_major_output(mut self) -> Self {
-        self.col_major = true;
-        self
-    }
-    /// Run into `c` (`m x n`, row- or column-major per [`Self::col_major_output`]).
+    /// Run into `c` (`m x n`, row- or column-major per the layout `L`).
     ///
     /// # Panics
     /// Panics if `a`/`c` lengths are inconsistent with `m` and the packed `n`/`k`,
@@ -770,7 +808,7 @@ impl<'a, T: PackedEpilogue> Gemm<'a, T> {
             self.m,
             &self.epilogue,
             self.beta,
-            self.col_major,
+            L::COL_MAJOR,
         );
     }
 }

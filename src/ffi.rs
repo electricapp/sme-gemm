@@ -20,22 +20,6 @@ pub(crate) struct EpDesc16 {
 pub(crate) struct EpDescF32 {
     pub(crate) n_nodes: u32,
     pub(crate) nodes: *const EpNode,
-    /// Optional per-M reduction outputs (length `m`), written once per row as
-    /// each M-tile finishes. Null to skip. See `ep_desc_f32` in the header.
-    pub(crate) row_sum: *mut f32,
-    pub(crate) row_max: *mut f32,
-}
-
-impl EpDescF32 {
-    /// Descriptor with no reductions -- the common case.
-    pub(crate) const fn nodes_only(n_nodes: u32, nodes: *const EpNode) -> Self {
-        Self {
-            n_nodes,
-            nodes,
-            row_sum: core::ptr::null_mut(),
-            row_max: core::ptr::null_mut(),
-        }
-    }
 }
 
 /// C-ABI mirror of `ep_desc_f64` in `csrc/epilogue.h`: an ordered op-graph node
@@ -412,14 +396,42 @@ unsafe extern "C" {
         beta: f32,
         ep: *const EpDescF32,
     ) -> core::ffi::c_int;
+    /// Dense row-major A (`m x k`), B (`k x n`) and C (`m x n`): C =
+    /// nodes(beta*A@B) plus each finished row's sum and max (length `m`, null
+    /// to skip). No strides, so a reduction always sees whole contiguous rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_sme_f32_rows(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut f32,
+        lhs: *const f32,
+        rhs: *const f32,
+        beta: f32,
+        ep: *const EpDescF32,
+        row_sum: *mut f32,
+        row_max: *mut f32,
+    ) -> core::ffi::c_int;
+    /// `gemm_sme_f32_rows` with B pre-packed by `gemm_sme_f32_packb`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_sme_f32_rows_packed(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut f32,
+        lhs: *const f32,
+        b_pack: *const f32,
+        beta: f32,
+        ep: *const EpDescF32,
+        row_sum: *mut f32,
+        row_max: *mut f32,
+    ) -> core::ffi::c_int;
     pub(crate) fn gemm_sme_f32_softmax(
         m: usize,
         n: usize,
         k: usize,
         dst: *mut f32,
         lhs: *const f32,
-        lhs_cs: isize,
-        lhs_rs: isize,
         b_pack: *const f32,
         row_max: *mut f32,
     ) -> core::ffi::c_int;

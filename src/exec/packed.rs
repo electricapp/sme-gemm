@@ -8,8 +8,8 @@ use crate::element::Packed;
 use crate::epilogue::Epilogue;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::ffi::{
-    EpDescF32, EpDescF64, gemm_sme_f32_run, gemm_sme_f32_run_packed, gemm_sme_f32_softmax,
-    gemm_sme_f64_run, gemm_sme_f64_run_packed,
+    EpDescF32, EpDescF64, gemm_sme_f32_rows, gemm_sme_f32_rows_packed, gemm_sme_f32_run,
+    gemm_sme_f32_run_packed, gemm_sme_f32_softmax, gemm_sme_f64_run, gemm_sme_f64_run_packed,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::probe::caps;
@@ -51,10 +51,10 @@ pub(crate) fn f32_packed_ep_impl(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if packed.sme || sme_worth_it(m, n, k) {
         let fnodes = resolve_nodes(&ep.nodes, ep.act, n);
-        let desc = EpDescF32::nodes_only(
-            u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
-            fnodes.as_ptr(),
-        );
+        let desc = EpDescF32 {
+            n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
+            nodes: fnodes.as_ptr(),
+        };
         // NULL when no epilogue work, so the unscaled row-major call keeps the
         // single-instruction pure-store fast path.
         let ep_ptr = if has_ep {
@@ -161,8 +161,6 @@ pub fn softmax_gemm_f32(a: &[f32], packed: &Packed<f32>, c: &mut [f32], m: usize
                 k,
                 c.as_mut_ptr(),
                 a.as_ptr(),
-                1,
-                k as isize,
                 packed.data.as_ptr(),
                 row_max.as_mut_ptr(),
             )
@@ -212,56 +210,46 @@ pub(crate) fn f32_packed_ep_reduce(
         let desc = EpDescF32 {
             n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
             nodes: fnodes.as_ptr(),
-            row_sum: red
-                .sum
-                .as_deref_mut()
-                .map_or(core::ptr::null_mut(), <[f32]>::as_mut_ptr),
-            row_max: red
-                .max
-                .as_deref_mut()
-                .map_or(core::ptr::null_mut(), <[f32]>::as_mut_ptr),
         };
-        let _busy = crate::warm::busy("gemm_sme_f32_run_packed", m, n, k);
-        // SAFETY: as `f32_packed_ep_impl`, plus two length-m `&mut [f32]` outputs
-        // the kernel writes one row at a time. The driver keeps every N-tile of a
-        // row on one thread (its N-parallel branch is disabled when a reduction
-        // is set), so those writes are unsynchronized but race-free.
+        let row_sum = red
+            .sum
+            .as_deref_mut()
+            .map_or(core::ptr::null_mut(), <[f32]>::as_mut_ptr);
+        let row_max = red
+            .max
+            .as_deref_mut()
+            .map_or(core::ptr::null_mut(), <[f32]>::as_mut_ptr);
+        let _busy = crate::warm::busy("gemm_sme_f32_rows", m, n, k);
+        // SAFETY: as `f32_packed_ep_impl` (a, c and B row-major and dense, which
+        // is all the rows entries take), plus two length-m `&mut [f32]` outputs
+        // the kernel writes one row at a time. Each row is finished and reduced
+        // by the one thread that owns its M-chunk, so the writes are race-free.
         let rc = unsafe {
             if packed.sme {
-                gemm_sme_f32_run_packed(
+                gemm_sme_f32_rows_packed(
                     m,
                     n,
                     k,
                     c.as_mut_ptr(),
-                    1,
-                    n as isize,
-                    0,
                     a.as_ptr(),
-                    1,
-                    k as isize,
                     packed.data.as_ptr(),
-                    0.0,
                     beta,
                     &raw const desc,
+                    row_sum,
+                    row_max,
                 )
             } else {
-                gemm_sme_f32_run(
+                gemm_sme_f32_rows(
                     m,
                     n,
                     k,
                     c.as_mut_ptr(),
-                    1,
-                    n as isize,
-                    0,
                     a.as_ptr(),
-                    1,
-                    k as isize,
                     packed.data.as_ptr(),
-                    1,
-                    n as isize,
-                    0.0,
                     beta,
                     &raw const desc,
+                    row_sum,
+                    row_max,
                 )
             }
         };

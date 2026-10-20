@@ -80,9 +80,6 @@ fn f16_composable_bias() {
             let packed = prepack_f16(&b, n, k);
             let mut c = vec![f16::ZERO; m * n];
             let mut g = apply_act!(Gemm::new(&a, &packed, m), act);
-            if cmaj {
-                g = g.col_major_output();
-            }
             if ur {
                 g = g.add_row(&bias_row);
             }
@@ -95,7 +92,11 @@ fn f16_composable_bias() {
             if ud {
                 g = g.add_tensor(&residual);
             }
-            g.run(&mut c);
+            if cmaj {
+                g.col_major_output().run(&mut c);
+            } else {
+                g.run(&mut c);
+            }
 
             let mut mr = 0.0f64;
             for i in 0..m {
@@ -250,9 +251,6 @@ fn bf16_composable_bias() {
             let packed = prepack_bf16(&b, n, k);
             let mut c = vec![bf16::ZERO; m * n];
             let mut g = apply_act!(Gemm::new(&a, &packed, m), act);
-            if cmaj {
-                g = g.col_major_output();
-            }
             if ur {
                 g = g.add_row(&bias_row);
             }
@@ -265,7 +263,11 @@ fn bf16_composable_bias() {
             if ud {
                 g = g.add_tensor(&residual);
             }
-            g.run(&mut c);
+            if cmaj {
+                g.col_major_output().run(&mut c);
+            } else {
+                g.run(&mut c);
+            }
 
             let mut mr = 0.0f64;
             for i in 0..m {
@@ -464,14 +466,15 @@ fn opgraph_f16_multensor_addscalar_tanh() {
         for &cmaj in &[false, true] {
             let packed = prepack_f16(&b, n, k);
             let mut c = vec![f16::ZERO; m * n];
-            let mut g = Gemm::new(&a, &packed, m)
+            let g = Gemm::new(&a, &packed, m)
                 .mul_tensor(&gate)
                 .add_scalar(scalar)
                 .tanh();
             if cmaj {
-                g = g.col_major_output();
+                g.col_major_output().run(&mut c);
+            } else {
+                g.run(&mut c);
             }
-            g.run(&mut c);
 
             let mut mr = 0.0f64;
             for i in 0..m {

@@ -263,22 +263,13 @@ static_assert(offsetof(ep_dq_f32, n_nodes) == 16, "ep_dq_f32.n_nodes offset");
 static_assert(offsetof(ep_dq_f32, nodes) == 24, "ep_dq_f32.nodes offset");
 
 // f32 epilogue descriptor: an ordered op-graph applied in the f32 accumulator
-// domain (operands are f32). NULL nodes / n_nodes==0 means identity.
-// row_sum / row_max are OPTIONAL per-M reduction outputs (length m, NULL to
-// skip), written once per row right after that row's last N-tile store, while
-// the row is still L1-hot. See the reduction block in gemm_f32.cc for why it is
-// there and not fused into the store itself.
+// domain (operands are f32). NULL nodes / n_nodes==0 means identity. Per-row
+// sums and maxima are not part of it: they need whole contiguous rows, so they
+// are outputs of the row-major-only gemm_sme_f32_rows* entries instead.
 typedef struct {
     uint32_t n_nodes;
     const EpNode *nodes;
-    float *row_sum;
-    float *row_max;
 } ep_desc_f32;
-
-// True if this descriptor asks for either per-row reduction.
-static inline int ep_has_reduce(const ep_desc_f32 *ep) {
-    return ep && (ep->row_sum || ep->row_max);
-}
 
 // f64 epilogue descriptor: an ordered op-graph applied in the f64 accumulator
 // domain (operands are f64). NULL nodes / n_nodes==0 means identity.
