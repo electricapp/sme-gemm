@@ -71,7 +71,7 @@ int gemm_sme_b16b16_run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long
                                long lhs_rs, const uint16_t *b_pack, uint16_t alpha_bits,
                                uint16_t beta_bits, const ep_desc16 *ep);
 
-// gemm_bf16f32.cc / gemm_f16f32.cc: widening 16-bit GEMMs into f32.
+// gemm_widen.cc: widening 16-bit GEMMs into f32.
 int gemm_sme_bf16f32_run(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs, long dst_rs,
                          int read_dst, const uint16_t *lhs, long lhs_cs, long lhs_rs,
                          const uint16_t *rhs, long rhs_cs, long rhs_rs, uint16_t alpha_bits,

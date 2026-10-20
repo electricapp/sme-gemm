@@ -500,10 +500,19 @@ diffs the disassembly per function. A refactor that leaves a function's
 instructions unchanged leaves its speed unchanged; the functions that differ are
 the ones to benchmark.
 
+The kernels share their building blocks through `csrc/sme_tile.h`: a MOPA atom
+per element and accumulator type (`Mopa<T, Acc>` fixes the lanes per vector, the
+ZA tile size and the K values each MOPA folds), the 2×2 super-tile K-loop with
+its live-band variants, and walkers over a super-tile's ZA rows and columns. ZA
+tile numbers travel as template arguments, which are constants by the time an
+instruction needs one (§1), and every helper and per-slice lambda is
+force-inlined, so a kernel built from them is still one streaming function with
+no call while ZA is live.
+
 The gating scheme keeps the M4 floor while shipping M5-only instructions in the
 same binary:
 
-- **Base `FEAT_SME` TUs (M4+).** `gemm_f16f32.cc`, `gemm_bf16f32.cc`,
+- **Base `FEAT_SME` TUs (M4+).** `gemm_widen.cc` (f16 and bf16 into f32),
   `gemm_i8i32.cc`, `gemm_f32.cc`, `attention.cc`, `sme_probe.cc` and
   `sme_runtime_shims.cc` compile together with
   `-mcpu=apple-m4 -ffp-contract=fast -O3` into `sme_gemm_base`, using only
@@ -538,10 +547,10 @@ The split is for navigability, not compilation. Each fragment closes over its
 parent's `static` packing helpers, per-thread scratch and typedefs, so it cannot
 be its own TU without exporting all of that, and each is included at exactly the
 point its code would otherwise occupy, leaving the preprocessed TU and the
-generated code unchanged. `csrc/transpose16.h` and `csrc/panel_ring.h` are the
-exceptions: genuinely shared headers, the first included by all four 16-bit
-drivers, the second (the §2.9/§2.10 scheduler) by the f16, bf16, widening and
-f32 drivers. Every fragment needs an entry in `build.rs`'s `CSRC` list for rerun
+generated code unchanged. `csrc/transpose16.h`, `csrc/panel_ring.h` and
+`csrc/sme_tile.h` are the exceptions: genuinely shared headers, the first
+included by every 16-bit driver, the second (the §2.9/§2.10 scheduler) by the
+f16, bf16, widening and f32 drivers, the third (§3) by the kernels built from it. Every fragment needs an entry in `build.rs`'s `CSRC` list for rerun
 tracking, since `cc` never sees it.
 
 ### 3.2 The runtime probe

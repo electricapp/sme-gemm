@@ -32,13 +32,13 @@ const CSRC: &[&str] = &[
     "epilogue_f64.h",
     "neon_act.h",
     "sme_gemm_api.h",
+    "sme_tile.h",
     "sme_probe.cc",
     "sme_runtime_shims.cc",
     "sme_warm.cc",
     "neon_ops.cc",
     "attention.cc",
-    "gemm_f16f32.cc",
-    "gemm_bf16f32.cc",
+    "gemm_widen.cc",
     "gemm_i8i32.cc",
     "gemm_f32.cc",
     "gemm_f32_batched.h",
@@ -138,8 +138,7 @@ fn compile_sme_kernels() {
         .file("csrc/sme_warm.cc")
         .file("csrc/neon_ops.cc");
     for f in [
-        "gemm_f16f32.cc",
-        "gemm_bf16f32.cc",
+        "gemm_widen.cc",
         "gemm_i8i32.cc",
         "gemm_f32.cc",
         "attention.cc",
