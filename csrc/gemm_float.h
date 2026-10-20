@@ -183,6 +183,10 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
     const EpNode *nodes = e.nodes;
     uint32_t n_nodes = e.n_nodes;
     int read_dst = e.read_dst;
+    if (e.pure) {
+        quad_store_raw<RowMajor>(dst, dst_cs, dst_rs, m0, n0, mr, nc);
+        return;
+    }
     if (!RowMajor && dst_rs == 1) {
         // Col-major C: one column of the super-tile per ZA column, lo-M rows from
         // tile zl and hi-M from zh.
@@ -190,16 +194,6 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
         // Clamp so no one-past-end pointer is formed; the hi-M band is empty
         // (phi all-false) when narrow-M.
         size_t hw = mr_hi ? W : 0;
-        if (e.pure) {
-            quad_cols<W>(
-                nc, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
-                                                size_t c) __arm_streaming __arm_in("za") {
-                    T *col = dst + (long)(n0 + c) * dst_cs + (long)m0;
-                    za_st_col<zl>(s, plo, col);
-                    za_st_col<zh>(s, phi, col + hw);
-                });
-            return;
-        }
         if (n_nodes && !e.has_tensor) {
             store_cols_ep<0, 2>(dst, dst_cs, m0, n0, 0, nc_lo, mr_hi, plo, phi, va, vb, read_dst,
                                 nodes, n_nodes);
@@ -247,16 +241,6 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
         // Clamp so no one-past-end pointer is formed; the hi-N band is empty
         // (phi all-false) when narrow-N.
         size_t hw = nc_hi ? W : 0;
-        if (e.pure) {
-            quad_rows<W>(
-                mr, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
-                                                size_t r) __arm_streaming __arm_in("za") {
-                    T *rp = dst + (long)(m0 + r) * dst_rs + (long)n0;
-                    za_st_row<zl>(s, plo, rp);
-                    za_st_row<zh>(s, phi, rp + hw);
-                });
-            return;
-        }
         quad_rows<W>(
             mr, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
                                             size_t r) __arm_streaming __arm_in("za") {

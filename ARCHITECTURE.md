@@ -539,20 +539,23 @@ owns them:
 | `epilogue.h`     | `epilogue_{scalar,f16,bf16,f32,f64}.h` |
 | `gemm_f16f16.cc` | `gemm_f16f16_{batched,q4}.h`           |
 | `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                     |
-| `gemm_i16i64.cc` | `gemm_i16i64_batched.h`                |
 
 The split is for navigability, not compilation. Each fragment closes over its
 parent's `static` packing helpers, per-thread scratch and typedefs, so it cannot
 be its own TU without exporting all of that, and each is included at exactly the
 point its code would otherwise occupy, leaving the preprocessed TU and the
 generated code unchanged. `csrc/transpose16.h`, `csrc/panel_ring.h`,
-`csrc/sme_tile.h` and `csrc/gemm_float.h` are the exceptions: genuinely shared
-headers, the first included by every 16-bit driver, the second (the §2.9/§2.10
-scheduler) by the f16, bf16, widening and f32 drivers, the third (§3) by the
-kernels built from it, and the fourth -- the f32/f64 packed, small, batched and
-row-reduction kernels as one template over the element type -- by `gemm_f32.cc`
-and `gemm_f64.cc`, which instantiate it under their own target features. Every fragment needs an entry in `build.rs`'s `CSRC` list for rerun
-tracking, since `cc` never sees it.
+`csrc/sme_tile.h`, `csrc/gemm_float.h` and `csrc/gemm_int.h` are the exceptions:
+genuinely shared headers, the first included by every 16-bit driver, the second
+(the §2.9/§2.10 scheduler) by the f16, bf16, widening and f32 drivers, the third
+(§3) by the kernels built from it. The last two are kernel templates over the
+element type, instantiated by each TU under its own target features:
+`gemm_float.h` holds the f32/f64 packed, small, batched and row-reduction
+kernels (`gemm_f32.cc`, `gemm_f64.cc`), `gemm_int.h` the i8/i16 packed and
+batched kernels and their dequant store (`gemm_i8i32.cc`, `gemm_i16i64.cc`). An
+integer kernel is instantiated per output type, raw accumulator or dequantized
+f32, so no call can pair a buffer with the wrong store. Every fragment needs an entry
+in `build.rs`'s `CSRC` list for rerun tracking, since `cc` never sees it.
 
 ### 3.2 The runtime probe
 

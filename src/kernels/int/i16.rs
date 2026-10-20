@@ -10,7 +10,7 @@ use crate::exec::{resolve_nodes, unpack_b_i16_sme};
 use crate::ffi::{
     gemm_sme_i16i64_batched, gemm_sme_i16i64_batched_dequant, gemm_sme_i16i64_packb,
     gemm_sme_i16i64_packed_b_elems, gemm_sme_i16i64_run, gemm_sme_i16i64_run_dequant,
-    gemm_sme_i16i64_run_packed_impl,
+    gemm_sme_i16i64_run_packed, gemm_sme_i16i64_run_packed_dequant,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::probe::caps;
@@ -394,20 +394,19 @@ pub fn matmul_i16_packed(a: &[i16], packed: &Packed<i16>, c: &mut [i64], m: usiz
     if packed.sme {
         let _busy = crate::warm::busy("gemm_sme_i16i64_packb", 0, n, k);
         // SAFETY: `packed.data` was produced by `gemm_sme_i16i64_packb` for these
-        // (n, k); a / c are row-major m*k / m*n. Null dq => the i64 store.
+        // (n, k); a / c are row-major m*k / m*n.
         let rc = unsafe {
-            gemm_sme_i16i64_run_packed_impl(
+            gemm_sme_i16i64_run_packed(
                 m,
                 n,
                 k,
-                c.as_mut_ptr().cast::<core::ffi::c_void>(),
+                c.as_mut_ptr(),
                 1,
                 n as isize,
                 a.as_ptr(),
                 1,
                 k as isize,
                 packed.data.as_ptr(),
-                core::ptr::null(),
             )
         };
         if rc == 0 {
@@ -451,28 +450,26 @@ pub fn matmul_i16_packed_dequant(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let unpacked: Vec<i16> = if packed.sme {
         let fnodes = resolve_nodes(&dq.nodes, dq.act, n);
-        let desc = crate::ffi::DqF32 {
-            scale: dq.scale,
-            scale_n: dq.scale_per_n.map_or(core::ptr::null(), <[f32]>::as_ptr),
-            n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
-            nodes: fnodes.as_ptr(),
-        };
-        let _busy = crate::warm::busy("gemm_sme_i16i64_run_packed_impl", m, n, k);
-        // SAFETY: as in `matmul_i16_packed`, with an f32 output and a dq
-        // descriptor whose operand slices are length-validated and outlive it.
+        let n_nodes = u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes");
+        let _busy = crate::warm::busy("gemm_sme_i16i64_run_packed_dequant", m, n, k);
+        // SAFETY: as in `matmul_i16_packed`, with an f32 output and op-graph
+        // operands that are length-validated and outlive the call.
         let rc = unsafe {
-            gemm_sme_i16i64_run_packed_impl(
+            gemm_sme_i16i64_run_packed_dequant(
                 m,
                 n,
                 k,
-                c.as_mut_ptr().cast::<core::ffi::c_void>(),
+                c.as_mut_ptr(),
                 1,
                 n as isize,
                 a.as_ptr(),
                 1,
                 k as isize,
                 packed.data.as_ptr(),
-                &raw const desc,
+                dq.scale,
+                dq.scale_per_n.map_or(core::ptr::null(), <[f32]>::as_ptr),
+                n_nodes,
+                fnodes.as_ptr(),
             )
         };
         if rc == 0 {

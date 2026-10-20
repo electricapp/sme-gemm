@@ -26,8 +26,7 @@ mod strided_dequant_tests {
     use crate::epilogue::Dequant;
     use crate::exec::resolve_nodes;
     use crate::ffi::{
-        DqF32, gemm_sme_i16i64_packb, gemm_sme_i16i64_packed_b_elems,
-        gemm_sme_i16i64_run_packed_impl,
+        gemm_sme_i16i64_packb, gemm_sme_i16i64_packed_b_elems, gemm_sme_i16i64_run_packed_dequant,
     };
     use crate::probe::caps;
 
@@ -76,12 +75,7 @@ mod strided_dequant_tests {
         let bias: Vec<f32> = (0..n).map(|j| 0.05 * (j as f32) - 0.4).collect();
         let dq = Dequant::new(scale).add_col(&bias).relu();
         let fnodes = resolve_nodes(&dq.nodes, dq.act, n);
-        let desc = DqF32 {
-            scale,
-            scale_n: core::ptr::null(),
-            n_nodes: u32::try_from(fnodes.len()).expect("nodes fit u32"),
-            nodes: fnodes.as_ptr(),
-        };
+        let n_nodes = u32::try_from(fnodes.len()).expect("nodes fit u32");
 
         // Column-major output: dst_cs = m (stride between columns), dst_rs = 1.
         let mut c = vec![0.0f32; m * n];
@@ -106,8 +100,8 @@ mod strided_dequant_tests {
                 bp.as_ptr(),
                 scale,
                 core::ptr::null(),
-                desc.n_nodes,
-                desc.nodes,
+                n_nodes,
+                fnodes.as_ptr(),
             )
         };
         assert_eq!(rc, 0, "strided i8 dequant kernel must succeed");
@@ -140,32 +134,30 @@ mod strided_dequant_tests {
         let bias: Vec<f32> = (0..n).map(|j| 0.03 * (j as f32) - 0.2).collect();
         let dq = Dequant::new(scale).add_col(&bias).relu();
         let fnodes = resolve_nodes(&dq.nodes, dq.act, n);
-        let desc = DqF32 {
-            scale,
-            scale_n: core::ptr::null(),
-            n_nodes: u32::try_from(fnodes.len()).expect("nodes fit u32"),
-            nodes: fnodes.as_ptr(),
-        };
+        let n_nodes = u32::try_from(fnodes.len()).expect("nodes fit u32");
 
         let mut c = vec![0.0f32; m * n];
-        let _busy = crate::warm::busy("gemm_sme_i16i64_run_packed_impl", m, n, k);
-        // SAFETY: as the i8 case, with the i16 packb and its void-typed dst.
+        let _busy = crate::warm::busy("gemm_sme_i16i64_run_packed_dequant", m, n, k);
+        // SAFETY: as the i8 case, with the i16 packb.
         let rc = unsafe {
             let elems = gemm_sme_i16i64_packed_b_elems(n, k);
             let mut bp = vec![0i16; elems];
             gemm_sme_i16i64_packb(bp.as_mut_ptr(), b.as_ptr(), n, k, n as isize, 1);
-            gemm_sme_i16i64_run_packed_impl(
+            gemm_sme_i16i64_run_packed_dequant(
                 m,
                 n,
                 k,
-                c.as_mut_ptr().cast::<core::ffi::c_void>(),
+                c.as_mut_ptr(),
                 m as isize,
                 1,
                 a.as_ptr(),
                 1,
                 k as isize,
                 bp.as_ptr(),
-                &raw const desc,
+                scale,
+                core::ptr::null(),
+                n_nodes,
+                fnodes.as_ptr(),
             )
         };
         assert_eq!(rc, 0, "strided i16 dequant kernel must succeed");

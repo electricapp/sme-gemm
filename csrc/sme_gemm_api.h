@@ -165,9 +165,12 @@ int gemm_sme_i16i64_run_dequant(size_t m, size_t n, size_t k, float *dst, long d
                                 const int16_t *lhs, long lhs_cs, long lhs_rs, const int16_t *rhs,
                                 long rhs_cs, long rhs_rs, float scale, const float *scale_n,
                                 uint32_t n_nodes, const EpNode *nodes);
-int gemm_sme_i16i64_run_packed_impl(size_t m, size_t n, size_t k, void *dst, long dst_cs,
-                                    long dst_rs, const int16_t *lhs, long lhs_cs, long lhs_rs,
-                                    const int16_t *b_pack, const ep_dq_f32 *dq);
+int gemm_sme_i16i64_run_packed(size_t m, size_t n, size_t k, int64_t *dst, long dst_cs, long dst_rs,
+                               const int16_t *lhs, long lhs_cs, long lhs_rs, const int16_t *b_pack);
+int gemm_sme_i16i64_run_packed_dequant(size_t m, size_t n, size_t k, float *dst, long dst_cs,
+                                       long dst_rs, const int16_t *lhs, long lhs_cs, long lhs_rs,
+                                       const int16_t *b_pack, float scale, const float *scale_n,
+                                       uint32_t n_nodes, const EpNode *nodes);
 
 // gemm_i8i32.cc
 int gemm_sme_i8i32_batched(size_t count, size_t m, size_t n, size_t k, int32_t *dst,
@@ -187,9 +190,6 @@ int gemm_sme_i8i32_run_packed_dequant(size_t m, size_t n, size_t k, float *dst, 
                                       long dst_rs, const int8_t *lhs, long lhs_cs, long lhs_rs,
                                       const int8_t *b_pack, float scale, const float *scale_n,
                                       uint32_t n_nodes, const EpNode *nodes);
-int gemm_sme_i8i32_run_packed_impl(size_t m, size_t n, size_t k, void *dst, long dst_cs,
-                                   long dst_rs, const int8_t *lhs, long lhs_cs, long lhs_rs,
-                                   const int8_t *b_pack, const ep_dq_f32 *dq);
 
 // gemm_q2.cc: the 2-bit and 1-bit GEMMs (FEAT_SME2p1).
 int gemm_sme_f16_q1(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,

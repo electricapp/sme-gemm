@@ -246,21 +246,15 @@ typedef struct {
     const EpNode *nodes;
 } ep_desc16;
 
-// f32 dequant epilogue descriptor: the per-tensor/per-N scale that turns the i32
-// accumulator into the real (f32) domain, then an op-graph applied in f32.
+// f32 dequant epilogue descriptor: the per-tensor/per-N scale that turns an
+// integer accumulator into the real (f32) domain, then an op-graph applied in
+// f32. Internal to the kernels: the C entry points take its fields.
 typedef struct {
     float scale;          // per-tensor scale (used when scale_n == NULL)
     const float *scale_n; // per-N scale, length n, or NULL
     uint32_t n_nodes;
     const EpNode *nodes;
 } ep_dq_f32;
-
-// Pinned against the Rust #[repr(C)] mirror (src/ffi.rs DqF32).
-static_assert(sizeof(ep_dq_f32) == 32, "ep_dq_f32 must match the Rust mirror");
-static_assert(offsetof(ep_dq_f32, scale) == 0, "ep_dq_f32.scale offset");
-static_assert(offsetof(ep_dq_f32, scale_n) == 8, "ep_dq_f32.scale_n offset");
-static_assert(offsetof(ep_dq_f32, n_nodes) == 16, "ep_dq_f32.n_nodes offset");
-static_assert(offsetof(ep_dq_f32, nodes) == 24, "ep_dq_f32.nodes offset");
 
 // f32 epilogue descriptor: an ordered op-graph applied in the f32 accumulator
 // domain (operands are f32). NULL nodes / n_nodes==0 means identity. Per-row

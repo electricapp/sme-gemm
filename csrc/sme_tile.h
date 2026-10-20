@@ -324,4 +324,44 @@ template <class Acc> SME_INLINE void quad_to_scratch(Acc *scratch) __arm_streami
     }
 }
 
+// The raw store of a super-tile's live mr x nc corner at (m0, n0): straight from
+// ZA to C in column slices for col-major C and row slices for row-major C, or
+// through a scratch for any other strides. RowMajor skips the layout test. The
+// hi band's base is clamped when the band is empty, so no pointer past C is
+// formed.
+template <bool RowMajor = false, class Acc>
+SME_INLINE void quad_store_raw(Acc *dst, long dst_cs, long dst_rs, size_t m0, size_t n0, size_t mr,
+                               size_t nc) __arm_streaming __arm_in("za") {
+    constexpr size_t W = 64 / sizeof(Acc);
+    size_t mr_lo = mr < W ? mr : W, mr_hi = mr > W ? mr - W : 0;
+    size_t nc_lo = nc < W ? nc : W, nc_hi = nc > W ? nc - W : 0;
+    if (!RowMajor && dst_rs == 1) {
+        svbool_t plo = whilelt<sizeof(Acc)>(0, mr_lo), phi = whilelt<sizeof(Acc)>(0, mr_hi);
+        size_t hw = mr_hi ? W : 0;
+        quad_cols<W>(
+            nc, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
+                                            size_t c) __arm_streaming __arm_in("za") {
+                Acc *col = dst + (long)(n0 + c) * dst_cs + (long)m0;
+                za_st_col<zl>(s, plo, col);
+                za_st_col<zh>(s, phi, col + hw);
+            });
+    } else if (RowMajor || dst_cs == 1) {
+        svbool_t plo = whilelt<sizeof(Acc)>(0, nc_lo), phi = whilelt<sizeof(Acc)>(0, nc_hi);
+        size_t hw = nc_hi ? W : 0;
+        quad_rows<W>(
+            mr, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
+                                            size_t r) __arm_streaming __arm_in("za") {
+                Acc *row = dst + (long)(m0 + r) * dst_rs + (long)n0;
+                za_st_row<zl>(s, plo, row);
+                za_st_row<zh>(s, phi, row + hw);
+            });
+    } else {
+        Acc scratch[4 * W * W];
+        quad_to_scratch(scratch);
+        for (size_t r = 0; r < mr; r++)
+            for (size_t c = 0; c < nc; c++)
+                dst[(long)(m0 + r) * dst_rs + (long)(n0 + c) * dst_cs] = scratch[r * 2 * W + c];
+    }
+}
+
 #endif // SME_GEMM_SME_TILE_H

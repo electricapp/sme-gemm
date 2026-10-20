@@ -31,39 +31,6 @@ pub(crate) struct EpDescF64 {
     pub(crate) nodes: *const EpNode,
 }
 
-/// C-ABI mirror of `ep_dq_f32` in `csrc/epilogue.h`: the per-tensor/per-N scale
-/// that lifts an integer accumulator into f32, plus the op-graph applied there.
-/// Field order must match the C struct exactly.
-#[repr(C)]
-pub(crate) struct DqF32 {
-    pub(crate) scale: f32,
-    pub(crate) scale_n: *const f32,
-    pub(crate) n_nodes: u32,
-    pub(crate) nodes: *const EpNode,
-}
-
-// Pin the FFI layout (4-byte holes after `scale` and `n_nodes` on arm64); drift
-// would be silent UB. The C side has matching _Static_asserts.
-const _: () = {
-    assert!(size_of::<DqF32>() == 32, "size_of::<DqF32>() == 32");
-    assert!(
-        core::mem::offset_of!(DqF32, scale) == 0,
-        "core::mem::offset_of!(DqF32, scale) == 0"
-    );
-    assert!(
-        core::mem::offset_of!(DqF32, scale_n) == 8,
-        "core::mem::offset_of!(DqF32, scale_n) == 8"
-    );
-    assert!(
-        core::mem::offset_of!(DqF32, n_nodes) == 16,
-        "core::mem::offset_of!(DqF32, n_nodes) == 16"
-    );
-    assert!(
-        core::mem::offset_of!(DqF32, nodes) == 24,
-        "core::mem::offset_of!(DqF32, nodes) == 24"
-    );
-};
-
 // ---- C kernels (Apple aarch64 only) ----------------------------------------
 unsafe extern "C" {
     /// `out = act(gate) * up` over rows of gate/up interleaved 32 columns at a
@@ -677,20 +644,35 @@ unsafe extern "C" {
         rhs_rs: isize,
         rhs_cs: isize,
     );
-    /// `dst` is `*mut i64` when `dq` is null, `*mut f32` when it is set.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn gemm_sme_i16i64_run_packed_impl(
+    pub(crate) fn gemm_sme_i16i64_run_packed(
         m: usize,
         n: usize,
         k: usize,
-        dst: *mut core::ffi::c_void,
+        dst: *mut i64,
         dst_cs: isize,
         dst_rs: isize,
         lhs: *const i16,
         lhs_cs: isize,
         lhs_rs: isize,
         b_pack: *const i16,
-        dq: *const DqF32,
+    ) -> core::ffi::c_int;
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_sme_i16i64_run_packed_dequant(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut f32,
+        dst_cs: isize,
+        dst_rs: isize,
+        lhs: *const i16,
+        lhs_cs: isize,
+        lhs_rs: isize,
+        b_pack: *const i16,
+        scale: f32,
+        scale_n: *const f32,
+        n_nodes: u32,
+        nodes: *const EpNode,
     ) -> core::ffi::c_int;
     pub(crate) fn gemm_sme_i16i64_batched(
         count: usize,

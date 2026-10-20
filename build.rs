@@ -42,6 +42,7 @@ const CSRC: &[&str] = &[
     "gemm_i8i32.cc",
     "gemm_f32.cc",
     "gemm_float.h",
+    "gemm_int.h",
     "gemm_f16f16.cc",
     "gemm_f16f16_batched.h",
     "gemm_f16f16_q4.h",
@@ -49,7 +50,6 @@ const CSRC: &[&str] = &[
     "gemm_b16b16_q4.h",
     "gemm_f64.cc",
     "gemm_i16i64.cc",
-    "gemm_i16i64_batched.h",
     "gemm_q2.cc",
 ];
 
