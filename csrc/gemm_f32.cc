@@ -96,7 +96,7 @@ static size_t f32_workers(size_t chunks) {
 }
 
 // m <= 4: SME2 multi-vector FMLA into ZA vector groups instead of MOPA; see
-// run_gemv in gemm_f16f16.cc. 16-column bands, two per 32-wide tile; `abc` is
+// run_gemv in gemm_half.h. 16-column bands, two per 32-wide tile; `abc` is
 // [rows][k][16] broadcast A; b_pack points at tile nt_lo. The bound is FMLA
 // issue (~3 cycles per vg1x4, measured), and the P-cluster's one SME unit is
 // shared, so more threads do not raise it.
@@ -200,7 +200,7 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(float *dst, long ds
 // same L2 bank (1.8x slower, measured). Each band still sums its four depth
 // phases in run_gemv's order, so the two agree bit for bit.
 //
-// One pass's accumulate, inlined per row count (see gemm_f16f16.cc's twin).
+// One pass's accumulate, inlined per row count (see gemm_half.h's twin).
 __attribute__((always_inline)) static inline void
 gemv_rm_acc(size_t rows, const float *b, long b_rs, const float *abc, size_t per_band, size_t k,
             size_t G, svcount_t pc0, svcount_t pc1, svcount_t pc2,
@@ -413,7 +413,7 @@ static void pack_a_range(float *a_pack, const float *a, long rs, long cs, size_t
 // bands out packed ([2][k][16]) for the packed kernel to take the other
 // M-tiles, and prefetches B 16 rows ahead: the SME loads alone keep too few
 // misses in flight (128x8192x4096 1.45 -> 2.05 TF/s; neither the 16-bit kernels
-// nor a one-M-tile pass gain from it). See gemm_f16f16.cc's twin.
+// nor a one-M-tile pass gain from it). See gemm_half.h's twin.
 // Row-major C, no epilogue.
 __arm_locally_streaming __arm_new("za") static void run_direct(float *dst, long dst_rs,
                                                                const float *a_pack, const float *b,
@@ -511,7 +511,7 @@ __arm_locally_streaming __arm_new("za") static void run_direct(float *dst, long 
     }
 }
 
-// Per-worker column items, as gemm_f16f16.cc's run_cols: each worker packs its own
+// Per-worker column items, as gemm_half.h's run_cols: each worker packs its own
 // two super-tiles of B and multiplies them while they are in cache; the first
 // units pack A by M-chunk.
 static int run_cols(float *dst, long dst_cs, long dst_rs, const float *a, long lhs_rs, long lhs_cs,
@@ -579,7 +579,7 @@ static int run_cols(float *dst, long dst_cs, long dst_rs, const float *a, long l
 }
 
 // Large A: B is built per N-block into a panel ring (panel_ring.h) and shared by
-// every M-chunk, as gemm_f16f16.cc's run_panels.
+// every M-chunk, as gemm_half.h's run_panels.
 static int run_panels(float *dst, long dst_cs, long dst_rs, const float *a, long lhs_rs,
                       long lhs_cs, size_t m, size_t n, size_t k, float alpha, float beta,
                       int read_dst, const float *b, long rhs_rs, long rhs_cs,

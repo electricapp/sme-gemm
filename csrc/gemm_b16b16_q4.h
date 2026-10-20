@@ -1,9 +1,9 @@
 // bf16 Q4 path: C(bf16) = A(bf16) @ dequant(B), B kept 4-bit resident.
-// Included at the end of gemm_b16b16.cc for its `bf16` typedef, `packa` and the
-// dense kernels; the f16 twin is gemm_f16f16_q4.h, which describes the
-// band-major resident layout both read. Scales and mins stay f16 -- that is the
-// GGUF Q4_0/Q4_1 on-disk type, and it carries more mantissa than bf16, so one
-// Q4Weights serves both compute paths.
+// Included at the end of gemm_b16b16.cc for its `bf16` typedef and gemm_half.h's
+// dense kernels (run_panels, apack_scratch); the f16 twin is gemm_f16f16_q4.h,
+// which describes the band-major resident layout both read. Scales and mins stay
+// f16 -- that is the GGUF Q4_0/Q4_1 on-disk type, and it carries more mantissa
+// than bf16, so one Q4Weights serves both compute paths.
 #ifndef SME_GEMM_B16B16_Q4_H
 #define SME_GEMM_B16B16_Q4_H
 
@@ -315,7 +315,7 @@ static int q4_bf16_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint1
         // per-thread A-pack buffer.
         bf16 *asum = NULL;
         if (mins) {
-            asum = apack_scratch(ep_cmul(ep_cmul(m, nbk), sizeof(bf16)));
+            asum = apack_scratch<bf16>(ep_cmul(ep_cmul(m, nbk), sizeof(bf16)));
             if (!asum) return -1;
             for (size_t i = 0; i < m * nbk; i++) {
                 size_t r = i / nbk, b = i % nbk;

@@ -8,7 +8,7 @@ has no on-CPU SME path on Apple M4+.
 This document is the design overview. The public API is documented in the
 rustdoc on `lib.rs`, the in-kernel epilogue interpreter in the header comment of
 `csrc/epilogue.h`, and the SME hot loop in the comment above `run_streaming` in
-`csrc/gemm_f16f16.cc`.
+`csrc/gemm_half.h`.
 
 ---
 
@@ -503,7 +503,8 @@ the ones to benchmark.
 The kernels share their building blocks through `csrc/sme_tile.h`: a MOPA atom
 per element and accumulator type (`Mopa<T, Acc>` fixes the lanes per vector, the
 ZA tile size and the K values each MOPA folds), the 2×2 super-tile K-loop with
-its live-band variants, and walkers over a super-tile's ZA rows and columns. ZA
+its live-band variants, walkers over a super-tile's ZA rows and columns, and the
+per-thread A-pack scratch (`apack_scratch<T>`). ZA
 tile numbers travel as template arguments, which are constants by the time an
 instruction needs one (§1), and every helper and per-slice lambda is
 force-inlined, so a kernel built from them is still one streaming function with
@@ -537,25 +538,28 @@ owns them:
 | TU               | fragments                              |
 | ---------------- | -------------------------------------- |
 | `epilogue.h`     | `epilogue_{scalar,f16,bf16,f32,f64}.h` |
-| `gemm_f16f16.cc` | `gemm_f16f16_{batched,q4}.h`           |
+| `gemm_f16f16.cc` | `gemm_f16f16_q4.h`                     |
 | `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                     |
 
 The split is for navigability, not compilation. Each fragment closes over its
-parent's `static` packing helpers, per-thread scratch and typedefs, so it cannot
-be its own TU without exporting all of that, and each is included at exactly the
-point its code would otherwise occupy, leaving the preprocessed TU and the
-generated code unchanged. `csrc/transpose16.h`, `csrc/panel_ring.h`,
-`csrc/sme_tile.h`, `csrc/gemm_float.h` and `csrc/gemm_int.h` are the exceptions:
-genuinely shared headers, the first included by every 16-bit driver, the second
-(the §2.9/§2.10 scheduler) by the f16, bf16, widening and f32 drivers, the third
-(§3) by the kernels built from it. The last two are kernel templates over the
-element type, instantiated by each TU under its own target features:
-`gemm_float.h` holds the f32/f64 packed, small, batched and row-reduction
-kernels (`gemm_f32.cc`, `gemm_f64.cc`), `gemm_int.h` the i8/i16 packed and
-batched kernels and their dequant store (`gemm_i8i32.cc`, `gemm_i16i64.cc`). An
-integer kernel is instantiated per output type, raw accumulator or dequantized
-f32, so no call can pair a buffer with the wrong store. Every fragment needs an entry
-in `build.rs`'s `CSRC` list for rerun tracking, since `cc` never sees it.
+parent's `static` kernels and typedefs, so it cannot be its own TU without
+exporting all of that, and each is included at exactly the point its code would
+otherwise occupy, leaving the preprocessed TU and the generated code unchanged.
+`csrc/transpose16.h`, `csrc/panel_ring.h`, `csrc/sme_tile.h`,
+`csrc/gemm_half.h`, `csrc/gemm_float.h` and `csrc/gemm_int.h` are the
+exceptions: genuinely shared headers, the first included by every 16-bit driver,
+the second (the §2.9/§2.10 scheduler) by the f16, bf16, widening and f32
+drivers, the third (§3) by the kernels built from it. The last three are kernel
+templates over the element type, instantiated by each TU under its own target
+features: `gemm_half.h` holds the whole native 16-bit GEMM -- packing, GEMV,
+MOPA and batched kernels and their drivers -- for f16 and bf16
+(`gemm_f16f16.cc`, `gemm_b16b16.cc`, whose 4-bit fragments build on it),
+`gemm_float.h` the f32/f64 packed, small, batched and row-reduction kernels
+(`gemm_f32.cc`, `gemm_f64.cc`), `gemm_int.h` the i8/i16 packed and batched
+kernels and their dequant store (`gemm_i8i32.cc`, `gemm_i16i64.cc`). An integer
+kernel is instantiated per output type, raw accumulator or dequantized f32, so
+no call can pair a buffer with the wrong store. Every fragment needs an entry in
+`build.rs`'s `CSRC` list for rerun tracking, since `cc` never sees it.
 
 ### 3.2 The runtime probe
 
@@ -833,7 +837,8 @@ their feature flags.
   `ep_apply_nodes_scalar_*` in `csrc/epilogue.h`) so the fallback matches. For
   an activation, extend `enum ep_act`, the `EP_ACT_*` constants, and the f32/f64
   `act_apply_*` evaluators.
-- **A perf change:** the hot loop is `run_streaming` in the per-dtype
-  `csrc/gemm_*.cc` — start with `gemm_f16f16.cc` and read its header comment
-  first. The monolithic structure and the node-major store are both
-  load-bearing; splitting either costs throughput. Measure per §7.
+- **A perf change:** the hot loop is `run_streaming` in each kernel template
+  (`csrc/gemm_half.h`, `gemm_float.h`, `gemm_int.h`, `gemm_widen.cc`) — start
+  with `gemm_half.h` and read the comment above its `run_streaming` first. The
+  monolithic structure and the node-major store are both load-bearing;
+  splitting either costs throughput. Measure per §7.

@@ -14,6 +14,7 @@
 #include <arm_sme.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <type_traits>
 
 #define SME_INLINE __attribute__((always_inline)) inline
@@ -362,6 +363,23 @@ SME_INLINE void quad_store_raw(Acc *dst, long dst_cs, long dst_rs, size_t m0, si
             for (size_t c = 0; c < nc; c++)
                 dst[(long)(m0 + r) * dst_rs + (long)(n0 + c) * dst_cs] = scratch[r * 2 * W + c];
     }
+}
+
+// Per-thread reusable A-pack scratch (no per-call malloc/free on the serial
+// small/medium paths), one per element type per TU. Grows monotonically, lives
+// for the thread's lifetime.
+template <class T> static T *apack_scratch(size_t bytes) {
+    static thread_local T *buf = NULL;
+    static thread_local size_t cap = 0;
+    if (bytes == 0)
+        bytes = 1; // k==0: return a real (tiny) buffer, not a
+                   // history-dependent NULL that looks like OOM
+    if (cap < bytes) {
+        free(buf);
+        buf = (T *)malloc(bytes);
+        cap = buf ? bytes : 0;
+    }
+    return buf;
 }
 
 #endif // SME_GEMM_SME_TILE_H

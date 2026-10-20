@@ -69,7 +69,7 @@ static size_t f64_workers(size_t chunks) {
 }
 
 // m == 1: SME2 multi-vector FMLA into ZA vector groups instead of MOPA; see
-// run_gemv in gemm_f16f16.cc. 8-column bands, two per 16-wide tile; `abc` is
+// run_gemv in gemm_half.h. 8-column bands, two per 16-wide tile; `abc` is
 // [k][8] broadcast A. Past one row the 8x8 MOPA is cheaper.
 __arm_locally_streaming __arm_new("za") static void run_gemv(double *dst, const double *abc,
                                                              const double *b_pack, size_t n,

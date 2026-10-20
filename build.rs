@@ -44,7 +44,7 @@ const CSRC: &[&str] = &[
     "gemm_float.h",
     "gemm_int.h",
     "gemm_f16f16.cc",
-    "gemm_f16f16_batched.h",
+    "gemm_half.h",
     "gemm_f16f16_q4.h",
     "gemm_b16b16.cc",
     "gemm_b16b16_q4.h",

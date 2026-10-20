@@ -334,7 +334,7 @@ __arm_locally_streaming __arm_new("za") static size_t
     return four ? 2 : 1;
 }
 
-// Per-worker column items, as gemm_f16f16.cc's run_cols: each worker packs its
+// Per-worker column items, as gemm_half.h's run_cols: each worker packs its
 // own two super-tiles of B and multiplies them while they are in cache; the
 // first units pack A by M-chunk.
 template <class E>

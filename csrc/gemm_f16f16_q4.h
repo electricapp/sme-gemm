@@ -1,6 +1,6 @@
 // f16 Q4 path: C(f16) = A(f16) @ dequant(B), B kept 4-bit resident.
-// Included at the end of gemm_f16f16.cc for its `f16` typedef, `packa` and the
-// dense kernels; the bf16 twin is gemm_b16b16_q4.h.
+// Included at the end of gemm_f16f16.cc for its `f16` typedef and gemm_half.h's
+// dense kernels (run_panels, apack_scratch); the bf16 twin is gemm_b16b16_q4.h.
 //
 // B is resident band-major: bands of Q4_BAND = 128 columns, and for each depth a
 // band holds 64 bytes of nibbles, column c of the band at nibble c (two a byte,
@@ -488,11 +488,11 @@ static int q4_core(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *
     if (m <= Q4_GEMV_MAXR && block >= 4) {
         const f16 *a = (const f16 *)lhs;
         // The affine form's per-row, per-block sums of A. Shares the dense path's
-        // per-thread A-pack buffer (this header is included into gemm_f16f16.cc):
-        // only one gemm call per thread is ever in flight.
+        // per-thread A-pack buffer (apack_scratch<f16>): only one gemm call per
+        // thread is ever in flight.
         f16 *asum = NULL;
         if (mins) {
-            asum = apack_scratch(ep_cmul(ep_cmul(m, nbk), sizeof(f16)));
+            asum = apack_scratch<f16>(ep_cmul(ep_cmul(m, nbk), sizeof(f16)));
             if (!asum) return -1;
             for (size_t i = 0; i < m * nbk; i++) {
                 size_t r = i / nbk, b = i % nbk;

@@ -59,22 +59,6 @@ SME_INLINE void ep_store_rows(svbool_t plo, svbool_t phi, T *dst, long row_strid
                                    read_dst, nodes, n_nodes, i_base, n0);
 }
 
-// Per-thread reusable A-pack scratch (no per-call malloc/free on the serial
-// small/medium paths). Grows monotonically, lives for the thread's lifetime.
-template <class T> static T *apack_scratch(size_t bytes) {
-    static thread_local T *buf = NULL;
-    static thread_local size_t cap = 0;
-    if (bytes == 0)
-        bytes = 1; // k==0: return a real (tiny) buffer, not a
-                   // history-dependent NULL that looks like OOM
-    if (cap < bytes) {
-        free(buf);
-        buf = (T *)malloc(bytes);
-        cap = buf ? bytes : 0;
-    }
-    return buf;
-}
-
 // What one call's store does, decided once. A leading per-column bias
 // (ADD_COL) alone folds into ZA through rank-1 MOPAs before the K-loop and is
 // dropped from the graph, so a bias-only graph reverts to the direct store (the

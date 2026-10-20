@@ -65,7 +65,7 @@ static void pack_band(int16_t *dst, const int16_t *src, long lane_stride, long d
 using I16 = IntMopa<int16_t>;
 
 // m == 1: SME2 multi-vector SDOT into ZA64 vector groups instead of SMOPA;
-// see run_gemv in gemm_f16f16.cc. 8-column bands of 4-deep groups, two per
+// see run_gemv in gemm_half.h. 8-column bands of 4-deep groups, two per
 // 16-wide tile; `abc` is [kp4][32]: A[4p..4p+3] repeated across the vector.
 // Past one row the SMOPA is cheaper.
 template <class Out>
