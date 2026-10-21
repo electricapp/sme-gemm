@@ -237,6 +237,51 @@ SME_INLINE void quad_accumulate(size_t kd, const T *al, const T *ah, const T *bl
         quad_kloop<A, true, true, K::kFull>(d, kd, al, ah, bl, bh);
 }
 
+// --- a super-tile pair against one N-band --------------------------------------
+//
+// When C has a single N-band (n <= kTile), a super-tile's hi-N tiles are pad,
+// and two live tiles cannot keep the MOPA unit busy (each accumulator's MOPAs
+// wait on the last). Two super-tiles of M then share the band: the first in
+// tiles 0 / 2 as usual, the second in 1 / 3, which is a super-tile with its
+// tiles numbered t ^ 1. Each tile sums the same depths in the same order as a
+// lone super-tile. Hi1 says whether the second's hi-M band holds data; the
+// first's always does, since a second exists.
+template <class A, bool Hi1, int U, class T>
+SME_INLINE void pair_kloop(size_t &d, size_t kd, const T *a0l, const T *a0h, const T *a1l,
+                           const T *a1h, const T *b) __arm_streaming __arm_inout("za") {
+    constexpr size_t R = A::kRow;
+    svbool_t p = ptrue<sizeof(T)>();
+    for (; d + U <= kd; d += U) {
+        auto A0L = ld_depths<U>(a0l + d * R), A0H = ld_depths<U>(a0h + d * R);
+        auto A1L = ld_depths<U>(a1l + d * R), A1H = Hi1 ? ld_depths<U>(a1h + d * R) : A1L;
+        auto B = ld_depths<U>(b + d * R);
+        auto step = [&] [[gnu::always_inline]] (auto i) __arm_streaming __arm_inout("za") {
+            constexpr int I = decltype(i)::value;
+            auto bi = depth<U, I>(B);
+            A::template mopa<0>(p, depth<U, I>(A0L), bi);
+            A::template mopa<2>(p, depth<U, I>(A0H), bi);
+            A::template mopa<1>(p, depth<U, I>(A1L), bi);
+            if constexpr (Hi1) A::template mopa<3>(p, depth<U, I>(A1H), bi);
+        };
+        step(std::integral_constant<int, 0>{});
+        if constexpr (U > 1) step(std::integral_constant<int, 1>{});
+        if constexpr (U > 2) {
+            step(std::integral_constant<int, 2>{});
+            step(std::integral_constant<int, 3>{});
+        }
+    }
+    if constexpr (U > 1) pair_kloop<A, Hi1, U / 2>(d, kd, a0l, a0h, a1l, a1h, b);
+}
+template <class A, class K, class T>
+SME_INLINE void pair_accumulate(size_t kd, const T *a0l, const T *a0h, const T *a1l, const T *a1h,
+                                const T *b, bool hi1) __arm_streaming __arm_inout("za") {
+    size_t d = 0;
+    if (hi1)
+        pair_kloop<A, true, K::kFull>(d, kd, a0l, a0h, a1l, a1h, b);
+    else
+        pair_kloop<A, false, K::kFull>(d, kd, a0l, a0h, a1l, a1h, b);
+}
+
 // The same with B read in place from row-major B (one K value per MOPA only):
 // depth d of B's lo / hi band is bl + d*b_rs / bh + d*b_rs under pbl / pbh, so
 // pad columns load as zero. U depths per iteration, then the remainder.
@@ -279,6 +324,40 @@ SME_INLINE void quad_accumulate_rowb(size_t kd, const T *al, const T *ah, const 
         quad_kloop_rowb<A, true, true, U>(d, kd, al, ah, bl, bh, b_rs, pbl, pbh);
 }
 
+// The super-tile pair with B read in place: depth d of the one band is
+// b + d*b_rs under pb.
+template <class A, bool Hi1, int U, class T>
+SME_INLINE void pair_kloop_rowb(size_t &d, size_t kd, const T *a0l, const T *a0h, const T *a1l,
+                                const T *a1h, const T *b, long b_rs,
+                                svbool_t pb) __arm_streaming __arm_inout("za") {
+    static_assert(A::kGroup == 1, "B rows are only MOPA operands without a K interleave");
+    constexpr size_t R = A::kRow;
+    svbool_t p = ptrue<sizeof(T)>();
+    auto step = [&] [[gnu::always_inline]] (size_t e) __arm_streaming __arm_inout("za") {
+        Vec<T> bv = svld1(pb, b + (long)e * b_rs);
+        A::template mopa<0>(p, svld1(p, a0l + e * R), bv);
+        A::template mopa<2>(p, svld1(p, a0h + e * R), bv);
+        A::template mopa<1>(p, svld1(p, a1l + e * R), bv);
+        if constexpr (Hi1) A::template mopa<3>(p, svld1(p, a1h + e * R), bv);
+    };
+    for (; d + U <= kd; d += U) {
+        step(d);
+        if constexpr (U > 1) step(d + 1);
+    }
+    for (; d < kd; d++)
+        step(d);
+}
+template <class A, int U, class T>
+SME_INLINE void pair_accumulate_rowb(size_t kd, const T *a0l, const T *a0h, const T *a1l,
+                                     const T *a1h, const T *b, long b_rs, svbool_t pb,
+                                     bool hi1) __arm_streaming __arm_inout("za") {
+    size_t d = 0;
+    if (hi1)
+        pair_kloop_rowb<A, true, U>(d, kd, a0l, a0h, a1l, a1h, b, b_rs, pb);
+    else
+        pair_kloop_rowb<A, false, U>(d, kd, a0l, a0h, a1l, a1h, b, b_rs, pb);
+}
+
 // L2 blocking (BLIS jc -> ic) in super-tiles: how many fit in `bytes` of A-block
 // plus B-block, when a super-tile is two packed bands of 64 bytes per depth group.
 // A band-sized unit would double the working set. Never below 2.
@@ -303,32 +382,34 @@ static inline size_t quad_nc_blk(size_t budget, size_t n_tiles) {
 // Walk the live slices of a super-tile with T-row tiles. quad_rows visits output
 // rows [0, mr): f(lo-N tile, hi-N tile, slice, row), rows below T in tiles 0/1
 // and the rest in 2/3. quad_cols visits columns [0, nc): f(lo-M tile, hi-M tile,
-// slice, col), columns below T in tiles 0/2 and the rest in 1/3.
-template <size_t T, class F>
+// slice, col), columns below T in tiles 0/2 and the rest in 1/3. With X = 1
+// every tile number is t ^ 1: the second super-tile of a pair.
+template <size_t T, int X = 0, class F>
 SME_INLINE void quad_rows(size_t mr, F &&f) __arm_streaming __arm_in("za") {
     for (size_t r = 0; r < (mr < T ? mr : T); r++)
-        f(Tile<0>{}, Tile<1>{}, (uint32_t)r, r);
+        f(Tile<0 ^ X>{}, Tile<1 ^ X>{}, (uint32_t)r, r);
     for (size_t r = T; r < mr; r++)
-        f(Tile<2>{}, Tile<3>{}, (uint32_t)(r - T), r);
+        f(Tile<2 ^ X>{}, Tile<3 ^ X>{}, (uint32_t)(r - T), r);
 }
-template <size_t T, class F>
+template <size_t T, int X = 0, class F>
 SME_INLINE void quad_cols(size_t nc, F &&f) __arm_streaming __arm_in("za") {
     for (size_t c = 0; c < (nc < T ? nc : T); c++)
-        f(Tile<0>{}, Tile<2>{}, (uint32_t)c, c);
+        f(Tile<0 ^ X>{}, Tile<2 ^ X>{}, (uint32_t)c, c);
     for (size_t c = T; c < nc; c++)
-        f(Tile<1>{}, Tile<3>{}, (uint32_t)(c - T), c);
+        f(Tile<1 ^ X>{}, Tile<3 ^ X>{}, (uint32_t)(c - T), c);
 }
 
 // The whole super-tile out of ZA into a row-major [2T][2T] scratch, for the
 // strided-C stores (no scatter store in streaming mode).
-template <class Acc> SME_INLINE void quad_to_scratch(Acc *scratch) __arm_streaming __arm_in("za") {
+template <int X = 0, class Acc>
+SME_INLINE void quad_to_scratch(Acc *scratch) __arm_streaming __arm_in("za") {
     constexpr size_t T = 64 / sizeof(Acc);
     svbool_t p = ptrue<sizeof(Acc)>();
     for (uint32_t r = 0; r < T; r++) {
-        za_st_row<0>(r, p, scratch + r * 2 * T);
-        za_st_row<1>(r, p, scratch + r * 2 * T + T);
-        za_st_row<2>(r, p, scratch + (T + r) * 2 * T);
-        za_st_row<3>(r, p, scratch + (T + r) * 2 * T + T);
+        za_st_row<0 ^ X>(r, p, scratch + r * 2 * T);
+        za_st_row<1 ^ X>(r, p, scratch + r * 2 * T + T);
+        za_st_row<2 ^ X>(r, p, scratch + (T + r) * 2 * T);
+        za_st_row<3 ^ X>(r, p, scratch + (T + r) * 2 * T + T);
     }
 }
 
@@ -337,7 +418,7 @@ template <class Acc> SME_INLINE void quad_to_scratch(Acc *scratch) __arm_streami
 // through a scratch for any other strides. RowMajor skips the layout test. The
 // hi band's base is clamped when the band is empty, so no pointer past C is
 // formed.
-template <bool RowMajor = false, class Acc>
+template <bool RowMajor = false, int X = 0, class Acc>
 SME_INLINE void quad_store_raw(Acc *dst, long dst_cs, long dst_rs, size_t m0, size_t n0, size_t mr,
                                size_t nc) __arm_streaming __arm_in("za") {
     constexpr size_t W = 64 / sizeof(Acc);
@@ -346,7 +427,7 @@ SME_INLINE void quad_store_raw(Acc *dst, long dst_cs, long dst_rs, size_t m0, si
     if (!RowMajor && dst_rs == 1) {
         svbool_t plo = whilelt<sizeof(Acc)>(0, mr_lo), phi = whilelt<sizeof(Acc)>(0, mr_hi);
         size_t hw = mr_hi ? W : 0;
-        quad_cols<W>(
+        quad_cols<W, X>(
             nc, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
                                             size_t c) __arm_streaming __arm_in("za") {
                 Acc *col = dst + (long)(n0 + c) * dst_cs + (long)m0;
@@ -356,7 +437,7 @@ SME_INLINE void quad_store_raw(Acc *dst, long dst_cs, long dst_rs, size_t m0, si
     } else if (RowMajor || dst_cs == 1) {
         svbool_t plo = whilelt<sizeof(Acc)>(0, nc_lo), phi = whilelt<sizeof(Acc)>(0, nc_hi);
         size_t hw = nc_hi ? W : 0;
-        quad_rows<W>(
+        quad_rows<W, X>(
             mr, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
                                             size_t r) __arm_streaming __arm_in("za") {
                 Acc *row = dst + (long)(m0 + r) * dst_rs + (long)n0;
@@ -365,7 +446,7 @@ SME_INLINE void quad_store_raw(Acc *dst, long dst_cs, long dst_rs, size_t m0, si
             });
     } else {
         Acc scratch[4 * W * W];
-        quad_to_scratch(scratch);
+        quad_to_scratch<X>(scratch);
         for (size_t r = 0; r < mr; r++)
             for (size_t c = 0; c < nc; c++)
                 dst[(long)(m0 + r) * dst_rs + (long)(n0 + c) * dst_cs] = scratch[r * 2 * W + c];

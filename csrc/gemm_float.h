@@ -79,14 +79,15 @@ SME_INLINE FloatEpi<T> float_epi(const Ep *ep, T alpha, T beta,
 // Zero ZA, then seed the live quadrants with the bias row through rank-1 MOPAs
 // (ones x bias): the lo bias half inits tiles 0 and 2, the hi half 1 and 3, and
 // the tiles the K-loop leaves dead stay zero. Out of line so the fold does not
-// perturb the store codegen.
-template <class T>
+// perturb the store codegen. X = 1 seeds the second super-tile of a pair, after
+// the first's call has zeroed ZA (Zero false).
+template <int X = 0, bool Zero = true, class T>
 __attribute__((noinline)) static void bias_init_za(const T *bias, size_t n0, size_t n, size_t nc,
                                                    size_t mr) __arm_streaming __arm_inout("za") {
     using A = Mopa<T, T>;
     constexpr size_t W = A::kTile;
     svbool_t p = ptrue<sizeof(T)>();
-    svzero_za();
+    if constexpr (Zero) svzero_za();
     Vec<T> ones = Sve<T>::dup(1);
     size_t nlo = n0, nhi = n0 + W;
     svbool_t plo = nlo < n ? whilelt<sizeof(T)>(nlo, n) : svpfalse_b();
@@ -95,19 +96,19 @@ __attribute__((noinline)) static void bias_init_za(const T *bias, size_t n0, siz
     // but forming bias + nlo/nhi past one-past-end would still be UB.
     Vec<T> blo = svld1(plo, nlo < n ? bias + nlo : bias);
     Vec<T> bhi = svld1(phi, nhi < n ? bias + nhi : bias);
-    A::template mopa<0>(p, plo, ones, blo);
-    if (nc > W) A::template mopa<1>(p, phi, ones, bhi);
-    if (mr > W) A::template mopa<2>(p, plo, ones, blo);
-    if (nc > W && mr > W) A::template mopa<3>(p, phi, ones, bhi);
+    A::template mopa<0 ^ X>(p, plo, ones, blo);
+    if (nc > W) A::template mopa<1 ^ X>(p, phi, ones, bhi);
+    if (mr > W) A::template mopa<2 ^ X>(p, plo, ones, blo);
+    if (nc > W && mr > W) A::template mopa<3 ^ X>(p, phi, ones, bhi);
 }
 
 // Zero ZA, or seed it with the folded bias.
-template <class T>
+template <int X = 0, bool Zero = true, class T>
 SME_INLINE void quad_init(const FloatEpi<T> &e, size_t n0, size_t n, size_t nc,
                           size_t mr) __arm_streaming __arm_inout("za") {
     if (e.bias)
-        bias_init_za(e.bias, n0, n, nc, mr);
-    else
+        bias_init_za<X, Zero>(e.bias, n0, n, nc, mr);
+    else if constexpr (Zero)
         svzero_za();
 }
 
@@ -126,8 +127,9 @@ static inline bool quad_cols_ep(long dst_rs, const Ep *ep, T alpha, T beta, int 
 }
 
 // Store the live mr x nc corner of super-tile (m0, n0) to C:
-// C = alpha*C + nodes(beta*acc), for the layouts L covers.
-template <QuadC L = QuadC::Any, class T>
+// C = alpha*C + nodes(beta*acc), for the layouts L covers. X = 1 stores the
+// second super-tile of a pair (tiles t ^ 1).
+template <QuadC L = QuadC::Any, int X = 0, class T>
 SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n0, size_t mr,
                            size_t nc, const FloatEpi<T> &e, Vec<T> va,
                            Vec<T> vb) __arm_streaming __arm_in("za") {
@@ -146,14 +148,14 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
         // The hi-M band is empty (phi all-false) when narrow-M; no pointer past it.
         size_t hw = mr_hi ? W : 0;
         T *cbase = dst + (long)n0 * dst_cs + (long)m0;
-        ep_store_colmajor(p, plo, phi, cbase, dst_cs, hw, ZaColPair<0, 2, T>{}, 0, nc_lo, vb, va,
-                          read_dst, *e.col, m0, n0);
-        ep_store_colmajor(p, plo, phi, cbase, dst_cs, hw, ZaColPair<1, 3, T>{}, W, nc, vb, va,
-                          read_dst, *e.col, m0, n0);
+        ep_store_colmajor(p, plo, phi, cbase, dst_cs, hw, ZaColPair<0 ^ X, 2 ^ X, T>{}, 0, nc_lo,
+                          vb, va, read_dst, *e.col, m0, n0);
+        ep_store_colmajor(p, plo, phi, cbase, dst_cs, hw, ZaColPair<1 ^ X, 3 ^ X, T>{}, W, nc, vb,
+                          va, read_dst, *e.col, m0, n0);
         return;
     }
     if (e.pure) {
-        quad_store_raw<kRows>(dst, dst_cs, dst_rs, m0, n0, mr, nc);
+        quad_store_raw<kRows, X>(dst, dst_cs, dst_rs, m0, n0, mr, nc);
         return;
     }
     if (!kRows && dst_rs == 1) {
@@ -163,7 +165,7 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
         // Clamp so no one-past-end pointer is formed; the hi-M band is empty
         // (phi all-false) when narrow-M.
         size_t hw = mr_hi ? W : 0;
-        quad_cols<W>(
+        quad_cols<W, X>(
             nc, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
                                             size_t c) __arm_streaming __arm_in("za") {
                 T *col = dst + (long)(n0 + c) * dst_cs + (long)m0, *colh = col + hw;
@@ -195,16 +197,16 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
             // Node-major: read the live ZA half-rows in 4-row blocks and dispatch
             // each node once per block across all halves.
             T *rbase = dst + (long)m0 * dst_rs + (long)n0;
-            ep_store_rowmajor(p, plo, phi, rbase, dst_rs, ZaRowPair<0, 1, T>{}, 0, mr_lo, vb, va,
-                              read_dst, nodes, n_nodes, m0, n0);
-            ep_store_rowmajor(p, plo, phi, rbase, dst_rs, ZaRowPair<2, 3, T>{}, W, mr, vb, va,
-                              read_dst, nodes, n_nodes, m0, n0);
+            ep_store_rowmajor(p, plo, phi, rbase, dst_rs, ZaRowPair<0 ^ X, 1 ^ X, T>{}, 0, mr_lo,
+                              vb, va, read_dst, nodes, n_nodes, m0, n0);
+            ep_store_rowmajor(p, plo, phi, rbase, dst_rs, ZaRowPair<2 ^ X, 3 ^ X, T>{}, W, mr, vb,
+                              va, read_dst, nodes, n_nodes, m0, n0);
             return;
         }
         // Clamp so no one-past-end pointer is formed; the hi-N band is empty
         // (phi all-false) when narrow-N.
         size_t hw = nc_hi ? W : 0;
-        quad_rows<W>(
+        quad_rows<W, X>(
             mr, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
                                             size_t r) __arm_streaming __arm_in("za") {
                 T *rp = dst + (long)(m0 + r) * dst_rs + (long)n0, *rph = rp + hw;
@@ -219,7 +221,7 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
     } else {
         // Fully general strides: through a scratch, scalar combine. Rare.
         T scratch[4 * W * W];
-        quad_to_scratch(scratch);
+        quad_to_scratch<X>(scratch);
         for (size_t r = 0; r < mr; r++)
             for (size_t c = 0; c < nc; c++) {
                 T ab = scratch[r * 2 * W + c] * e.beta;
@@ -273,10 +275,42 @@ SME_INLINE void reduce_rows(const T *dst, size_t m0, size_t mr, size_t n,
     }
 }
 
+// The M-tiles [mt_lo, mt_hi) of a C with one N-band (n <= W), two super-tiles
+// at a time (sme_tile.h's pair); an odd last one runs alone. acc2(mt, hi1)
+// accumulates the pair from mt, acc1(mt, hi) the lone one.
+template <QuadC L, class T, class Stats, class Acc2, class Acc1>
+SME_INLINE void pair_tiles(T *dst, long dst_cs, long dst_rs, size_t m, size_t n, size_t mt_lo,
+                           size_t mt_hi, const FloatEpi<T> &e, Vec<T> va, Vec<T> vb, Stats stats,
+                           Acc2 acc2, Acc1 acc1) __arm_streaming __arm_inout("za") {
+    constexpr size_t W = 64 / sizeof(T);
+    constexpr bool kRows = std::is_same_v<Stats, RowStats<T>>;
+    for (size_t mt = mt_lo; mt < mt_hi; mt += 2) {
+        size_t m0 = mt * 2 * W, mr0 = m - m0 < 2 * W ? m - m0 : 2 * W;
+        if (mt + 1 < mt_hi) {
+            size_t m1 = m0 + 2 * W, mr1 = m - m1 < 2 * W ? m - m1 : 2 * W;
+            quad_init<0, true>(e, 0, n, n, mr0);
+            quad_init<1, false>(e, 0, n, n, mr1);
+            acc2(mt, mr1 > W);
+            quad_store<L, 0>(dst, dst_cs, dst_rs, m0, 0, mr0, n, e, va, vb);
+            quad_store<L, 1>(dst, dst_cs, dst_rs, m1, 0, mr1, n, e, va, vb);
+            if constexpr (kRows) {
+                reduce_rows(dst, m0, mr0, n, stats);
+                reduce_rows(dst, m1, mr1, n, stats);
+            }
+        } else {
+            quad_init(e, 0, n, n, mr0);
+            acc1(mt, mr0 > W);
+            quad_store<L>(dst, dst_cs, dst_rs, m0, 0, mr0, n, e, va, vb);
+            if constexpr (kRows) reduce_rows(dst, m0, mr0, n, stats);
+        }
+    }
+}
+
 // The packed loop nest behind run_streaming and run_rows. With RowStats, C is
 // row-major by construction: the store never reads dst_cs, and all of N is one
-// block so each M-tile's rows are finished before they are reduced.
-template <QuadC L, class T, class Ep, class Stats>
+// block so each M-tile's rows are finished before they are reduced. Pair runs a
+// C of one N-band (n <= W) as super-tile pairs.
+template <QuadC L, bool Pair, class T, class Ep, class Stats>
 SME_INLINE void packed_tiles(T *dst, long dst_cs, long dst_rs, const T *a_pack, const T *b_pack,
                              size_t m, size_t n, size_t mt_lo, size_t mt_hi, size_t nt_lo,
                              size_t nt_hi, size_t k, T alpha, T beta, int read_dst, const Ep *ep,
@@ -288,6 +322,22 @@ SME_INLINE void packed_tiles(T *dst, long dst_cs, long dst_rs, const T *a_pack, 
     const Vec<T> va = Sve<T>::dup(alpha), vb = Sve<T>::dup(beta);
     size_t per_tile = ep_cmul(k, W);
     FloatEpi<T> e = float_epi(ep, alpha, beta, read_dst);
+    if constexpr (Pair) {
+        // One N-band: b_pack's band 0.
+        pair_tiles<L>(
+            dst, dst_cs, dst_rs, m, n, mt_lo, mt_hi, e, va, vb, stats,
+            [&] [[gnu::always_inline]] (size_t mt, bool hi1) __arm_streaming __arm_inout("za") {
+                const T *a = a_pack + 2 * mt * per_tile;
+                pair_accumulate<A, FloatK<T>>(k, a, a + per_tile, a + 2 * per_tile,
+                                              a + 3 * per_tile, b_pack, hi1);
+            },
+            [&] [[gnu::always_inline]] (size_t mt, bool hi) __arm_streaming __arm_inout("za") {
+                const T *a = a_pack + 2 * mt * per_tile;
+                quad_accumulate<A, FloatK<T>>(k, a, a + per_tile, b_pack, b_pack + per_tile, hi,
+                                              false);
+            });
+        return;
+    }
 
     // Cache blocking (BLIS jc->ic) in super-tiles. mc_blk is capped at this
     // call's M range, so in the parallel paths only nc_blk grows; cross-chunk B
@@ -323,13 +373,13 @@ SME_INLINE void packed_tiles(T *dst, long dst_cs, long dst_rs, const T *a_pack, 
 // owns -- (0, n_tiles) for the whole problem, or a slice for the N-parallel
 // paths -- and b_pack points at super-tile nt_lo's bands. Super-tiles are
 // independent (no cross-tile state), so any chunk granularity is safe.
-template <QuadC L, class T, class Ep>
+template <QuadC L, bool Pair, class T, class Ep>
 __arm_locally_streaming __arm_new("za") static void streaming_tiles(
     T *dst, long dst_cs, long dst_rs, const T *a_pack, const T *b_pack, size_t m, size_t n,
     size_t mt_lo, size_t mt_hi, size_t nt_lo, size_t nt_hi, size_t k, T alpha, T beta, int read_dst,
     const Ep *ep) {
-    packed_tiles<L>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi, nt_lo, nt_hi, k, alpha,
-                    beta, read_dst, ep, NoRowStats{});
+    packed_tiles<L, Pair>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi, nt_lo, nt_hi, k,
+                          alpha, beta, read_dst, ep, NoRowStats{});
 }
 template <class T, class Ep>
 static inline void run_streaming(T *dst, long dst_cs, long dst_rs, const T *a_pack, const T *b_pack,
@@ -337,31 +387,43 @@ static inline void run_streaming(T *dst, long dst_cs, long dst_rs, const T *a_pa
                                  size_t nt_hi, size_t k, T alpha, T beta, int read_dst,
                                  const Ep *ep) {
     if (quad_cols_ep(dst_rs, ep, alpha, beta, read_dst))
-        streaming_tiles<QuadC::ColsEp>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi,
-                                       nt_lo, nt_hi, k, alpha, beta, read_dst, ep);
+        streaming_tiles<QuadC::ColsEp, false>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo,
+                                              mt_hi, nt_lo, nt_hi, k, alpha, beta, read_dst, ep);
+    else if (n <= 64 / sizeof(T))
+        streaming_tiles<QuadC::Any, true>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi,
+                                          nt_lo, nt_hi, k, alpha, beta, read_dst, ep);
     else
-        streaming_tiles<QuadC::Any>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi, nt_lo,
-                                    nt_hi, k, alpha, beta, read_dst, ep);
+        streaming_tiles<QuadC::Any, false>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi,
+                                           nt_lo, nt_hi, k, alpha, beta, read_dst, ep);
 }
 
 // M-tiles [mt_lo, mt_hi) of C = nodes(beta*A@B) into dense row-major C (row
 // stride n) across all of N, writing each finished row's sum and max.
-template <class T, class Ep>
-__arm_locally_streaming __arm_new("za") static void run_rows(T *dst, const T *a_pack,
-                                                             const T *b_pack, size_t m, size_t n,
-                                                             size_t mt_lo, size_t mt_hi, size_t k,
-                                                             T beta, const Ep *ep,
-                                                             RowStats<T> stats) {
+template <bool Pair, class T, class Ep>
+__arm_locally_streaming __arm_new("za") static void rows_tiles(T *dst, const T *a_pack,
+                                                               const T *b_pack, size_t m, size_t n,
+                                                               size_t mt_lo, size_t mt_hi, size_t k,
+                                                               T beta, const Ep *ep,
+                                                               RowStats<T> stats) {
     size_t n_tiles = (n + 128 / sizeof(T) - 1) / (128 / sizeof(T));
-    packed_tiles<QuadC::Rows>(dst, 1, (long)n, a_pack, b_pack, m, n, mt_lo, mt_hi, 0, n_tiles, k,
-                              (T)0, beta, 0, ep, stats);
+    packed_tiles<QuadC::Rows, Pair>(dst, 1, (long)n, a_pack, b_pack, m, n, mt_lo, mt_hi, 0, n_tiles,
+                                    k, (T)0, beta, 0, ep, stats);
+}
+template <class T, class Ep>
+static inline void run_rows(T *dst, const T *a_pack, const T *b_pack, size_t m, size_t n,
+                            size_t mt_lo, size_t mt_hi, size_t k, T beta, const Ep *ep,
+                            RowStats<T> stats) {
+    if (n <= 64 / sizeof(T))
+        rows_tiles<true>(dst, a_pack, b_pack, m, n, mt_lo, mt_hi, k, beta, ep, stats);
+    else
+        rows_tiles<false>(dst, a_pack, b_pack, m, n, mt_lo, mt_hi, k, beta, ep, stats);
 }
 
 // Small-GEMM path: serial (one streaming region, no GCD), A pre-packed, B read
 // straight from row-major rhs -- B[d, n0..] is already contiguous, so no B pack.
 // Targets the small regime where the parallel path's dispatch and full A/B
 // packing dwarf the compute.
-template <QuadC L, class T, class Ep>
+template <QuadC L, bool Pair, class T, class Ep>
 __arm_locally_streaming __arm_new("za") static void small_tiles(
     T *dst, long dst_cs, long dst_rs, const T *a_pack, const T *rhs, long rhs_rs, size_t m,
     size_t n, size_t k, size_t mt_lo, size_t mt_hi, T alpha, T beta, int read_dst, const Ep *ep) {
@@ -371,6 +433,23 @@ __arm_locally_streaming __arm_new("za") static void small_tiles(
     size_t per_tile = ep_cmul(k, W);
     size_t n_tiles = (n + 2 * W - 1) / (2 * W);
     FloatEpi<T> e = float_epi(ep, alpha, beta, read_dst);
+    if constexpr (Pair) {
+        // One N-band, B's first n columns.
+        svbool_t pb = whilelt<sizeof(T)>(0, n);
+        pair_tiles<L>(
+            dst, dst_cs, dst_rs, m, n, mt_lo, mt_hi, e, va, vb, NoRowStats{},
+            [&] [[gnu::always_inline]] (size_t mt, bool hi1) __arm_streaming __arm_inout("za") {
+                const T *a = a_pack + 2 * mt * per_tile;
+                pair_accumulate_rowb<A, 2>(k, a, a + per_tile, a + 2 * per_tile, a + 3 * per_tile,
+                                           rhs, rhs_rs, pb, hi1);
+            },
+            [&] [[gnu::always_inline]] (size_t mt, bool hi) __arm_streaming __arm_inout("za") {
+                const T *a = a_pack + 2 * mt * per_tile;
+                quad_accumulate_rowb<A, 2>(k, a, a + per_tile, rhs, rhs, rhs_rs, pb, svpfalse_b(),
+                                           hi, false);
+            });
+        return;
+    }
     for (size_t mt = mt_lo; mt < mt_hi; mt++) {
         const T *a_lo = a_pack + 2 * mt * per_tile, *a_hi = a_lo + per_tile;
         size_t m0 = mt * 2 * W, mr = m - m0 < 2 * W ? m - m0 : 2 * W;
@@ -393,11 +472,14 @@ static inline void run_small(T *dst, long dst_cs, long dst_rs, const T *a_pack, 
                              long rhs_rs, size_t m, size_t n, size_t k, size_t mt_lo, size_t mt_hi,
                              T alpha, T beta, int read_dst, const Ep *ep) {
     if (quad_cols_ep(dst_rs, ep, alpha, beta, read_dst))
-        small_tiles<QuadC::ColsEp>(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k, mt_lo, mt_hi,
-                                   alpha, beta, read_dst, ep);
+        small_tiles<QuadC::ColsEp, false>(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k, mt_lo,
+                                          mt_hi, alpha, beta, read_dst, ep);
+    else if (n <= 64 / sizeof(T))
+        small_tiles<QuadC::Any, true>(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k, mt_lo,
+                                      mt_hi, alpha, beta, read_dst, ep);
     else
-        small_tiles<QuadC::Any>(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k, mt_lo, mt_hi,
-                                alpha, beta, read_dst, ep);
+        small_tiles<QuadC::Any, false>(dst, dst_cs, dst_rs, a_pack, rhs, rhs_rs, m, n, k, mt_lo,
+                                       mt_hi, alpha, beta, read_dst, ep);
 }
 
 // One row-major batch item (C = nodes(A@B), overwrite), already in streaming

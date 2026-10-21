@@ -73,18 +73,60 @@ SME_INLINE void store_vec(svbool_t p32, svbool_t pst, typename E::T *ptr, svfloa
     svst1(pst, ptr, E::narrow(p32, lo, hi));
 }
 
+// Store the live mr x nc corner of super-tile (m0, n0): C = alpha*C + beta*acc,
+// by C's layout. X = 1 stores the second super-tile of a pair (tiles t ^ 1).
+template <class E, int X>
+SME_INLINE void widen_store(typename E::T *dst, long dst_cs, long dst_rs, size_t m0, size_t n0,
+                            size_t mr, size_t nc, float alpha, float beta, int read_dst,
+                            svfloat32_t va, svfloat32_t vb) __arm_streaming __arm_in("za") {
+    using T = typename E::T;
+    svbool_t p32 = svptrue_b32();
+    if (dst_rs == 1) {
+        // Col-major C: read ZA vertically so a column's 32 M-values land
+        // contiguous.
+        svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)mr);
+        quad_cols<16, X>(
+            nc, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
+                                            size_t c) __arm_streaming __arm_in("za") {
+                store_vec<E>(p32, pst, dst + (long)(n0 + c) * dst_cs + (long)m0,
+                             svmul_x(p32, za_col<zl, float>(s), vb),
+                             svmul_x(p32, za_col<zh, float>(s), vb), read_dst, va);
+            });
+    } else if (dst_cs == 1) {
+        // Row-major C: read ZA horizontally.
+        svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)nc);
+        quad_rows<16, X>(
+            mr, [&] [[gnu::always_inline]] (auto zl, auto zh, uint32_t s,
+                                            size_t r) __arm_streaming __arm_in("za") {
+                store_vec<E>(p32, pst, dst + (long)(m0 + r) * dst_rs + (long)n0,
+                             svmul_x(p32, za_row<zl, float>(s), vb),
+                             svmul_x(p32, za_row<zh, float>(s), vb), read_dst, va);
+            });
+    } else {
+        // Fully general strides: through a scratch, scalar combine. Rare;
+        // correctness over speed.
+        float scratch[32 * 32];
+        quad_to_scratch<X>(scratch);
+        for (size_t r = 0; r < mr; r++)
+            for (size_t c = 0; c < nc; c++) {
+                float ab = scratch[r * 32 + c] * beta;
+                T *cell = dst + (long)(m0 + r) * dst_rs + (long)(n0 + c) * dst_cs;
+                *cell = (T)(read_dst ? alpha * (float)*cell + ab : ab);
+            }
+    }
+}
+
 // The streaming compute: one ZA lifetime for a tile range. b_pack points at
 // super-tile nt_lo's bands; [nt_lo, nt_hi) is the N-tile sub-range this
 // invocation owns. Each super-tile is independent (zero, accumulate, store), so
 // any chunk granularity is safe.
 template <class E>
-__arm_locally_streaming __arm_new("za") static void run_streaming(
+__arm_locally_streaming __arm_new("za") static void streaming_tiles(
     typename E::T *dst, long dst_cs, long dst_rs, const typename E::T *a_pack,
     const typename E::T *b_pack, size_t m, size_t n, size_t mt_lo, size_t mt_hi, size_t nt_lo,
     size_t nt_hi, size_t kp, float alpha, float beta, int read_dst) {
     using T = typename E::T;
     using A = Mopa<T, float>;
-    svbool_t p32 = svptrue_b32();
     const svfloat32_t va = svdup_n_f32(alpha);
     const svfloat32_t vb = svdup_n_f32(beta);
     size_t per_tile = ep_cmul(kp, 32);
@@ -110,49 +152,57 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                 for (size_t nt = jc; nt < jc_end; nt++) {
                     const T *b_lo = b_pack + 2 * (nt - nt_lo) * per_tile, *b_hi = b_lo + per_tile;
                     size_t n0 = nt * 32, nc = n - n0 < 32 ? n - n0 : 32;
-
                     svzero_za();
                     quad_accumulate<A, KSteps<2>>(kp, a_lo, a_hi, b_lo, b_hi, mr > 16, nc > 16);
-
-                    if (dst_rs == 1) {
-                        // Col-major C: read ZA vertically so a column's 32
-                        // M-values land contiguous.
-                        svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)mr);
-                        quad_cols<16>(
-                            nc, [&] [[gnu::always_inline]] (
-                                    auto zl, auto zh, uint32_t s,
-                                    size_t c) __arm_streaming __arm_in("za") {
-                                store_vec<E>(p32, pst, dst + (long)(n0 + c) * dst_cs + (long)m0,
-                                             svmul_x(p32, za_col<zl, float>(s), vb),
-                                             svmul_x(p32, za_col<zh, float>(s), vb), read_dst, va);
-                            });
-                    } else if (dst_cs == 1) {
-                        // Row-major C: read ZA horizontally.
-                        svbool_t pst = svwhilelt_b16((uint64_t)0, (uint64_t)nc);
-                        quad_rows<16>(
-                            mr, [&] [[gnu::always_inline]] (
-                                    auto zl, auto zh, uint32_t s,
-                                    size_t r) __arm_streaming __arm_in("za") {
-                                store_vec<E>(p32, pst, dst + (long)(m0 + r) * dst_rs + (long)n0,
-                                             svmul_x(p32, za_row<zl, float>(s), vb),
-                                             svmul_x(p32, za_row<zh, float>(s), vb), read_dst, va);
-                            });
-                    } else {
-                        // Fully general strides: through a scratch, scalar combine.
-                        // Rare; correctness over speed.
-                        float scratch[32 * 32];
-                        quad_to_scratch(scratch);
-                        for (size_t r = 0; r < mr; r++)
-                            for (size_t c = 0; c < nc; c++) {
-                                float ab = scratch[r * 32 + c] * beta;
-                                T *cell = dst + (long)(m0 + r) * dst_rs + (long)(n0 + c) * dst_cs;
-                                *cell = (T)(read_dst ? alpha * (float)*cell + ab : ab);
-                            }
-                    }
+                    widen_store<E, 0>(dst, dst_cs, dst_rs, m0, n0, mr, nc, alpha, beta, read_dst,
+                                      va, vb);
                 }
             }
         }
     }
+}
+
+// C with one N-band (n <= 16): M-tiles [mt_lo, mt_hi) as super-tile pairs
+// (sme_tile.h), so all four tiles accumulate; an odd last one runs alone.
+template <class E>
+__arm_locally_streaming __arm_new("za") static void paired_tiles(
+    typename E::T *dst, long dst_cs, long dst_rs, const typename E::T *a_pack,
+    const typename E::T *b_pack, size_t m, size_t n, size_t mt_lo, size_t mt_hi, size_t kp,
+    float alpha, float beta, int read_dst) {
+    using T = typename E::T;
+    using A = Mopa<T, float>;
+    const svfloat32_t va = svdup_n_f32(alpha);
+    const svfloat32_t vb = svdup_n_f32(beta);
+    size_t per_tile = ep_cmul(kp, 32);
+    for (size_t mt = mt_lo; mt < mt_hi; mt += 2) {
+        const T *a = a_pack + 2 * mt * per_tile;
+        size_t m0 = mt * 32, mr0 = m - m0 < 32 ? m - m0 : 32;
+        svzero_za();
+        if (mt + 1 < mt_hi) {
+            size_t m1 = m0 + 32, mr1 = m - m1 < 32 ? m - m1 : 32;
+            pair_accumulate<A, KSteps<2>>(kp, a, a + per_tile, a + 2 * per_tile, a + 3 * per_tile,
+                                          b_pack, mr1 > 16);
+            widen_store<E, 0>(dst, dst_cs, dst_rs, m0, 0, mr0, n, alpha, beta, read_dst, va, vb);
+            widen_store<E, 1>(dst, dst_cs, dst_rs, m1, 0, mr1, n, alpha, beta, read_dst, va, vb);
+        } else {
+            quad_accumulate<A, KSteps<2>>(kp, a, a + per_tile, b_pack, b_pack + per_tile, mr0 > 16,
+                                          false);
+            widen_store<E, 0>(dst, dst_cs, dst_rs, m0, 0, mr0, n, alpha, beta, read_dst, va, vb);
+        }
+    }
+}
+
+template <class E>
+static inline void run_streaming(typename E::T *dst, long dst_cs, long dst_rs,
+                                 const typename E::T *a_pack, const typename E::T *b_pack, size_t m,
+                                 size_t n, size_t mt_lo, size_t mt_hi, size_t nt_lo, size_t nt_hi,
+                                 size_t kp, float alpha, float beta, int read_dst) {
+    if (n <= 16)
+        paired_tiles<E>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi, kp, alpha, beta,
+                        read_dst);
+    else
+        streaming_tiles<E>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, mt_lo, mt_hi, nt_lo, nt_hi,
+                           kp, alpha, beta, read_dst);
 }
 
 // Per-thread reusable A-pack scratch (no per-call malloc/free on the serial

@@ -96,6 +96,18 @@ transpose a 16×16 block, where the NEON 4×4 transpose is issue-bound at about
 one instruction per float. Once A is DRAM-sized the NEON path's memory-level
 parallelism wins, so the ZA pack is gated on A's footprint.
 
+A C with one N-band (n up to the tile width: 16 lanes for f32, i8 and the
+widening kernels, 8 for f64, 32 for f16f16/b16b16) leaves a super-tile's hi-N
+tiles as pad, and two live accumulators cannot keep the MOPA unit busy: each
+one's MOPAs wait on its last. Those calls run M-tiles in pairs against the one
+band, the first in tiles 0/2 and the second in 1/3 (`pair_accumulate` in
+`sme_tile.h`; `run_narrow_rowmajor` in the f16f16, b16b16 and i8 kernels). Each
+tile sums the same depths in the same order as a lone super-tile, so results
+are unchanged, and the dispatchers choose the paired loop nest as its own
+instantiation. It pays where A is cache-resident and K is deep. Where A streams
+from DRAM the call is bound on reading A, and each A vector feeds one MOPA
+either way.
+
 Rust's `sme_worth_it(m,n,k)` requires `has_sme() && k >= 2` and a flop floor:
 `1<<12` once `m*n >= 8`, `1<<18` below, since a MOPA pays for a whole 32×32 tile
 whatever the output shape. The floor applies only where the fallback is
@@ -508,7 +520,8 @@ the ones to benchmark.
 The kernels share their building blocks through `csrc/sme_tile.h`: a MOPA atom
 per element and accumulator type (`Mopa<T, Acc>` fixes the lanes per vector, the
 ZA tile size and the K values each MOPA folds), the 2×2 super-tile K-loop with
-its live-band variants, walkers over a super-tile's ZA rows and columns, and the
+its live-band variants, the super-tile pair for a C with one N-band (§2.3),
+walkers over a super-tile's ZA rows and columns, and the
 per-thread A-pack scratch (`apack_scratch<T>`). ZA
 tile numbers travel as template arguments, which are constants by the time an
 instruction needs one (§1), and every helper and per-slice lambda is
