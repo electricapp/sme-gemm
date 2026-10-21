@@ -7,7 +7,7 @@ has no on-CPU SME path on Apple M4+.
 
 This document is the design overview. The public API is documented in the
 rustdoc on `lib.rs`, the in-kernel epilogue interpreter in the header comment of
-`csrc/epilogue.h`, and the SME hot loop in the comment above `run_streaming` in
+`csrc/epilogue.h`, and the SME hot loop in the comment above `streaming_tiles` in
 `csrc/gemm_half.h`.
 
 ---
@@ -40,7 +40,7 @@ follow from the differences.
   two tiles in flight — `za0` for N-tile `nt`, `za1` for `nt+1`, run in lockstep
   so consecutive MOPAs never collide — must hard-code both. This is why the hot
   loop cannot be parameterized over "which tile" and is one large function; see
-  the `run_streaming` header comment.
+  the `streaming_tiles` header comment.
 
 ---
 
@@ -738,6 +738,15 @@ ROW as a per-slice scalar; a column swaps them. Each kernel hands the store a
 slice reader: a ZA row or column, with the tile numbers as template arguments,
 or a GEMV row already in registers.
 
+Every vector op on a slice costs a measurable share of a shallow-K GEMM, so the
+store does no op it can avoid. beta is 1 in nearly every call, and each kernel
+compiles its loop nest both with the `beta * acc` multiply and without it,
+choosing per call (`Scale`): testing beta inside the store instead perturbs its
+register allocation. The operand fixed per slice (ROW for a row, COL for a
+column) is a broadcast load (`EpRow::splat`); bf16 broadcasts its bits and
+widens in vector registers, where widening the scalar would take a core register
+and a move into the streaming unit on every slice.
+
 A TENSOR operand read down a column is a gather, which streaming SVE lacks, so
 the column store takes an `EpColGraph`, which only `EpColGraph::of` makes and
 only for a graph with no TENSOR node; col-major C with a TENSOR graph takes the
@@ -873,8 +882,10 @@ their feature flags.
   `ep_apply_nodes_scalar_*` in `csrc/epilogue.h`) so the fallback matches. For
   an activation, extend `enum ep_act`, the `EP_ACT_*` constants, the vector
   `ep_act_rational_{f16,f32,f64}` and the scalar `ep_act_scalar*`.
-- **A perf change:** the hot loop is `run_streaming` in each kernel template
-  (`csrc/gemm_half.h`, `gemm_float.h`, `gemm_int.h`, `gemm_widen.cc`) — start
-  with `gemm_half.h` and read the comment above its `run_streaming` first. The
+- **A perf change:** the hot loop is the streaming body each kernel's
+  `run_streaming` dispatches to (`streaming_tiles` in `csrc/gemm_half.h`,
+  `gemm_float.h` and `gemm_widen.cc`; `run_streaming` itself in `gemm_int.h`) —
+  start with `gemm_half.h` and read the comment above its `streaming_tiles`
+  first. The
   monolithic structure and the node-major store are both load-bearing;
   splitting either costs throughput. Measure per §7.

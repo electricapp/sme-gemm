@@ -106,6 +106,8 @@ template <> struct EpRow<ep_f16> {
                                      size_t) __arm_streaming {
         return svld1(pl, q);
     }
+    // *q in every lane: the operand fixed per slice.
+    static SME_INLINE svfloat16_t splat(const ep_f16 *q) __arm_streaming { return svdup_n_f16(*q); }
     static SME_INLINE svfloat16_t act(svbool_t p, svfloat16_t x, int kind,
                                       float alpha) __arm_streaming {
         return ep_act<ep_f16>(p, x, kind, alpha, ep_act_rational_f16);
@@ -131,6 +133,13 @@ template <> struct EpRow<ep_bf16> {
                                      size_t) __arm_streaming {
         return half(svld1(pl, q), h);
     }
+    // Broadcast as bf16 and widen in vector registers: widening the scalar
+    // first takes a core register and a move into the streaming unit per slice.
+    static SME_INLINE svfloat32_t splat(const ep_bf16 *q) __arm_streaming {
+        uint16_t b; // its bits: a 16-bit integer broadcast load is one LD1RH
+        __builtin_memcpy(&b, q, sizeof b);
+        return half(svreinterpret_bf16(svdup_n_u16(b)), 0);
+    }
     static SME_INLINE svfloat32_t act(svbool_t p, svfloat32_t x, int kind,
                                       float alpha) __arm_streaming {
         return ep_act<float>(p, x, kind, alpha, ep_act_rational_f32);
@@ -155,6 +164,7 @@ template <class T, int Hi> struct EpRowWide {
                                 size_t hoff) __arm_streaming {
         return h ? svld1(ph, q + hoff) : svld1(pl, q);
     }
+    static SME_INLINE Vec<T> splat(const T *q) __arm_streaming { return Sve<T>::dup(*q); }
     static SME_INLINE Vec<T> act(svbool_t p, Vec<T> x, int kind, T alpha) __arm_streaming {
         if constexpr (sizeof(T) == 4)
             return ep_act<T>(p, x, kind, alpha, ep_act_rational_f32);
@@ -165,7 +175,7 @@ template <class T, int Hi> struct EpRowWide {
 template <> struct EpRow<float> : EpRowWide<float, 16> {};
 template <> struct EpRow<double> : EpRowWide<double, 8> {};
 
-template <class E, bool Cols>
+template <class E, bool Cols, bool Scale>
 SME_INLINE void ep_block(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long stride, size_t hoff,
                          typename EpRow<E>::In x0, typename EpRow<E>::In x1,
                          typename EpRow<E>::In x2, typename EpRow<E>::In x3, size_t nr, Vec<E> vb,
@@ -209,10 +219,10 @@ SME_INLINE void ep_block(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long str
         V cl = G::ld(pl, ph, q + (at), 0, hoff), ch = two ? G::ld(pl, ph, q + (at), 1, hoff) : cl; \
         EP_EACH(f(p, x, h ? ch : cl));                                                             \
     }
-    if constexpr (widen) {
+    if constexpr (Scale && widen) {
         V bl = G::half(vb, 0), bh = G::half(vb, 1);
         EP_EACH(svmul_x(p, x, h ? bh : bl));
-    } else {
+    } else if constexpr (Scale) {
         EP_EACH(svmul_x(p, x, vb));
     }
     for (uint32_t t = 0; t < n_nodes; t++) {
@@ -243,23 +253,23 @@ SME_INLINE void ep_block(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long str
                 if constexpr (Cols)
                     EP_ALONG(svadd_x, m0)
                 else
-                    EP_EACH(svadd_x(p, x, (C)q[m0 + s0 + r]));
+                    EP_EACH(svadd_x(p, x, G::splat(q + (m0 + s0 + r))));
                 break;
             case EP_OP_MUL_ROW:
                 if constexpr (Cols)
                     EP_ALONG(svmul_x, m0)
                 else
-                    EP_EACH(svmul_x(p, x, (C)q[m0 + s0 + r]));
+                    EP_EACH(svmul_x(p, x, G::splat(q + (m0 + s0 + r))));
                 break;
             case EP_OP_ADD_COL:
                 if constexpr (Cols)
-                    EP_EACH(svadd_x(p, x, (C)q[n0 + s0 + r]));
+                    EP_EACH(svadd_x(p, x, G::splat(q + (n0 + s0 + r))));
                 else
                     EP_ALONG(svadd_x, n0)
                 break;
             case EP_OP_MUL_COL:
                 if constexpr (Cols)
-                    EP_EACH(svmul_x(p, x, (C)q[n0 + s0 + r]));
+                    EP_EACH(svmul_x(p, x, G::splat(q + (n0 + s0 + r))));
                 else
                     EP_ALONG(svmul_x, n0)
                 break;
@@ -295,7 +305,7 @@ SME_INLINE void ep_block(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long str
                 if constexpr (Cols)
                     EP_ALONG(svsub_x, m0)
                 else
-                    EP_EACH(svsub_x(p, x, (C)q[m0 + s0 + r]));
+                    EP_EACH(svsub_x(p, x, G::splat(q + (m0 + s0 + r))));
                 break;
             case EP_OP_DIV_ROW:
                 if constexpr (Cols)
@@ -307,17 +317,17 @@ SME_INLINE void ep_block(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long str
                 if constexpr (Cols)
                     EP_ALONG(svmaxnm_x, m0)
                 else
-                    EP_EACH(svmaxnm_x(p, x, (C)q[m0 + s0 + r]));
+                    EP_EACH(svmaxnm_x(p, x, G::splat(q + (m0 + s0 + r))));
                 break;
             case EP_OP_MIN_ROW:
                 if constexpr (Cols)
                     EP_ALONG(svminnm_x, m0)
                 else
-                    EP_EACH(svminnm_x(p, x, (C)q[m0 + s0 + r]));
+                    EP_EACH(svminnm_x(p, x, G::splat(q + (m0 + s0 + r))));
                 break;
             case EP_OP_SUB_COL:
                 if constexpr (Cols)
-                    EP_EACH(svsub_x(p, x, (C)q[n0 + s0 + r]));
+                    EP_EACH(svsub_x(p, x, G::splat(q + (n0 + s0 + r))));
                 else
                     EP_ALONG(svsub_x, n0)
                 break;
@@ -329,13 +339,13 @@ SME_INLINE void ep_block(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long str
                 break;
             case EP_OP_MAX_COL:
                 if constexpr (Cols)
-                    EP_EACH(svmaxnm_x(p, x, (C)q[n0 + s0 + r]));
+                    EP_EACH(svmaxnm_x(p, x, G::splat(q + (n0 + s0 + r))));
                 else
                     EP_ALONG(svmaxnm_x, n0)
                 break;
             case EP_OP_MIN_COL:
                 if constexpr (Cols)
-                    EP_EACH(svminnm_x(p, x, (C)q[n0 + s0 + r]));
+                    EP_EACH(svminnm_x(p, x, G::splat(q + (n0 + s0 + r))));
                 else
                     EP_ALONG(svminnm_x, n0)
                 break;
@@ -406,17 +416,20 @@ SME_INLINE void ep_block(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long str
 
 // Slices [lo, hi) of a tile at dst (slice s at dst + s*stride), slice s read by
 // rd(s - lo): a ZA slice (the tile number is the reader's template argument),
-// or one already in registers.
-template <class E, bool Cols, class RD>
+// or one already in registers. Scale applies beta (vb) first; a caller that
+// knows beta is 1 drops it, since every vector op on a slice costs and a runtime
+// test of it perturbs the store's code.
+template <class E, bool Cols, bool Scale, class RD>
 SME_INLINE void ep_store_slices(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long stride,
                                 size_t hoff, RD &&rd, size_t lo, size_t hi, Vec<E> vb, Vec<E> va,
                                 int read_dst, const EpNode *nodes, uint32_t n_nodes, size_t m0,
                                 size_t n0) __arm_streaming __arm_in("za") {
     size_t n = hi > lo ? hi - lo : 0, s = 0;
     for (; s + 4 <= n; s += 4)
-        ep_block<E, Cols>(pm, pl, ph, dst, stride, hoff, rd((uint32_t)(s + 0)),
-                          rd((uint32_t)(s + 1)), rd((uint32_t)(s + 2)), rd((uint32_t)(s + 3)), 4,
-                          vb, va, read_dst, nodes, n_nodes, m0, lo + s, n0);
+        ep_block<E, Cols, Scale>(pm, pl, ph, dst, stride, hoff, rd((uint32_t)(s + 0)),
+                                 rd((uint32_t)(s + 1)), rd((uint32_t)(s + 2)),
+                                 rd((uint32_t)(s + 3)), 4, vb, va, read_dst, nodes, n_nodes, m0,
+                                 lo + s, n0);
     if (s < n) {
         size_t nr = n - s;
         // Implied by the loop exit, but stated, the compiler drops the tail
@@ -425,43 +438,43 @@ SME_INLINE void ep_store_slices(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, l
         typename EpRow<E>::In x0 = rd((uint32_t)(s + 0));
         typename EpRow<E>::In x1 = nr > 1 ? rd((uint32_t)(s + 1)) : x0;
         typename EpRow<E>::In x2 = nr > 2 ? rd((uint32_t)(s + 2)) : x0;
-        ep_block<E, Cols>(pm, pl, ph, dst, stride, hoff, x0, x1, x2, x0, nr, vb, va, read_dst,
-                          nodes, n_nodes, m0, lo + s, n0);
+        ep_block<E, Cols, Scale>(pm, pl, ph, dst, stride, hoff, x0, x1, x2, x0, nr, vb, va,
+                                 read_dst, nodes, n_nodes, m0, lo + s, n0);
     }
 }
 
 // Tile rows [lo, hi) of row-major C at dst (tile row r at dst + r*row_stride);
 // pl / ph are the N predicates of the row's halves. i_base is the tile's first
 // output row.
-template <class E, class RD>
+template <bool Scale = true, class E, class RD>
 SME_INLINE void ep_store_rowmajor(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long row_stride,
                                   RD &&rd, size_t lo, size_t hi, Vec<E> vb, Vec<E> va, int read_dst,
                                   const EpNode *nodes, uint32_t n_nodes, size_t i_base,
                                   size_t n0) __arm_streaming __arm_in("za") {
-    ep_store_slices<E, false>(pm, pl, ph, dst, row_stride, EpRow<E>::kHi, rd, lo, hi, vb, va,
-                              read_dst, nodes, n_nodes, i_base, n0);
+    ep_store_slices<E, false, Scale>(pm, pl, ph, dst, row_stride, EpRow<E>::kHi, rd, lo, hi, vb, va,
+                                     read_dst, nodes, n_nodes, i_base, n0);
 }
 
 // Tile columns [lo, hi) of col-major C at dst (tile column c at dst +
 // c*col_stride); pl / ph are the M predicates of the column's halves and hoff
 // the hi half's offset (0 when that half is empty, so no past-the-end pointer
 // is formed). The tile starts at output row m0, column n0.
-template <class E, class RD>
+template <bool Scale = true, class E, class RD>
 SME_INLINE void ep_store_colmajor(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, long col_stride,
                                   size_t hoff, RD &&rd, size_t lo, size_t hi, Vec<E> vb, Vec<E> va,
                                   int read_dst, EpColGraph g, size_t m0,
                                   size_t n0) __arm_streaming __arm_in("za") {
-    ep_store_slices<E, true>(pm, pl, ph, dst, col_stride, hoff, rd, lo, hi, vb, va, read_dst,
-                             g.nodes(), g.size(), m0, n0);
+    ep_store_slices<E, true, Scale>(pm, pl, ph, dst, col_stride, hoff, rd, lo, hi, vb, va, read_dst,
+                                    g.nodes(), g.size(), m0, n0);
 }
 
 // One row already in registers (a GEMV output row).
-template <class E>
+template <bool Scale = true, class E>
 SME_INLINE void ep_store_row(svbool_t pm, svbool_t pl, svbool_t ph, E *dst, typename EpRow<E>::In x,
                              Vec<E> vb, Vec<E> va, int read_dst, const EpNode *nodes,
                              uint32_t n_nodes, size_t i_base, size_t n0) __arm_streaming {
-    ep_block<E, false>(pm, pl, ph, dst, 0, EpRow<E>::kHi, x, x, x, x, 1, vb, va, read_dst, nodes,
-                       n_nodes, i_base, 0, n0);
+    ep_block<E, false, Scale>(pm, pl, ph, dst, 0, EpRow<E>::kHi, x, x, x, x, 1, vb, va, read_dst,
+                              nodes, n_nodes, i_base, 0, n0);
 }
 
 #endif // SME_GEMM_EPILOGUE_TILE_H

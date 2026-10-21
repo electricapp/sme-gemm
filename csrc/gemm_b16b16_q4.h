@@ -254,7 +254,7 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
             if (!n_nodes) {                                                                        \
                 svst1_bf16(pst, out, acc);                                                         \
             } else {                                                                               \
-                ep_store_row(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, r, n0);           \
+                ep_store_row<false>(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, r, n0);    \
             }                                                                                      \
         }                                                                                          \
     } while (0)

@@ -216,7 +216,7 @@ static inline size_t q2_cap(size_t rows) {
             if (!n_nodes) {                                                                        \
                 svst1_f16(pst, out, acc);                                                          \
             } else {                                                                               \
-                ep_store_row(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, row, n0);         \
+                ep_store_row<false>(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, row, n0);  \
             }                                                                                      \
         }                                                                                          \
     } while (0)

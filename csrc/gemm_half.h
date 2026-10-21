@@ -60,15 +60,16 @@ template <class T> static inline float half_from_bits(uint16_t b) {
 // The epilogue stores. Every SVE value reaches them as a parameter -- the
 // kernel's hoisted p16 and zero included -- so after inlining they are the
 // kernel's own registers; a fresh ptrue or a captured reference gets spilled
-// and reloaded around the out-of-line calls instead (see run_streaming).
+// and reloaded around the out-of-line calls instead (see streaming_tiles).
+// Scale applies beta first; kernels instantiate without it for beta 1.
 
 // Node-major store of `ncols` columns of ZA tile Z to col-major C (dst is the
 // tile's first column; epilogue_tile.h).
-template <int Z, class T>
+template <bool Scale = true, int Z, class T>
 SME_INLINE void ep_cols(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst, long col_stride,
                         size_t ncols, Vec<T> vb, Vec<T> va, int read_dst, EpColGraph g, size_t m0,
                         size_t n0) __arm_streaming __arm_in("za") {
-    ep_store_colmajor(
+    ep_store_colmajor<Scale>(
         p16, pst, pst, dst, col_stride, 0,
         [&] [[gnu::always_inline]] (uint32_t s) __arm_streaming __arm_in("za") {
             return svread_ver_za16_m(z16, p16, Z, s);
@@ -77,11 +78,11 @@ SME_INLINE void ep_cols(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst,
 }
 
 // Node-major store of `mrows` rows of ZA tile Z (epilogue_tile.h).
-template <int Z, class T>
+template <bool Scale = true, int Z, class T>
 SME_INLINE void ep_rows(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst, long row_stride,
                         size_t mrows, Vec<T> vb, Vec<T> va, int read_dst, const EpNode *nodes,
                         uint32_t n_nodes, size_t i_base, size_t n0) __arm_streaming __arm_in("za") {
-    ep_store_rowmajor(
+    ep_store_rowmajor<Scale>(
         p16, pst, pst, dst, row_stride,
         [&] [[gnu::always_inline]] (uint32_t s) __arm_streaming __arm_in("za") {
             return svread_hor_za16_m(z16, p16, Z, s);
@@ -91,7 +92,7 @@ SME_INLINE void ep_rows(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst,
 
 // Narrow/combine/store one extracted ZA16 column or row (already 32 contiguous
 // lanes for the stored direction). `acc` is the raw outer-product slice. Left
-// to the inliner: run_streaming's register allocation is tuned with it called
+// to the inliner: streaming_tiles's register allocation is tuned with it called
 // out of line there.
 template <class T>
 static inline void store_slice(svbool_t p16, svbool_t pst, T *ptr, Vec<T> acc, Vec<T> vb,
@@ -103,7 +104,7 @@ static inline void store_slice(svbool_t p16, svbool_t pst, T *ptr, Vec<T> acc, V
 
 // Zero ZA tiles 0/1 then initialize ZA[r][c] = bias[c] via a rank-1 FMOPA
 // (ones[r] * bias[c]). Kept out of line so the bias-fold path does not perturb
-// the (layout-sensitive) inlined store code of run_streaming. nt is the first of
+// the (layout-sensitive) inlined store code of streaming_tiles. nt is the first of
 // the two N-tiles; partial column tiles predicate the bias load.
 template <class T>
 __attribute__((noinline)) static void bias_init_za(svbool_t p16, const T *bias, size_t nt,
@@ -122,17 +123,17 @@ __attribute__((noinline)) static void bias_init_za(svbool_t p16, const T *bias, 
 }
 
 // Narrow-N (n_tiles == 1, n <= 32) row-major fast path. The dual-tile lockstep in
-// run_streaming pairs N-tiles (za0 = nt, za1 = nt+1); when there is only ONE
+// streaming_tiles pairs N-tiles (za0 = nt, za1 = nt+1); when there is only ONE
 // N-tile, za1 accumulates the zeroed pad tile -- ~half the MOPAs are wasted (n=32
 // measured ~2x slow per flop vs n=64). Here both ZA tiles stay productive by
 // pairing two M-tiles against the single B-tile: za0 = A[mt] @ B, za1 = A[mt+1] @ B.
 // Row-major only (the small-m output layout); col-major / strided n_tiles==1
 // stays on the general path. Bias is NOT folded (applied as a normal node at the
-// store), so the store reuses run_streaming's pure / node-major row-major
-// primitives verbatim -- no new store codegen, and run_streaming is untouched.
-// `b_pack` points at tile `nt` itself.
-template <class T>
-__arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
+// store), so the store reuses streaming_tiles's pure / node-major row-major
+// primitives verbatim -- no new store codegen. `b_pack` points at tile `nt`
+// itself.
+template <class T, bool Scale>
+__arm_locally_streaming __arm_new("za") static void narrow_tiles(
     T *dst, long dst_cs, long dst_rs, const T *a_pack, const T *b_pack, size_t m, size_t n,
     size_t k, size_t mt_lo, size_t mt_hi, size_t nt, float alpha, float beta, int read_dst,
     const ep_desc16 *ep) {
@@ -198,12 +199,12 @@ __arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
                                    dst + (long)(m0_1 + r) * dst_rs + (long)n0 * dst_cs);
         } else if (has_ep) {
             T *base0 = dst + (long)m0_0 * dst_rs + (long)n0 * dst_cs;
-            ep_rows(Tile<0>{}, p16, pst, z16, base0, dst_rs, mrows0, vb, va, read_dst, nodes,
-                    n_nodes, m0_0, n0);
+            ep_rows<Scale>(Tile<0>{}, p16, pst, z16, base0, dst_rs, mrows0, vb, va, read_dst, nodes,
+                           n_nodes, m0_0, n0);
             if (have1) {
                 T *base1 = dst + (long)m0_1 * dst_rs + (long)n0 * dst_cs;
-                ep_rows(Tile<1>{}, p16, pst, z16, base1, dst_rs, mrows1, vb, va, read_dst, nodes,
-                        n_nodes, m0_1, n0);
+                ep_rows<Scale>(Tile<1>{}, p16, pst, z16, base1, dst_rs, mrows1, vb, va, read_dst,
+                               nodes, n_nodes, m0_1, n0);
             }
         } else {
             // beta != 1 or read_dst (no ep): scale / accumulate per row.
@@ -216,6 +217,24 @@ __arm_locally_streaming __arm_new("za") static void run_narrow_rowmajor(
                                 svread_hor_za16_m(z16, p16, 1, (uint32_t)r), vb, read_dst, va);
         }
     }
+}
+
+// Whether a graph store applies beta: only with a graph and beta not 1.
+static inline bool half_scales(float beta, const ep_desc16 *ep) {
+    return ep && ep->n_nodes > 0 && beta != 1.0f;
+}
+
+template <class T>
+static inline void run_narrow_rowmajor(T *dst, long dst_cs, long dst_rs, const T *a_pack,
+                                       const T *b_pack, size_t m, size_t n, size_t k, size_t mt_lo,
+                                       size_t mt_hi, size_t nt, float alpha, float beta,
+                                       int read_dst, const ep_desc16 *ep) {
+    if (half_scales(beta, ep))
+        narrow_tiles<T, true>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, k, mt_lo, mt_hi, nt, alpha,
+                              beta, read_dst, ep);
+    else
+        narrow_tiles<T, false>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, k, mt_lo, mt_hi, nt,
+                               alpha, beta, read_dst, ep);
 }
 
 // m == 1: SME2 multi-vector FMLA into ZA vector groups (4 depths per op) instead
@@ -445,7 +464,7 @@ template <class T> static void bcast_row(T *abc, const T *a, long lhs_cs, size_t
 }
 
 // =============================================================================
-// run_streaming: the SME hot loop. Computes the tile-blocked GEMM + epilogue for
+// streaming_tiles: the SME hot loop. Computes the tile-blocked GEMM + epilogue for
 // the M-tile range [mt_lo, mt_hi) of this (cluster's) chunk.
 //
 // INVARIANTS / WHY IT IS SHAPED THIS WAY -- read before touching this function.
@@ -498,7 +517,7 @@ template <class T> static void bcast_row(T *abc, const T *a, long lhs_cs, size_t
 // store arms inline so the live ZA slice never bounces through memory, and the
 // codegen here is sensitive to register pressure -- the bias-fold is restricted to
 // the bias-ONLY case precisely because folding through the relu store perturbs
-// this layout and costs more than it saves. Splitting run_streaming into smaller
+// this layout and costs more than it saves. Splitting streaming_tiles into smaller
 // functions costs ~8% of shared GEMM throughput: the streaming/ZA state and the
 // inlined store stop composing. The monolith is load-bearing; benchmark ANY
 // restructuring against examples/bench.rs and examples/epilogue_bench.rs (and run
@@ -511,7 +530,7 @@ static inline size_t half_budget(size_t k) {
     return b < 4 ? 4 : b;
 }
 
-// N-block width shared by the driver and run_streaming; even, split evenly.
+// N-block width shared by the driver and streaming_tiles; even, split evenly.
 static inline size_t half_nc_blk(size_t k, size_t span) {
     size_t nc = (half_budget(k) / 2) & ~(size_t)1;
     if (nc < 2) nc = 2;
@@ -526,8 +545,8 @@ static inline size_t half_nc_blk(size_t k, size_t span) {
 // N-parallel flat-M path (see run_packed_core). Must be pair-aligned (even) so
 // the dual-tile lockstep never splits a pair across workers. `b_pack` points at
 // tile nt_lo, so a caller can hand in one N-block's panel on its own.
-template <class T>
-__arm_locally_streaming __arm_new("za") static void run_streaming(
+template <class T, bool Scale>
+__arm_locally_streaming __arm_new("za") static void streaming_tiles(
     T *dst, long dst_cs, long dst_rs, const T *a_pack, const T *b_pack, size_t m, size_t n,
     size_t k, size_t mt_lo, size_t mt_hi, size_t n_tiles, size_t nt_lo, size_t nt_hi, float alpha,
     float beta, int read_dst, const ep_desc16 *ep) {
@@ -663,11 +682,11 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                                 // invariant M-vector, COL a per-column splat.
                                 T *cbase = dst + (long)n0 * dst_cs + (long)m0 * dst_rs;
                                 if (t == 0)
-                                    ep_cols(Tile<0>{}, p16, pst, z16, cbase, dst_cs, ncols, vb, va,
-                                            read_dst, *colg, m0, n0);
+                                    ep_cols<Scale>(Tile<0>{}, p16, pst, z16, cbase, dst_cs, ncols,
+                                                   vb, va, read_dst, *colg, m0, n0);
                                 else
-                                    ep_cols(Tile<1>{}, p16, pst, z16, cbase, dst_cs, ncols, vb, va,
-                                            read_dst, *colg, m0, n0);
+                                    ep_cols<Scale>(Tile<1>{}, p16, pst, z16, cbase, dst_cs, ncols,
+                                                   vb, va, read_dst, *colg, m0, n0);
                             } else {
                                 for (size_t c = 0; c < ncols; c++) {
                                     T *col = dst + (long)(n0 + c) * dst_cs + (long)m0 * dst_rs;
@@ -714,11 +733,11 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                                 // once per row); no memory bounce.
                                 T *base = dst + (long)m0 * dst_rs + (long)n0 * dst_cs;
                                 if (t == 0)
-                                    ep_rows(Tile<0>{}, p16, pst, z16, base, dst_rs, mrows, vb, va,
-                                            read_dst, nodes, n_nodes, m0, n0);
+                                    ep_rows<Scale>(Tile<0>{}, p16, pst, z16, base, dst_rs, mrows,
+                                                   vb, va, read_dst, nodes, n_nodes, m0, n0);
                                 else
-                                    ep_rows(Tile<1>{}, p16, pst, z16, base, dst_rs, mrows, vb, va,
-                                            read_dst, nodes, n_nodes, m0, n0);
+                                    ep_rows<Scale>(Tile<1>{}, p16, pst, z16, base, dst_rs, mrows,
+                                                   vb, va, read_dst, nodes, n_nodes, m0, n0);
                             } else {
                                 for (size_t r = 0; r < mrows; r++) {
                                     T *rowp = dst + (long)(m0 + r) * dst_rs + (long)n0 * dst_cs;
@@ -751,6 +770,19 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
             } // mt
         } // ic
     } // jc
+}
+
+template <class T>
+static inline void run_streaming(T *dst, long dst_cs, long dst_rs, const T *a_pack, const T *b_pack,
+                                 size_t m, size_t n, size_t k, size_t mt_lo, size_t mt_hi,
+                                 size_t n_tiles, size_t nt_lo, size_t nt_hi, float alpha,
+                                 float beta, int read_dst, const ep_desc16 *ep) {
+    if (half_scales(beta, ep))
+        streaming_tiles<T, true>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, k, mt_lo, mt_hi,
+                                 n_tiles, nt_lo, nt_hi, alpha, beta, read_dst, ep);
+    else
+        streaming_tiles<T, false>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, k, mt_lo, mt_hi,
+                                  n_tiles, nt_lo, nt_hi, alpha, beta, read_dst, ep);
 }
 
 // Row-major B read in place (`b` is B's column 0, row stride b_rs) for the tile
@@ -881,7 +913,7 @@ static int run_packed_core(size_t m, size_t n, size_t k, uint16_t *dst, long dst
     // N-tile (~2x slow per flop). run_narrow_rowmajor pairs two M-tiles against the
     // single B-tile instead. Same M-chunk parallelism; just a different inner loop.
     int narrow = (n_tiles == 1 && dst_cs == 1);
-    // ODD N-TILE TAIL. run_streaming pairs N-tiles into za0/za1, so an odd tile
+    // ODD N-TILE TAIL. streaming_tiles pairs N-tiles into za0/za1, so an odd tile
     // count leaves the final pair's za1 accumulating the zero pad tile -- it
     // wastes 1/(2*ceil(n_tiles/2)) of all MOPA issue, measured ~10% at
     // n_tiles=9 (3.86 vs 4.30/4.32 TF/s at the even neighbours). Handing that
@@ -889,10 +921,10 @@ static int run_packed_core(size_t m, size_t n, size_t k, uint16_t *dst, long dst
     // both ZA tiles stay productive. A-traffic is unchanged: the tile was
     // already being read once either way.
     //
-    // Not when the bias folds. run_streaming folds a leading ADD_COL into ZA via
+    // Not when the bias folds. streaming_tiles folds a leading ADD_COL into ZA via
     // a rank-1 MOPA while run_narrow_rowmajor applies it at the store, so
     // splitting a folded call would round the two halves of one output
-    // differently. Same predicate as `fold_bias` inside run_streaming.
+    // differently. Same predicate as `fold_bias` inside streaming_tiles.
     int fold_bias_here =
         ep && ep->n_nodes == 1 && beta == 1.0f && !read_dst && ep->nodes[0].op == EP_OP_ADD_COL;
     int odd_tail = (n_tiles > 1) && (n_tiles & 1) && dst_cs == 1 && !fold_bias_here;
@@ -1306,7 +1338,7 @@ static int run(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs, long ds
 // and each A tile is transposed through ZA tile 0 into `a_scr` ([k][32]) -- a
 // load into a tile row comes back out as a column -- so nothing is packed
 // outside the streaming session. `nodes` apply at the per-row store, as
-// run_streaming's row-major path does.
+// streaming_tiles's row-major path does.
 template <class T>
 static void batch_one(T *dst, const T *a, const T *b, T *a_scr, size_t m, size_t n, size_t k,
                       size_t n_tiles, const EpNode *nodes,
@@ -1351,11 +1383,11 @@ static void batch_one(T *dst, const T *a, const T *b, T *a_scr, size_t m, size_t
                 if (has_ep) {
                     T *base = dst + m0 * n + nc0;
                     if (t == 0)
-                        ep_rows(Tile<0>{}, p16, pst, z16, base, (long)n, mrows, vb, va, 0, nodes,
-                                n_nodes, m0, nc0);
+                        ep_rows<false>(Tile<0>{}, p16, pst, z16, base, (long)n, mrows, vb, va, 0,
+                                       nodes, n_nodes, m0, nc0);
                     else
-                        ep_rows(Tile<1>{}, p16, pst, z16, base, (long)n, mrows, vb, va, 0, nodes,
-                                n_nodes, m0, nc0);
+                        ep_rows<false>(Tile<1>{}, p16, pst, z16, base, (long)n, mrows, vb, va, 0,
+                                       nodes, n_nodes, m0, nc0);
                 } else if (t == 0) {
                     for (size_t r = 0; r < mrows; r++)
                         svst1_hor_za16(0, (uint32_t)r, pst, dst + (m0 + r) * n + nc0);

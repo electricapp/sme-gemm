@@ -152,7 +152,7 @@ static int run_q4_panels(f16 *dst, const f16 *a, const uint8_t *nibbles, const f
             if (!n_nodes) {                                                                        \
                 svst1_f16(pst, out, acc);                                                          \
             } else {                                                                               \
-                ep_store_row(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, r, n0);           \
+                ep_store_row<false>(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, r, n0);    \
             }                                                                                      \
         }                                                                                          \
     } while (0)
