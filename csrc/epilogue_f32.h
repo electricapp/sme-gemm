@@ -276,10 +276,11 @@ static inline svfloat32_t ep_act_apply_f32(svbool_t p32, svfloat32_t x, int act,
     return ep_act_rational_f32(p32, x, act, alpha);
 }
 
-// Walk the op-graph over a live f32 SVE vector `x`. `span_n` mirrors the f16
-// interpreter: span_n != 0 (row-major dst, vector spans N) -> COL/TENSOR are
-// vector loads, ROW/SCALAR splats; span_n == 0 (col-major dst, vector spans M)
-// -> ROW is the vector load, COL/SCALAR splats; TENSOR routes to the scalar path.
+// Walk the op-graph over one live f32 vector `x`: the integer kernels'
+// dequantized slices. span_n != 0 (row-major dst, vector spans N) -> COL/TENSOR
+// are vector loads, ROW/SCALAR splats; span_n == 0 (col-major dst, vector spans
+// M) -> ROW is the vector load, COL/SCALAR splats; TENSOR routes to the scalar
+// path.
 static inline svfloat32_t ep_apply_nodes_f32(svbool_t p32, svbool_t pst, svfloat32_t x,
                                              const EpNode *nodes, uint32_t n_nodes, int span_n,
                                              size_t i, size_t n0, size_t m0) __arm_streaming {
@@ -364,18 +365,6 @@ static inline svfloat32_t ep_apply_nodes_f32(svbool_t p32, svbool_t pst, svfloat
         }
     }
     return x;
-}
-
-// Combine + store one f32 slice with the fused op-graph epilogue:
-//   x = beta*acc; x = nodes(x); [x = alpha*C + x]; store
-static inline void ep_store_f32(svbool_t p32, svbool_t pst, float *ptr, svfloat32_t acc,
-                                svfloat32_t vb, svfloat32_t va, int read_dst, const EpNode *nodes,
-                                uint32_t n_nodes, int span_n, size_t i, size_t n0,
-                                size_t m0) __arm_streaming {
-    svfloat32_t x = svmul_f32_x(p32, acc, vb);
-    x = ep_apply_nodes_f32(p32, pst, x, nodes, n_nodes, span_n, i, n0, m0);
-    if (read_dst) x = svmla_f32_x(p32, x, svld1_f32(pst, ptr), va);
-    svst1_f32(pst, ptr, x);
 }
 
 #endif // SME_GEMM_EPILOGUE_F32_H

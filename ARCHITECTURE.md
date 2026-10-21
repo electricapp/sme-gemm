@@ -542,7 +542,7 @@ owns them:
 
 | TU               | fragments                                   |
 | ---------------- | ------------------------------------------- |
-| `epilogue.h`     | `epilogue_{scalar,f16,bf16,f32,f64,rows}.h` |
+| `epilogue.h`     | `epilogue_{scalar,f16,f32,f64,tile}.h`      |
 | `gemm_f16f16.cc` | `gemm_f16f16_q4.h`                          |
 | `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                          |
 
@@ -703,23 +703,34 @@ exceptions:
 
 ### Node-major register-resident store
 
-The store is node-major: it reads a 4-row block of the live ZA tile into Z
-registers and dispatches each node once per block across all its rows, hoisting
-invariant operands (COL vectors, scalars, activation constants) out of the
-per-row loop with no memory bounce. Interpreting the graph per output row
+The store is node-major: it reads a block of 4 slices of the live ZA tile
+(rows for row-major C, columns for col-major C) into Z registers and dispatches
+each node once per block across all of them, hoisting invariant operands (the
+vector that runs along the slices, scalars, activation constants) out of the
+per-slice loop with no memory bounce. Interpreting the graph per output slice
 instead — an out-of-line node loop with jump-table dispatch and operands
-reloaded each row — would cost ~500K dispatches for a 4096² output. The
-gelu/silu/tanh rational approximation sits in a `noinline` helper so the common
-add/mul/relu nodes still inline. A fused epilogue costs a few percent over the
-bare GEMM when compute-bound and up to about a third at the shallowest
-store-bound K.
+reloaded each slice — would cost ~500K dispatches for a 4096² output, and each
+of those calls, made with ZA live, sets up a lazy save. The gelu/silu/tanh
+rational approximation sits in a `noinline` helper; relu, the bf16 widen and
+round, and every other common node stay inline. A fused epilogue costs a few
+percent over the bare GEMM when compute-bound and up to about a third at the
+shallowest store-bound K, in either output layout.
 
-The store is one template over the stored element type (`csrc/epilogue_rows.h`);
-`EpRow<E>` says how a row computes. f16 holds a row as one vector, f32 and f64
-as the lo/hi halves that come from two ZA tiles, and bf16 widens its 32 lanes
-into two f32 halves, runs the graph in f32 and rounds once at the store. Each
-kernel hands it a row reader: a ZA slice, with the tile number as a template
-argument, or a GEMV row already in registers.
+The store is one template over the stored element type and the slice
+orientation (`csrc/epilogue_tile.h`); `EpRow<E>` says how a slice computes. f16
+holds a slice as one vector, f32 and f64 as the lo/hi halves that come from two
+ZA tiles, and bf16 widens its 32 lanes into two f32 halves, runs the graph in
+f32 and rounds once at the store. A row has the COL operand as its vector and
+ROW as a per-slice scalar; a column swaps them. Each kernel hands the store a
+slice reader: a ZA row or column, with the tile numbers as template arguments,
+or a GEMV row already in registers.
+
+A TENSOR operand read down a column is a gather, which streaming SVE lacks, so
+the column store takes an `EpColGraph`, which only `EpColGraph::of` makes and
+only for a graph with no TENSOR node; col-major C with a TENSOR graph takes the
+scalar path. In the f32 and f64 kernels, col-major C with an `EpColGraph` runs
+its own instantiation of the tile loops (`QuadC::ColsEp`): inlined beside the
+other stores, the column store's register pressure spills their per-tile state.
 
 ### Bias-init MOPA fold
 
@@ -841,14 +852,14 @@ their feature flags.
   `src/kernels/` module re-exported from `src/lib.rs`.
 - **Add an epilogue op:** the opcode in `enum ep_op` (`csrc/epilogue.h`) and the
   mirrored `EpOp` (`src/epilogue/mod.rs`) at the same numeric value; the
-  implementation in the per-dtype `ep_apply_nodes_*` (`csrc/epilogue_*.h`) and
-  the one `ep_block_rowmajor` switch in `csrc/epilogue_rows.h`; a builder method on
-  `Epilogue`/`Dequant` and the forwarding method on `Gemm`
+  implementation in `ep_apply_nodes_f32` (`csrc/epilogue_f32.h`, the integer
+  dequant stores) and the one `ep_block` switch in `csrc/epilogue_tile.h`; a
+  builder method on `Epilogue`/`Dequant` and the forwarding method on `Gemm`
   (`src/exec/builder.rs`); and the scalar evaluators (`ep_apply_cell`,
   `ep_apply_cell_f64`, `dq_apply_cell` in `src/exec/scalar.rs`, and
   `ep_apply_nodes_scalar_*` in `csrc/epilogue.h`) so the fallback matches. For
-  an activation, extend `enum ep_act`, the `EP_ACT_*` constants, and the f32/f64
-  `act_apply_*` evaluators.
+  an activation, extend `enum ep_act`, the `EP_ACT_*` constants, the vector
+  `ep_act_rational_{f16,f32,f64}` and the scalar `ep_act_scalar*`.
 - **A perf change:** the hot loop is `run_streaming` in each kernel template
   (`csrc/gemm_half.h`, `gemm_float.h`, `gemm_int.h`, `gemm_widen.cc`) — start
   with `gemm_half.h` and read the comment above its `run_streaming` first. The

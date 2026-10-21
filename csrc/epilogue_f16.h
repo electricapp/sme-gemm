@@ -1,10 +1,8 @@
-// f16 in-register epilogue: vector op-graph and the per-slice store.
+// f16 in-register activations for the tile epilogue (epilogue_tile.h).
 // Included by epilogue.h, which defines the shared enums, EpNode/ep_desc
 // structs, and helper macros these evaluators use.
 #ifndef SME_GEMM_EPILOGUE_F16_H
 #define SME_GEMM_EPILOGUE_F16_H
-
-// --- f16 vectorized op-graph ------------------------------------------------
 
 // Rational tanh on a live f16 slice: t*(27+t^2)/(27+9t^2), clamped. This same
 // rational backs GELU, SiLU, and the bare tanh/sigmoid activations: end-to-end
@@ -13,12 +11,8 @@
 // Acceptable for fused f16 inference. The input clamp keeps t^2 from
 // overflowing f16 and saturates |tanh|->1.
 
-// ===========================================================================
-// F16 SECTION: in-register f16 epilogue. ep_tanh_f16 / ep_act_apply /
-// ep_apply_nodes_f16 / ep_store_f16 (the node-major tile store is the shared
-// template in epilogue_rows.h). Exotic activations upcast to f32 and
-// reuse the f32 transcendentals forward-declared above.
-// ===========================================================================
+// Exotic activations upcast to f32 and reuse the f32 transcendentals
+// forward-declared in epilogue.h.
 static inline svfloat16_t ep_tanh_f16(svbool_t p16, svfloat16_t t) __arm_streaming {
     t = svmin_n_f16_x(p16, svmax_n_f16_x(p16, t, (ep_f16)-8.0f), (ep_f16)8.0f);
     svfloat16_t t2 = svmul_f16_x(p16, t, t);
@@ -150,135 +144,6 @@ __attribute__((noinline)) static svfloat16_t ep_act_rational_f16(svbool_t p16, s
         return svmul_n_f16_x(p16, svadd_n_f16_x(p16, th, (ep_f16)1.0f), (ep_f16)0.5f);
     }
     return x; // EP_ACT_NONE
-}
-
-// Apply the activation to a live f16 slice (streaming-SVE). RELU stays inline (one
-// svmax); the rationals go out of line via ep_act_rational_f16.
-static inline svfloat16_t ep_act_apply(svbool_t p16, svfloat16_t x, int act,
-                                       float alpha) __arm_streaming {
-    if (act == EP_ACT_RELU) {
-        return svmaxnm_n_f16_x(p16, x, (ep_f16)0.0f);
-    }
-    if (act == EP_ACT_NONE) {
-        return x;
-    }
-    return ep_act_rational_f16(p16, x, act, alpha);
-}
-
-// Walk the op-graph over a live f16 SVE vector `x`. `span_n` selects orientation:
-//   span_n != 0 (row-major dst, vector spans N over lanes [n0, n0+VL)):
-//       COL/TENSOR are vector loads (ptr+n0 / ptr+i*ld+n0); ROW/SCALAR are splats.
-//   span_n == 0 (col-major dst, vector spans M over lanes [m0, m0+VL)):
-//       ROW is the vector load (ptr+m0); COL/SCALAR are splats; TENSOR is column-
-//       strided -- not vectorizable here, so the caller uses the scalar path and
-//       this routine is not invoked for graphs containing a TENSOR node.
-// `i` is the fixed row (when span_n) / column (when !span_n) index for splats.
-static inline svfloat16_t ep_apply_nodes_f16(svbool_t p16, svbool_t pst, svfloat16_t x,
-                                             const EpNode *nodes, uint32_t n_nodes, int span_n,
-                                             size_t i, size_t n0, size_t m0) __arm_streaming {
-    for (uint32_t t = 0; t < n_nodes; t++) {
-        const EpNode *nd = &nodes[t];
-        const ep_f16 *p = (const ep_f16 *)nd->ptr;
-        switch (nd->op) {
-            case EP_OP_ADD_SCALAR: x = svadd_n_f16_x(p16, x, (ep_f16)nd->scalar); break;
-            case EP_OP_MUL_SCALAR: x = svmul_n_f16_x(p16, x, (ep_f16)nd->scalar); break;
-            case EP_OP_ADD_ROW:
-                if (span_n) x = svadd_n_f16_x(p16, x, p[i]);
-                else x = svadd_f16_x(p16, x, svld1_f16(pst, p + m0));
-                break;
-            case EP_OP_MUL_ROW:
-                if (span_n) x = svmul_n_f16_x(p16, x, p[i]);
-                else x = svmul_f16_x(p16, x, svld1_f16(pst, p + m0));
-                break;
-            case EP_OP_ADD_COL:
-                if (span_n) x = svadd_f16_x(p16, x, svld1_f16(pst, p + n0));
-                else x = svadd_n_f16_x(p16, x, p[i]);
-                break;
-            case EP_OP_MUL_COL:
-                if (span_n) x = svmul_f16_x(p16, x, svld1_f16(pst, p + n0));
-                else x = svmul_n_f16_x(p16, x, p[i]);
-                break;
-            case EP_OP_ADD_TENSOR:
-                // Only reached for span_n (row-major); the col-major caller routes
-                // TENSOR graphs to the scalar path.
-                x = svadd_f16_x(p16, x, svld1_f16(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_MUL_TENSOR:
-                x = svmul_f16_x(p16, x, svld1_f16(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_ACT: x = ep_act_apply(p16, x, (int)nd->aux, nd->scalar); break;
-            case EP_OP_MAX_SCALAR: x = svmaxnm_n_f16_x(p16, x, (ep_f16)nd->scalar); break;
-            case EP_OP_MIN_SCALAR: x = svminnm_n_f16_x(p16, x, (ep_f16)nd->scalar); break;
-            case EP_OP_SUB_SCALAR: x = svsub_n_f16_x(p16, x, (ep_f16)nd->scalar); break;
-            case EP_OP_DIV_SCALAR: x = EP_DIV_SPLAT_F16(p16, x, nd->scalar); break;
-            case EP_OP_SUB_ROW:
-                if (span_n) x = svsub_n_f16_x(p16, x, p[i]);
-                else x = svsub_f16_x(p16, x, svld1_f16(pst, p + m0));
-                break;
-            case EP_OP_DIV_ROW:
-                if (span_n) x = EP_DIV_SPLAT_F16(p16, x, (float)p[i]);
-                else x = svdiv_f16_x(p16, x, svld1_f16(pst, p + m0));
-                break;
-            case EP_OP_MAX_ROW:
-                if (span_n) x = svmaxnm_n_f16_x(p16, x, p[i]);
-                else x = svmaxnm_f16_x(p16, x, svld1_f16(pst, p + m0));
-                break;
-            case EP_OP_MIN_ROW:
-                if (span_n) x = svminnm_n_f16_x(p16, x, p[i]);
-                else x = svminnm_f16_x(p16, x, svld1_f16(pst, p + m0));
-                break;
-            case EP_OP_SUB_COL:
-                if (span_n) x = svsub_f16_x(p16, x, svld1_f16(pst, p + n0));
-                else x = svsub_n_f16_x(p16, x, p[i]);
-                break;
-            case EP_OP_DIV_COL:
-                if (span_n) x = svdiv_f16_x(p16, x, svld1_f16(pst, p + n0));
-                else x = EP_DIV_SPLAT_F16(p16, x, (float)p[i]);
-                break;
-            case EP_OP_MAX_COL:
-                if (span_n) x = svmaxnm_f16_x(p16, x, svld1_f16(pst, p + n0));
-                else x = svmaxnm_n_f16_x(p16, x, p[i]);
-                break;
-            case EP_OP_MIN_COL:
-                if (span_n) x = svminnm_f16_x(p16, x, svld1_f16(pst, p + n0));
-                else x = svminnm_n_f16_x(p16, x, p[i]);
-                break;
-            case EP_OP_SUB_TENSOR:
-                x = svsub_f16_x(p16, x, svld1_f16(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_DIV_TENSOR:
-                x = svdiv_f16_x(p16, x, svld1_f16(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_MAX_TENSOR:
-                x = svmaxnm_f16_x(p16, x, svld1_f16(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_MIN_TENSOR:
-                x = svminnm_f16_x(p16, x, svld1_f16(pst, p + i * nd->ld + n0));
-                break;
-            default: break;
-        }
-    }
-    return x;
-}
-
-// True if the op-graph contains a TENSOR node (which the col-major store cannot
-// vectorize and must route to the scalar path).
-static inline int ep_has_tensor(const EpNode *nodes, uint32_t n_nodes) {
-    for (uint32_t t = 0; t < n_nodes; t++)
-        if (EP_OP_IS_TENSOR(nodes[t].op)) return 1;
-    return 0;
-}
-
-// Combine + store one f16 slice with the fused op-graph epilogue:
-//   x = beta*acc; x = nodes(x); [x = alpha*C + x]; store
-static inline void ep_store_f16(svbool_t p16, svbool_t pst, ep_f16 *ptr, svfloat16_t acc,
-                                svfloat16_t vb, svfloat16_t va, int read_dst, const EpNode *nodes,
-                                uint32_t n_nodes, int span_n, size_t i, size_t n0,
-                                size_t m0) __arm_streaming {
-    svfloat16_t x = svmul_f16_x(p16, acc, vb);
-    x = ep_apply_nodes_f16(p16, pst, x, nodes, n_nodes, span_n, i, n0, m0);
-    if (read_dst) x = svmla_f16_x(p16, x, svld1_f16(pst, ptr), va);
-    svst1_f16(pst, ptr, x);
 }
 
 #endif // SME_GEMM_EPILOGUE_F16_H

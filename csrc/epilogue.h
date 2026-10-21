@@ -55,27 +55,19 @@
 //       Used by the strided / general / col-major-with-TENSOR store paths where a
 //       vectorized slice is not available, and by the dequant cells.
 //
-//   ep_apply_nodes_{f16,f32,f64}(p, pst, x, ...) -> vector
-//   ep_apply_nodes_bf16_f32(p, pst, lo, hi, ...)  (bf16 splits a slice into two
-//       f32 halves lo/hi and evaluates the graph in f32)
-//       Walk the whole graph for ONE vector slice (a ZA row/col already in a
-//       streaming-SVE register). The per-cell vector form.
+//   ep_apply_nodes_f32(p, pst, x, ...) -> vector
+//       Walk the whole graph for ONE f32 vector slice: the i8/i16 dequant stores.
 //
-//   ep_store_rowmajor<E>(...) / ep_store_row<E>(...)   (epilogue_rows.h)
-//       The NODE-MAJOR register-resident store: read a 4-row block of the live ZA
-//       tile into Z registers, then dispatch each op-graph node ONCE across the
-//       block (invariant COL/scalar/act operands hoisted), and store. This is the
-//       hot store path for the common row-major output. Dispatching per row
-//       instead, through an out-of-line node loop, costs ~ms on large outputs.
-//       One template over the stored element type; EpRow<E> holds what differs.
-//
-//   ep_store_{f16,bf16,f32,f64}(p, pst, ptr, acc, vb, va, read_dst, nodes, ...)
-//       The non-row-major / col-major store helper: apply beta, run the op-graph on
-//       one slice, optionally fold read_dst (alpha*C), and store one slice.
-//
-//   ep_has_tensor(nodes, n)  - true if any node reads a TENSOR operand; the
-//       col-major store uses it to route TENSOR graphs to the scalar path (a
-//       col-major TENSOR read is a strided gather, not vectorizable).
+//   ep_store_rowmajor<E> / ep_store_colmajor<E> / ep_store_row<E>   (epilogue_tile.h)
+//       The NODE-MAJOR register-resident store of every f16/bf16/f32/f64 kernel:
+//       read a block of 4 rows or columns of the live ZA tile into Z registers,
+//       dispatch each op-graph node ONCE across the block (invariant operands
+//       hoisted), and store. Dispatching per slice instead, through an
+//       out-of-line node loop, costs ~ms on large outputs. One template over the
+//       stored element type and the slice orientation; EpRow<E> holds what
+//       differs. A column store takes an EpColGraph, which cannot hold a TENSOR
+//       node: a TENSOR read down a column is a strided gather, so those graphs
+//       take the scalar path.
 //
 // TRANSCENDENTAL HELPERS (streaming-SVE, NO libm; libm is not callable from a
 // streaming region). Each is a vectorized polynomial/range-reduction approx:
@@ -100,10 +92,9 @@
 // macros; the evaluators live in the parts it includes at the bottom:
 //   epilogue_scalar.h  ep_act_scalar*, ep_apply_nodes_scalar_*, dequant cells
 //   epilogue_f16.h     ep_*_f16
-//   epilogue_bf16.h    ep_*_bf16 (the f32-domain bf16 evaluators)
 //   epilogue_f32.h     ep_*_f32; the vector transcendentals live here
 //   epilogue_f64.h     ep_*_f64
-//   epilogue_rows.h    the node-major row-major store, over all four
+//   epilogue_tile.h    the node-major row and column store, over all four
 // =============================================================================
 
 #ifndef SME_GEMM_EPILOGUE_H
@@ -270,25 +261,21 @@ typedef struct {
     const EpNode *nodes;
 } ep_desc_f64;
 
-// activations, so it needs these before the definitions appear.
+// The f16 epilogue upcasts to f32 for its exotic activations, so it needs these
+// before the definitions appear.
 static svfloat32_t ep_exp_f32(svbool_t p32, svfloat32_t x) __arm_streaming;
 static svfloat32_t ep_log_f32(svbool_t p32, svfloat32_t x) __arm_streaming;
 static svfloat32_t ep_softplus_f32(svbool_t p32, svfloat32_t x) __arm_streaming;
 static svfloat32_t ep_act_rational_f32(svbool_t p32, svfloat32_t x, int act,
                                        float alpha) __arm_streaming;
-// Also used by the bf16 epilogue (which computes in f32) before its definition.
-static inline svfloat32_t ep_act_apply_f32(svbool_t p32, svfloat32_t x, int act,
-                                           float alpha) __arm_streaming;
-
 
 // Order matters: each part uses the ones before it.
 // clang-format off
 #include "epilogue_scalar.h"
 #include "epilogue_f16.h"
-#include "epilogue_bf16.h"
 #include "epilogue_f32.h"
 #include "epilogue_f64.h"
-#include "epilogue_rows.h"
+#include "epilogue_tile.h"
 // clang-format on
 
 #endif // SME_GEMM_EPILOGUE_H

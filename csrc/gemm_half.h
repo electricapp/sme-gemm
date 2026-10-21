@@ -62,19 +62,21 @@ template <class T> static inline float half_from_bits(uint16_t b) {
 // kernel's own registers; a fresh ptrue or a captured reference gets spilled
 // and reloaded around the out-of-line calls instead (see run_streaming).
 
-// The op-graph over one col-major slice (vector spans M): beta, nodes, alpha*C,
-// store. span_n is a literal 0 here so the out-of-line store specializes on it.
-template <class T>
-SME_INLINE void ep_col(svbool_t p16, svbool_t pst, T *ptr, Vec<T> acc, Vec<T> vb, Vec<T> va,
-                       int read_dst, const EpNode *nodes, uint32_t n_nodes, size_t i, size_t n0,
-                       size_t m0) __arm_streaming {
-    if constexpr (kBf16<T>)
-        ep_store_bf16(p16, pst, ptr, acc, vb, va, read_dst, nodes, n_nodes, 0, i, n0, m0);
-    else
-        ep_store_f16(p16, pst, ptr, acc, vb, va, read_dst, nodes, n_nodes, 0, i, n0, m0);
+// Node-major store of `ncols` columns of ZA tile Z to col-major C (dst is the
+// tile's first column; epilogue_tile.h).
+template <int Z, class T>
+SME_INLINE void ep_cols(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst, long col_stride,
+                        size_t ncols, Vec<T> vb, Vec<T> va, int read_dst, EpColGraph g, size_t m0,
+                        size_t n0) __arm_streaming __arm_in("za") {
+    ep_store_colmajor(
+        p16, pst, pst, dst, col_stride, 0,
+        [&] [[gnu::always_inline]] (uint32_t s) __arm_streaming __arm_in("za") {
+            return svread_ver_za16_m(z16, p16, Z, s);
+        },
+        0, ncols, vb, va, read_dst, g, m0, n0);
 }
 
-// Node-major store of `mrows` rows of ZA tile Z (epilogue_rows.h).
+// Node-major store of `mrows` rows of ZA tile Z (epilogue_tile.h).
 template <int Z, class T>
 SME_INLINE void ep_rows(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst, long row_stride,
                         size_t mrows, Vec<T> vb, Vec<T> va, int read_dst, const EpNode *nodes,
@@ -486,11 +488,10 @@ template <class T> static void bcast_row(T *abc, const T *a, long lhs_cs, size_t
 //   4. Store / epilogue hook, per N-tile, branching on output layout:
 //        - `pure`: direct single-instruction ZA->C store (st1h vertical for
 //          col-major, horizontal for row-major) -- no read/scale/store.
-//        - col-major with epilogue: read each ZA vertical slice, run the op-graph
-//          (TENSOR ops route to the scalar path, being a strided gather).
-//        - row-major with epilogue: the NODE-MAJOR register-resident store
-//          (ep_store_rowmajor, epilogue_rows.h) -- read a 4-row block, dispatch each node
-//          once per block.
+//        - with an epilogue: the NODE-MAJOR register-resident store
+//          (ep_store_rowmajor / ep_store_colmajor, epilogue_tile.h) -- read a
+//          block of 4 rows or columns, dispatch each node once per block. A
+//          col-major TENSOR graph (a strided gather) takes the scalar path.
 //        - fully strided: materialize a 32x32 scratch tile and store scalar-wise.
 //
 // REGISTER-FRAGILE / DO NOT SPLIT. This function is intentionally monolithic. The
@@ -562,7 +563,7 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
     int pure = (beta == 1.0f && !read_dst && !has_ep);
     const EpNode *nodes = has_ep ? ep_eff->nodes : NULL;
     uint32_t n_nodes = has_ep ? ep_eff->n_nodes : 0;
-    int has_tensor = has_ep && ep_has_tensor(nodes, n_nodes);
+    EpColGraph::Maybe colg = EpColGraph::of(nodes, n_nodes);
 
     // Cache blocking (BLIS jc->ic->mt->nt). Each packed tile-panel is
     // k*32*2 bytes. Pick N- and M-block tile counts so the B-block and the
@@ -655,19 +656,25 @@ __arm_locally_streaming __arm_new("za") static void run_streaming(
                                         svst1_ver_za16(1, (uint32_t)c, pst,
                                                        dst + (long)(n0 + c) * dst_cs +
                                                            (long)m0 * dst_rs);
+                            } else if (has_ep && colg) {
+                                // Col slice (M-oriented, vector spans M), NODE-MAJOR:
+                                // 4-column blocks of the live ZA tile in Z registers,
+                                // each node dispatched once per block; ROW is the
+                                // invariant M-vector, COL a per-column splat.
+                                T *cbase = dst + (long)n0 * dst_cs + (long)m0 * dst_rs;
+                                if (t == 0)
+                                    ep_cols(Tile<0>{}, p16, pst, z16, cbase, dst_cs, ncols, vb, va,
+                                            read_dst, *colg, m0, n0);
+                                else
+                                    ep_cols(Tile<1>{}, p16, pst, z16, cbase, dst_cs, ncols, vb, va,
+                                            read_dst, *colg, m0, n0);
                             } else {
-                                // Col slice (M-oriented, vector spans M): ROW is the
-                                // contiguous M-vector load (ptr+m0); COL/SCALAR splat;
-                                // TENSOR (col-strided) routes to the scalar path below.
                                 for (size_t c = 0; c < ncols; c++) {
                                     T *col = dst + (long)(n0 + c) * dst_cs + (long)m0 * dst_rs;
                                     Vec<T> acc = (t == 0)
                                                      ? svread_ver_za16_m(z16, p16, 0, (uint32_t)c)
                                                      : svread_ver_za16_m(z16, p16, 1, (uint32_t)c);
-                                    if (has_ep && !has_tensor) {
-                                        ep_col(p16, pst, col, acc, vb, va, read_dst, nodes, n_nodes,
-                                               n0 + c, n0, m0);
-                                    } else if (has_ep) {
+                                    if (has_ep) {
                                         // TENSOR present: col-major tensor is a strided
                                         // gather, so materialize the M-column and apply
                                         // the whole op-graph scalar-wise.

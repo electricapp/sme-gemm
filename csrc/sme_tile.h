@@ -131,11 +131,17 @@ SME_INLINE void za_st_col(uint32_t s, svbool_t p, Acc *x) __arm_streaming __arm_
     else
         svst1_ver_za64(Z, s, p, x);
 }
-// Row s of tiles ZL / ZH as the lo / hi halves of one output row: the row
-// reader of the row-major epilogue (epilogue_rows.h).
+// Row s of tiles ZL / ZH as the lo / hi halves of one output row, and column s
+// as those of one output column: the slice readers of the tile epilogue
+// (epilogue_tile.h).
 template <int ZL, int ZH, class Acc> struct ZaRowPair {
     SME_INLINE auto operator()(uint32_t s) const __arm_streaming __arm_in("za") {
         return svcreate2(za_row<ZL, Acc>(s), za_row<ZH, Acc>(s));
+    }
+};
+template <int ZL, int ZH, class Acc> struct ZaColPair {
+    SME_INLINE auto operator()(uint32_t s) const __arm_streaming __arm_in("za") {
+        return svcreate2(za_col<ZL, Acc>(s), za_col<ZH, Acc>(s));
     }
 };
 template <int Z, class Acc>

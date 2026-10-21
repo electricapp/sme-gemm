@@ -1,10 +1,8 @@
-// f64 in-register epilogue: vector op-graph and the per-slice store.
-// Included by epilogue.h, which defines the shared enums, EpNode/ep_desc
-// structs, and helper macros these evaluators use.
+// f64 in-register activations and transcendentals for the tile epilogue
+// (epilogue_tile.h). Included by epilogue.h, which defines the shared enums,
+// EpNode/ep_desc structs, and helper macros these evaluators use.
 #ifndef SME_GEMM_EPILOGUE_F64_H
 #define SME_GEMM_EPILOGUE_F64_H
-
-// --- f64 vectorized op-graph (FMOPA f64 accumulator domain) -----------------
 
 // f64 vector exp: range reduction by ln2 + a degree-11 Taylor/minimax poly on
 // the reduced argument, then 2^k by exponent assembly. ~1e-13 relative.
@@ -130,9 +128,8 @@ static inline svfloat64_t ep_tanh_f64(svbool_t p64, svfloat64_t t) __arm_streami
 
 // Rational GELU/SiLU/TANH/SIGMOID pulled out of line (mirrors the f16/f32 split)
 // so the common add/mul/relu node path inlines cleanly into the node-major loops.
-__attribute__((noinline)) static svfloat64_t ep_act_rational_f64(svbool_t p64, svfloat64_t x,
-                                                                 int act,
-                                                                 double alpha) __arm_streaming {
+__attribute__((noinline)) static inline svfloat64_t
+ep_act_rational_f64(svbool_t p64, svfloat64_t x, int act, double alpha) __arm_streaming {
     if (act == EP_ACT_GELU) {
         svfloat64_t x2 = svmul_f64_x(p64, x, x);
         svfloat64_t inner = svmul_f64_x(
@@ -208,119 +205,6 @@ __attribute__((noinline)) static svfloat64_t ep_act_rational_f64(svbool_t p64, s
         return svmul_n_f64_x(p64, svmul_f64_x(p64, x, svadd_n_f64_x(p64, e, 1.0)), 0.5);
     }
     return x;
-}
-
-static inline svfloat64_t ep_act_apply_f64(svbool_t p64, svfloat64_t x, int act,
-                                           double alpha) __arm_streaming {
-    if (act == EP_ACT_RELU) {
-        return svmaxnm_n_f64_x(p64, x, 0.0);
-    }
-    if (act == EP_ACT_NONE) {
-        return x;
-    }
-    return ep_act_rational_f64(p64, x, act, alpha);
-}
-
-// Walk the op-graph over a live f64 SVE vector `x`. `span_n` mirrors the f32
-// interpreter: span_n != 0 (row-major dst, vector spans N) -> COL/TENSOR are
-// vector loads, ROW/SCALAR splats; span_n == 0 (col-major dst, vector spans M)
-// -> ROW is the vector load, COL/SCALAR splats; TENSOR routes to the scalar path.
-static inline svfloat64_t ep_apply_nodes_f64(svbool_t p64, svbool_t pst, svfloat64_t x,
-                                             const EpNode *nodes, uint32_t n_nodes, int span_n,
-                                             size_t i, size_t n0, size_t m0) __arm_streaming {
-    for (uint32_t t = 0; t < n_nodes; t++) {
-        const EpNode *nd = &nodes[t];
-        const double *p = (const double *)nd->ptr;
-        switch (nd->op) {
-            case EP_OP_ADD_SCALAR: x = svadd_n_f64_x(p64, x, (double)nd->scalar); break;
-            case EP_OP_MUL_SCALAR: x = svmul_n_f64_x(p64, x, (double)nd->scalar); break;
-            case EP_OP_ADD_ROW:
-                if (span_n) x = svadd_n_f64_x(p64, x, p[i]);
-                else x = svadd_f64_x(p64, x, svld1_f64(pst, p + m0));
-                break;
-            case EP_OP_MUL_ROW:
-                if (span_n) x = svmul_n_f64_x(p64, x, p[i]);
-                else x = svmul_f64_x(p64, x, svld1_f64(pst, p + m0));
-                break;
-            case EP_OP_ADD_COL:
-                if (span_n) x = svadd_f64_x(p64, x, svld1_f64(pst, p + n0));
-                else x = svadd_n_f64_x(p64, x, p[i]);
-                break;
-            case EP_OP_MUL_COL:
-                if (span_n) x = svmul_f64_x(p64, x, svld1_f64(pst, p + n0));
-                else x = svmul_n_f64_x(p64, x, p[i]);
-                break;
-            case EP_OP_ADD_TENSOR:
-                x = svadd_f64_x(p64, x, svld1_f64(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_MUL_TENSOR:
-                x = svmul_f64_x(p64, x, svld1_f64(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_ACT: x = ep_act_apply_f64(p64, x, (int)nd->aux, (double)nd->scalar); break;
-            case EP_OP_MAX_SCALAR: x = svmaxnm_n_f64_x(p64, x, (double)nd->scalar); break;
-            case EP_OP_MIN_SCALAR: x = svminnm_n_f64_x(p64, x, (double)nd->scalar); break;
-            case EP_OP_SUB_SCALAR: x = svsub_n_f64_x(p64, x, (double)nd->scalar); break;
-            case EP_OP_DIV_SCALAR: x = EP_DIV_SPLAT_F64(p64, x, nd->scalar); break;
-            case EP_OP_SUB_ROW:
-                if (span_n) x = svsub_n_f64_x(p64, x, p[i]);
-                else x = svsub_f64_x(p64, x, svld1_f64(pst, p + m0));
-                break;
-            case EP_OP_DIV_ROW:
-                if (span_n) x = EP_DIV_SPLAT_F64(p64, x, p[i]);
-                else x = svdiv_f64_x(p64, x, svld1_f64(pst, p + m0));
-                break;
-            case EP_OP_MAX_ROW:
-                if (span_n) x = svmaxnm_n_f64_x(p64, x, p[i]);
-                else x = svmaxnm_f64_x(p64, x, svld1_f64(pst, p + m0));
-                break;
-            case EP_OP_MIN_ROW:
-                if (span_n) x = svminnm_n_f64_x(p64, x, p[i]);
-                else x = svminnm_f64_x(p64, x, svld1_f64(pst, p + m0));
-                break;
-            case EP_OP_SUB_COL:
-                if (span_n) x = svsub_f64_x(p64, x, svld1_f64(pst, p + n0));
-                else x = svsub_n_f64_x(p64, x, p[i]);
-                break;
-            case EP_OP_DIV_COL:
-                if (span_n) x = svdiv_f64_x(p64, x, svld1_f64(pst, p + n0));
-                else x = EP_DIV_SPLAT_F64(p64, x, p[i]);
-                break;
-            case EP_OP_MAX_COL:
-                if (span_n) x = svmaxnm_f64_x(p64, x, svld1_f64(pst, p + n0));
-                else x = svmaxnm_n_f64_x(p64, x, p[i]);
-                break;
-            case EP_OP_MIN_COL:
-                if (span_n) x = svminnm_f64_x(p64, x, svld1_f64(pst, p + n0));
-                else x = svminnm_n_f64_x(p64, x, p[i]);
-                break;
-            case EP_OP_SUB_TENSOR:
-                x = svsub_f64_x(p64, x, svld1_f64(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_DIV_TENSOR:
-                x = svdiv_f64_x(p64, x, svld1_f64(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_MAX_TENSOR:
-                x = svmaxnm_f64_x(p64, x, svld1_f64(pst, p + i * nd->ld + n0));
-                break;
-            case EP_OP_MIN_TENSOR:
-                x = svminnm_f64_x(p64, x, svld1_f64(pst, p + i * nd->ld + n0));
-                break;
-            default: break;
-        }
-    }
-    return x;
-}
-
-// Combine + store one f64 slice with the fused op-graph epilogue:
-//   x = beta*acc; x = nodes(x); [x = alpha*C + x]; store
-static inline void ep_store_f64(svbool_t p64, svbool_t pst, double *ptr, svfloat64_t acc,
-                                svfloat64_t vb, svfloat64_t va, int read_dst, const EpNode *nodes,
-                                uint32_t n_nodes, int span_n, size_t i, size_t n0,
-                                size_t m0) __arm_streaming {
-    svfloat64_t x = svmul_f64_x(p64, acc, vb);
-    x = ep_apply_nodes_f64(p64, pst, x, nodes, n_nodes, span_n, i, n0, m0);
-    if (read_dst) x = svmla_f64_x(p64, x, svld1_f64(pst, ptr), va);
-    svst1_f64(pst, ptr, x);
 }
 
 #endif // SME_GEMM_EPILOGUE_F64_H
