@@ -293,20 +293,22 @@ SME_INLINE void ep_store_rowmajor(svbool_t pm, svbool_t pl, svbool_t ph, E *dst,
                                   RD &&rd, size_t lo, size_t hi, Vec<E> vb, Vec<E> va, int read_dst,
                                   const EpNode *nodes, uint32_t n_nodes, size_t i_base,
                                   size_t n0) __arm_streaming __arm_in("za") {
-    size_t r = lo;
-    for (; r + 4 <= hi; r += 4) {
-        uint32_t s = (uint32_t)(r - lo);
-        ep_block_rowmajor<E>(pm, pl, ph, dst, row_stride, rd(s), rd(s + 1), rd(s + 2), rd(s + 3), 4,
-                             vb, va, read_dst, nodes, n_nodes, i_base, r, n0);
-    }
-    if (r < hi) {
-        size_t nr = hi - r;
-        uint32_t s = (uint32_t)(r - lo);
-        typename EpRow<E>::In x0 = rd(s);
-        typename EpRow<E>::In x1 = nr > 1 ? rd(s + 1) : x0;
-        typename EpRow<E>::In x2 = nr > 2 ? rd(s + 2) : x0;
+    // Walk slices s of the range; tile row lo + s.
+    size_t n = hi > lo ? hi - lo : 0, s = 0;
+    for (; s + 4 <= n; s += 4)
+        ep_block_rowmajor<E>(pm, pl, ph, dst, row_stride, rd((uint32_t)(s + 0)),
+                             rd((uint32_t)(s + 1)), rd((uint32_t)(s + 2)), rd((uint32_t)(s + 3)), 4,
+                             vb, va, read_dst, nodes, n_nodes, i_base, lo + s, n0);
+    if (s < n) {
+        size_t nr = n - s;
+        // Implied by the loop exit, but stated, the compiler drops the tail
+        // block's fourth row (about 500 instructions of run_streaming).
+        __builtin_assume(nr < 4);
+        typename EpRow<E>::In x0 = rd((uint32_t)(s + 0));
+        typename EpRow<E>::In x1 = nr > 1 ? rd((uint32_t)(s + 1)) : x0;
+        typename EpRow<E>::In x2 = nr > 2 ? rd((uint32_t)(s + 2)) : x0;
         ep_block_rowmajor<E>(pm, pl, ph, dst, row_stride, x0, x1, x2, x0, nr, vb, va, read_dst,
-                             nodes, n_nodes, i_base, r, n0);
+                             nodes, n_nodes, i_base, lo + s, n0);
     }
 }
 
