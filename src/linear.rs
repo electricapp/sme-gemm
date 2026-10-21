@@ -9,7 +9,8 @@ use half::f16;
 use crate::element::sealed;
 use crate::{
     Epilogue, Packed, Q1Weights, Q2Params, Q2Weights, Q4Params, Q4Weights, WeightLayout, caps,
-    matmul_q1_ep, matmul_q2_ep, matmul_q4_ep, prepack, prepack_f16,
+    matmul_q1_ep, matmul_q1_mopa_ep, matmul_q2_ep, matmul_q2_mopa_ep, matmul_q4_ep, prepack,
+    prepack_f16,
 };
 
 /// The float types the model-level helpers take and give: `f32` and `f16`.
@@ -103,6 +104,8 @@ thread_local! {
 /// quantized from f32) stay resident as [`Q2Weights`] / [`Q1Weights`] and run
 /// [`matmul_q2`](crate::matmul_q2) / [`matmul_q1`](crate::matmul_q1) at every
 /// row count, with int8 activations: for models trained at that precision.
+/// [`Linear::lowbit_mopa`] trades that for f16 activations and accumulation
+/// from [`Linear::LOWBIT_MOPA_ROWS`] rows, at the f16 MOPA rate.
 ///
 /// Inputs are f16 or f32 ([`ModelFloat`]); outputs f16 ([`forward`]), f32
 /// ([`forward_f32`]), or added into an f32 residual stream ([`accumulate`]). A
@@ -139,8 +142,15 @@ enum Weights {
         q4: Q4Weights,
         panel: OnceLock<Packed<f16>>,
     },
-    Q2(Q2Weights),
-    Q1(Q1Weights),
+    /// `mopa`: [`Linear::lowbit_mopa`] was asked for.
+    Q2 {
+        q2: Q2Weights,
+        mopa: bool,
+    },
+    Q1 {
+        q1: Q1Weights,
+        mopa: bool,
+    },
     F16(Packed<f16>),
 }
 
@@ -148,6 +158,14 @@ impl Linear {
     /// Rows at or above which 4-bit weights run on their f16 panel; below, the
     /// Q4 GEMV.
     pub const PANEL_ROWS: usize = 8;
+
+    /// Rows at or above which 1- and 2-bit weights opted in with
+    /// [`Linear::lowbit_mopa`] run the f16 MOPA path; below, the int8 GEMV,
+    /// which reads only the packed codes. Per call the MOPA path writes and
+    /// reads f16 panels of every weight, 16 times a 1-bit code's bytes, and
+    /// costs by the 32-row tile: on M5 (Bonsai 1.7B's projections) it ties
+    /// the GEMV at 32 rows, loses up to 53 and wins from 54.
+    pub const LOWBIT_MOPA_ROWS: usize = 64;
 
     /// Quantizes f32 weights to `Q4_0` (32-deep blocks); see
     /// [`Q4Weights::quantize`].
@@ -195,7 +213,7 @@ impl Linear {
     #[must_use]
     pub const fn from_q2(q2: Q2Weights) -> Self {
         Self {
-            w: Weights::Q2(q2),
+            w: Weights::Q2 { q2, mopa: false },
             bias: None,
             rms_eps: None,
         }
@@ -215,10 +233,25 @@ impl Linear {
     #[must_use]
     pub const fn from_q1(q1: Q1Weights) -> Self {
         Self {
-            w: Weights::Q1(q1),
+            w: Weights::Q1 { q1, mopa: false },
             bias: None,
             rms_eps: None,
         }
+    }
+
+    /// 1- and 2-bit weights run [`matmul_q1_mopa`](crate::matmul_q1_mopa) /
+    /// [`matmul_q2_mopa`](crate::matmul_q2_mopa) from
+    /// [`Linear::LOWBIT_MOPA_ROWS`] rows on M5: f16 activations and
+    /// accumulation at twice the int8 GEMV's rate, with the f16 accumulator's
+    /// error instead of int8 activation rounding. A no-op for 4-bit and f16
+    /// weights, which run on f16 panels from [`Linear::PANEL_ROWS`] rows as it
+    /// is.
+    #[must_use]
+    pub const fn lowbit_mopa(mut self) -> Self {
+        if let Weights::Q2 { mopa, .. } | Weights::Q1 { mopa, .. } = &mut self.w {
+            *mopa = true;
+        }
+        self
     }
 
     /// f16 weights (from f32 or f16) in `layout`, packed once.
@@ -279,8 +312,8 @@ impl Linear {
     pub const fn n(&self) -> usize {
         match &self.w {
             Weights::Q4 { q4, .. } => q4.n(),
-            Weights::Q2(q2) => q2.n(),
-            Weights::Q1(q1) => q1.n(),
+            Weights::Q2 { q2, .. } => q2.n(),
+            Weights::Q1 { q1, .. } => q1.n(),
             Weights::F16(p) => p.n(),
         }
     }
@@ -290,8 +323,8 @@ impl Linear {
     pub const fn k(&self) -> usize {
         match &self.w {
             Weights::Q4 { q4, .. } => q4.k(),
-            Weights::Q2(q2) => q2.k(),
-            Weights::Q1(q1) => q1.k(),
+            Weights::Q2 { q2, .. } => q2.k(),
+            Weights::Q1 { q1, .. } => q1.k(),
             Weights::F16(p) => p.k(),
         }
     }
@@ -301,7 +334,7 @@ impl Linear {
     pub const fn q4(&self) -> Option<&Q4Weights> {
         match &self.w {
             Weights::Q4 { q4, .. } => Some(q4),
-            Weights::Q2(_) | Weights::Q1(_) | Weights::F16(_) => None,
+            Weights::Q2 { .. } | Weights::Q1 { .. } | Weights::F16(_) => None,
         }
     }
 
@@ -309,8 +342,8 @@ impl Linear {
     #[must_use]
     pub const fn q2(&self) -> Option<&Q2Weights> {
         match &self.w {
-            Weights::Q2(q2) => Some(q2),
-            Weights::Q4 { .. } | Weights::Q1(_) | Weights::F16(_) => None,
+            Weights::Q2 { q2, .. } => Some(q2),
+            Weights::Q4 { .. } | Weights::Q1 { .. } | Weights::F16(_) => None,
         }
     }
 
@@ -504,13 +537,16 @@ impl Linear {
             assert_eq!(x.len(), crate::exec::checked_dim2(m, p.k()), "x is m*k");
             crate::kernels::f16::f16_packed_ep_impl(x, p, y, m, ep, f16::ONE, false);
         };
+        let lowbit_mopa = m >= Self::LOWBIT_MOPA_ROWS && caps().sme_f16f16;
         match &self.w {
             Weights::Q4 { q4, panel } if m >= Self::PANEL_ROWS && caps().sme_f16f16 => {
                 packed(Self::panel(q4, panel), y);
             }
             Weights::Q4 { q4, .. } => matmul_q4_ep(x, q4, y, m, ep),
-            Weights::Q2(q2) => matmul_q2_ep(x, q2, y, m, ep),
-            Weights::Q1(q1) => matmul_q1_ep(x, q1, y, m, ep),
+            Weights::Q2 { q2, mopa: true } if lowbit_mopa => matmul_q2_mopa_ep(x, q2, y, m, ep),
+            Weights::Q2 { q2, .. } => matmul_q2_ep(x, q2, y, m, ep),
+            Weights::Q1 { q1, mopa: true } if lowbit_mopa => matmul_q1_mopa_ep(x, q1, y, m, ep),
+            Weights::Q1 { q1, .. } => matmul_q1_ep(x, q1, y, m, ep),
             Weights::F16(p) => packed(p, y),
         }
     }
@@ -702,6 +738,13 @@ impl GatedLinear {
     #[must_use]
     pub const fn rms_norm_input(mut self, eps: f32) -> Self {
         self.inner.rms_eps = Some(eps);
+        self
+    }
+
+    /// [`Linear::lowbit_mopa`] for the gate and up weights.
+    #[must_use]
+    pub fn lowbit_mopa(mut self) -> Self {
+        self.inner = self.inner.lowbit_mopa();
         self
     }
 

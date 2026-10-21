@@ -1,7 +1,9 @@
-// Row-softmax and flash-attention support passes (Apple aarch64, f32).
+// Row-softmax and flash-attention support passes (Apple aarch64, f32), and the
+// KV-cache attention built on them (attention_kv_sme.h puts a block's products
+// on the SME unit).
 //
-// These use NO SME -- hence the attn_ prefix rather than the sme_ one the GEMM
-// kernels carry. They are pure elementwise exp work, and measured on M5 over
+// The passes use NO SME -- hence the attn_ prefix rather than the sme_ one the
+// GEMM kernels carry. They are pure elementwise exp work, and measured on M5 over
 // 16M f32: scalar libm ~19 ms, streaming-SVE with the epilogue's ep_exp_f32
 // ~21 ms, plain NEON dispatched across all cores ~1.2 ms. Streaming-mode SVE
 // ALU throughput is tuned for MOPA rather than this, and the SME unit is shared
@@ -477,3 +479,7 @@ int attn_kv_causal_f16(float *out, const float *q, const __fp16 *k, const __fp16
         dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), body);
     return failed->load(std::memory_order_relaxed) ? -1 : 0;
 }
+
+// Causal attention for blocks of query rows on the SME unit, kept in its own
+// file: it shares the row passes above.
+#include "attention_kv_sme.h"

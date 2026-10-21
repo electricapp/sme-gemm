@@ -80,6 +80,64 @@ pub fn matmul_q1_ep(a: &[f16], w: &Q1Weights, c: &mut [f16], m: usize, ep: &Epil
     lowbit_impl(a, Codes::Q1(w), c, m, ep);
 }
 
+/// [`matmul_q2`] on the f16 MOPA path, for many rows.
+///
+/// `a` stays f16, the call unpacks the weights into f16 panels -- `scale *
+/// codebook[code]`, rounded once -- and the dense f16 kernel multiplies them,
+/// accumulating in f16 as [`Accum::F16`](crate::Accum::F16) does.
+///
+/// At prompt-sized row counts that is twice [`matmul_q2`]'s rate on M5, with
+/// a different error: no activation rounding, but an f16 accumulator, whose
+/// error grows with `k` (with random weights and activations about 0.65% of
+/// the output's RMS at k = 2048 and 1.1% at 6144, against 0.4% for the int8
+/// path). From 8 rows the
+/// result is [`matmul_f16_packed`](crate::matmul_f16_packed) over the
+/// dequantized weights bit for bit; fewer rows run the same MOPA, where the
+/// dense GEMM would switch to its GEMV.
+///
+/// # Panics
+/// As [`matmul_q2`].
+pub fn matmul_q2_mopa(a: &[f16], w: &Q2Weights, c: &mut [f16], m: usize) {
+    mopa_impl(a, Codes::Q2(w), c, m, &Epilogue::new());
+}
+
+/// [`matmul_q2_mopa`] with a fused epilogue, applied at the f16 store.
+///
+/// # Panics
+/// As [`matmul_q2_ep`].
+pub fn matmul_q2_mopa_ep(
+    a: &[f16],
+    w: &Q2Weights,
+    c: &mut [f16],
+    m: usize,
+    ep: &Epilogue<'_, f16>,
+) {
+    mopa_impl(a, Codes::Q2(w), c, m, ep);
+}
+
+/// [`matmul_q1`] on the f16 MOPA path, as [`matmul_q2_mopa`]; a 1-bit
+/// weight unpacks exactly (its scale, negated for a clear bit).
+///
+/// # Panics
+/// As [`matmul_q1`].
+pub fn matmul_q1_mopa(a: &[f16], w: &Q1Weights, c: &mut [f16], m: usize) {
+    mopa_impl(a, Codes::Q1(w), c, m, &Epilogue::new());
+}
+
+/// [`matmul_q1_mopa`] with a fused epilogue, applied at the f16 store.
+///
+/// # Panics
+/// As [`matmul_q1_ep`].
+pub fn matmul_q1_mopa_ep(
+    a: &[f16],
+    w: &Q1Weights,
+    c: &mut [f16],
+    m: usize,
+    ep: &Epilogue<'_, f16>,
+) {
+    mopa_impl(a, Codes::Q1(w), c, m, ep);
+}
+
 /// The weights either path reads, as the shared code sees them.
 #[derive(Clone, Copy)]
 enum Codes<'w> {
@@ -116,8 +174,30 @@ impl Codes<'_> {
         }
     }
 
-    /// Runs the kernel; non-zero when its scratch allocation failed and `c`
-    /// is untouched.
+    /// The weights as the MOPA path unpacks them, row-major `k x n`.
+    fn dequant(self) -> Vec<f16> {
+        let (n, k, block) = self.dims();
+        let mut b = vec![f16::ZERO; k * n];
+        for (d, row) in b.chunks_exact_mut(n.max(1)).enumerate().take(k) {
+            for (j, o) in row.iter_mut().enumerate() {
+                let s = self.scale(d / block, j);
+                *o = f16::from_f32(match self {
+                    Self::Q2(w) => s * f32::from(w.params.codebook[w.code(d, j)]),
+                    Self::Q1(w) => {
+                        if w.sign(d, j) {
+                            s
+                        } else {
+                            -s
+                        }
+                    }
+                });
+            }
+        }
+        b
+    }
+
+    /// Runs the int8 GEMV kernel, or with `mopa` the f16 MOPA path; non-zero
+    /// when its scratch allocation failed and `c` is untouched.
     ///
     /// # Safety
     /// `a` / `c` hold `m*k` / `m*n` values; `ep` is null or a validated
@@ -125,6 +205,7 @@ impl Codes<'_> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     unsafe fn run(
         self,
+        mopa: bool,
         m: usize,
         c: *mut u16,
         a: *const u16,
@@ -133,10 +214,10 @@ impl Codes<'_> {
         let (n, k, block) = self.dims();
         // SAFETY: the caller's contract covers a, c and ep; the codes and
         // scales describe the weights' (n, k) in the band-major layout the
-        // kernel expects, and a codebook is 4 bytes.
+        // kernels expect, and a codebook is 4 bytes.
         unsafe {
-            match self {
-                Self::Q2(w) => {
+            match (self, mopa) {
+                (Self::Q2(w), false) => {
                     let _busy = crate::warm::busy("gemm_sme_f16_q2", m, n, k);
                     crate::ffi::gemm_sme_f16_q2(
                         m,
@@ -151,9 +232,38 @@ impl Codes<'_> {
                         ep,
                     )
                 }
-                Self::Q1(w) => {
+                (Self::Q2(w), true) => {
+                    let _busy = crate::warm::busy("gemm_sme_f16f16_q2", m, n, k);
+                    crate::ffi::gemm_sme_f16f16_q2(
+                        m,
+                        n,
+                        k,
+                        c,
+                        a,
+                        w.codes.as_ptr(),
+                        w.scales.as_ptr().cast::<u16>(),
+                        w.params.codebook.as_ptr(),
+                        block,
+                        ep,
+                    )
+                }
+                (Self::Q1(w), false) => {
                     let _busy = crate::warm::busy("gemm_sme_f16_q1", m, n, k);
                     crate::ffi::gemm_sme_f16_q1(
+                        m,
+                        n,
+                        k,
+                        c,
+                        a,
+                        w.signs.as_ptr(),
+                        w.scales.as_ptr().cast::<u16>(),
+                        block,
+                        ep,
+                    )
+                }
+                (Self::Q1(w), true) => {
+                    let _busy = crate::warm::busy("gemm_sme_f16f16_q1", m, n, k);
+                    crate::ffi::gemm_sme_f16f16_q1(
                         m,
                         n,
                         k,
@@ -168,19 +278,18 @@ impl Codes<'_> {
             }
         }
     }
-}
 
-fn lowbit_impl(a: &[f16], w: Codes<'_>, c: &mut [f16], m: usize, ep: &Epilogue<'_, f16>) {
-    let (n, k, _) = w.dims();
-    assert_eq!(a.len(), crate::exec::checked_dim2(m, k), "a is m*k");
-    assert_eq!(c.len(), crate::exec::checked_dim2(m, n), "c is m*n");
-    crate::exec::validate_ep(ep, m, n);
-    if m == 0 || n == 0 {
-        return;
-    }
+    /// [`Codes::run`] with `ep` resolved for the kernel; `true` when it ran.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if caps().sme2p1 {
-        let fnodes = crate::exec::resolve_nodes(&ep.nodes, ep.act, n);
+    fn run_ep(
+        self,
+        mopa: bool,
+        a: &[f16],
+        c: &mut [f16],
+        m: usize,
+        ep: &Epilogue<'_, f16>,
+    ) -> bool {
+        let fnodes = crate::exec::resolve_nodes(&ep.nodes, ep.act, self.dims().0);
         let desc = crate::ffi::EpDesc16 {
             n_nodes: u32::try_from(fnodes.len()).expect("epilogue op-graph exceeds u32 nodes"),
             nodes: fnodes.as_ptr(),
@@ -190,22 +299,54 @@ fn lowbit_impl(a: &[f16], w: Codes<'_>, c: &mut [f16], m: usize, ep: &Epilogue<'
         } else {
             &raw const desc
         };
-        // SAFETY: a / c are m*k / m*n (checked above); the node operands are
-        // length-validated above and outlive the call.
+        // SAFETY: the callers check a / c against m*k / m*n and validate the
+        // node operands, which outlive the call.
         let rc = unsafe {
-            w.run(
+            self.run(
+                mopa,
                 m,
                 c.as_mut_ptr().cast::<u16>(),
                 a.as_ptr().cast::<u16>(),
                 ep_ptr,
             )
         };
-        if rc == 0 {
-            return;
-        }
+        rc == 0
     }
+}
+
+/// The shapes both paths take; `false` when there is nothing to compute.
+fn check(a: &[f16], w: Codes<'_>, c: &[f16], m: usize, ep: &Epilogue<'_, f16>) -> bool {
+    let (n, k, _) = w.dims();
+    assert_eq!(a.len(), crate::exec::checked_dim2(m, k), "a is m*k");
+    assert_eq!(c.len(), crate::exec::checked_dim2(m, n), "c is m*n");
+    crate::exec::validate_ep(ep, m, n);
+    m != 0 && n != 0
+}
+
+fn lowbit_impl(a: &[f16], w: Codes<'_>, c: &mut [f16], m: usize, ep: &Epilogue<'_, f16>) {
+    if !check(a, w, c, m, ep) {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if caps().sme2p1 && w.run_ep(false, a, c, m, ep) {
+        return;
+    }
+    let n = w.dims().0;
     reference(a, w, c, m);
     crate::exec::apply_ep_scalar(c, m, n, n, 1, ep);
+}
+
+fn mopa_impl(a: &[f16], w: Codes<'_>, c: &mut [f16], m: usize, ep: &Epilogue<'_, f16>) {
+    if !check(a, w, c, m, ep) {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if caps().sme_f16f16 && w.run_ep(true, a, c, m, ep) {
+        return;
+    }
+    let (n, k, _) = w.dims();
+    let p = crate::prepack_f16(&w.dequant(), n, k);
+    crate::kernels::f16::f16_packed_ep_impl(a, &p, c, m, ep, f16::ONE, false);
 }
 
 /// One row's int8 activations and per-block scales, as `csrc/gemm_q2.cc`
@@ -261,6 +402,7 @@ mod tests {
     use half::f16;
 
     use super::{Codes, reference};
+    use crate::Epilogue;
     use crate::WeightLayout;
     use crate::kernels::lowbit::{Q1Weights, Q2Params, Q2Weights};
 
@@ -346,6 +488,79 @@ mod tests {
                         &a,
                         &format!("q1 {m}x{n}x{k} {block} {layout:?}"),
                     );
+                }
+            }
+        }
+    }
+
+    /// The MOPA path against the eager dequant through the dense f16 kernel,
+    /// bit for bit. The dense call gets at least 8 rows (zero rows appended),
+    /// so it runs its MOPA too rather than its GEMV.
+    fn check_mopa(m: usize, w: Codes<'_>, a: &[f16], ep: &Epilogue<'_, f16>, what: &str) {
+        let (n, k, _) = w.dims();
+        let mp = m.max(8);
+        let mut ap = a.to_vec();
+        ap.resize(mp * k, f16::ZERO);
+        let mut want = vec![f16::ZERO; mp * n];
+        let p = crate::prepack_f16(&w.dequant(), n, k);
+        crate::kernels::f16::f16_packed_ep_impl(&ap, &p, &mut want, mp, ep, f16::ONE, false);
+        let mut got = vec![f16::from_f32(9.0); m * n];
+        match w {
+            Codes::Q2(q) => crate::matmul_q2_mopa_ep(a, q, &mut got, m, ep),
+            Codes::Q1(q) => crate::matmul_q1_mopa_ep(a, q, &mut got, m, ep),
+        }
+        for (i, (g, r)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                r.to_bits(),
+                "{what}: c[{}][{}] = {g} vs {r}",
+                i / n,
+                i % n
+            );
+        }
+    }
+
+    /// Ragged shapes, K tails off the four-depth quad, odd tile counts, more
+    /// N-blocks than ring slots, every block size and codebook, plain and with
+    /// a fused bias and activation.
+    #[test]
+    fn mopa_matches_eager_dequant() {
+        let books = [[-1i8, 0, 1, 0], [-2, -1, 1, 2], [-128, 127, 3, -7]];
+        let shapes = [
+            (8usize, 64usize, 256usize),
+            (1, 65, 37),
+            (3, 200, 301),
+            (33, 130, 514),
+            (40, 4200, 1030),
+            (200, 1000, 2048),
+        ];
+        for (si, &(m, n, k)) in shapes.iter().enumerate() {
+            let bias: Vec<f16> = (0..n)
+                .map(|j| f16::from_f32(j as f32 * 0.01 - 1.0))
+                .collect();
+            for (bi, &block) in [16usize, 128, 4096].iter().enumerate() {
+                let nbk = k.div_ceil(block);
+                let scales: Vec<f16> = data(si as u64 + 3, n * nbk)
+                    .iter()
+                    .map(|&b| f16::from_f32(f32::from(b) * 1e-3 - 0.1))
+                    .collect();
+                let a: Vec<f16> = data(si as u64 + 77, m * k)
+                    .iter()
+                    .map(|&b| f16::from_f32((f32::from(b) - 128.0) / 61.0))
+                    .collect();
+                let book = books[(si + bi) % books.len()];
+                let codes = data(si as u64 * 13 + bi as u64, (k * n).div_ceil(4));
+                let p = Q2Params::new(block).with_codebook(book);
+                let q2 = Q2Weights::new(&codes, &scales, n, k, p);
+                let signs = data(si as u64 * 19 + bi as u64, (k * n).div_ceil(8));
+                let q1 = Q1Weights::new(&signs, &scales, WeightLayout::OutIn, n, k, block);
+                for (ei, ep) in [Epilogue::new(), Epilogue::new().add_col(&bias).silu()]
+                    .iter()
+                    .enumerate()
+                {
+                    let what = format!("{m}x{n}x{k} block {block} ep {ei}");
+                    check_mopa(m, Codes::Q2(&q2), &a, ep, &format!("q2 {book:?} {what}"));
+                    check_mopa(m, Codes::Q1(&q1), &a, ep, &format!("q1 {what}"));
                 }
             }
         }

@@ -100,7 +100,10 @@ matching f16).
   pass ahead, which takes one SME unit to the P-cluster's DRAM limit. For
   models trained at that precision (BitNet b1.58, `TQ2_0`, Bonsai):
   `Q2Weights::new` / `Q1Weights::new` take their codes and scales as stored,
-  and `quantize` re-encodes weights already on such a grid exactly.
+  and `quantize` re-encodes weights already on such a grid exactly. For many
+  rows, `matmul_q2_mopa` / `matmul_q1_mopa` unpack the weights into f16 panels
+  per call and run the f16 MOPA at twice that rate, with f16 activations and
+  f16 accumulation in place of int8 activations.
 - **Batched** — many small `C_i = A_i @ B_i` in one streaming session
   (`matmul_*_batched` / `_ep`).
 - **Pre-packed weights** — `prepack_*` once, reuse. Calls that skip it pack B
@@ -114,8 +117,8 @@ matching f16).
     Q4 GEMV under 8 rows, an f16 panel built once on first use from 8. 2-bit
     and 1-bit layers (`Linear::from_q2` / `from_q1` or `quantize_q2` /
     `quantize_q1`, `GatedLinear::quantize_q2` / `from_q1`) run their GEMM at
-    every row count, so `Mlp`, `SelfAttention` and `Block` take them as they
-    are.
+    every row count, or with `.lowbit_mopa()` the f16 MOPA path from 64 rows,
+    so `Mlp`, `SelfAttention` and `Block` take them as they are.
   - `GatedLinear`: the gate and up projections of a SwiGLU / GeGLU MLP as one
     matmul (interleaved 32 columns at a time) plus one NEON `act(g)·u` pass.
   - An input RMSNorm folds into the layer after it: `WeightLayout::scale_inputs`
@@ -126,7 +129,8 @@ matching f16).
     `prepack(w, layout, n, k)` for every dtype, so weights go in as they are
     stored.
   - `KvCache`: an f16 key/value cache with `push` / `attend` / `attend_causal`
-    (grouped-query aware; NEON, since one row has no GEMM in it), over
+    (grouped-query aware; NEON for one row, which has no GEMM in it, and both
+    products on the SME unit for blocks of 32 or more rows), over
     `attention_kv_f16` / `attention_kv_causal_f16`.
   - `Mlp` (`y += down(act(up(x)))`, plain or gated) and `SelfAttention` (fused
     qkv projection, KV cache append, attention, output projection): whole
@@ -402,14 +406,18 @@ tokenizer. On the CPU of a base M5 it generates 289 tok/s (tg128, one stream,
 ≥ 300 at short context); llama.cpp on the same machine and file runs 238 tok/s
 on the GPU (Metal) and 60 on the CPU, and its greedy output matches ours token
 for token. The weights stream at 71-80 GB/s against the P-cluster's ~83 GB/s
-limit. Prompts are compute-bound and run the same one-row kernel five rows at
-a time: 690 tok/s (pp512) against llama.cpp's 3237 on the GPU and 423 on the
-CPU.
+limit. Prompts are compute-bound: from 64 tokens their projections run the f16
+MOPA path (`Linear::lowbit_mopa`) and their attention runs on the SME unit,
+1320 tok/s (pp512) against llama.cpp's 3237 on the GPU and 423 on the CPU,
+with the projections at ~85% of the f16 MOPA's peak rate.
+Their f16 accumulation can part a long prompt's greedy continuation from
+llama.cpp's after a few tokens; `--int8` keeps prompts on the int8 GEMV
+(742 tok/s), which matched it on the prompts tried.
 
 ```sh
 examples/bonsai/fetch.sh                                   # once: the GGUF, 248 MB
 cargo run --release --example bonsai -- "Why is the sky blue?"
-cargo run --release --example bonsai -- --bench            # as llama-bench tg128
+cargo run --release --example bonsai -- --bench            # as llama-bench tg128 and pp512
 ```
 
 `examples/sme_warm` shows the wake cost `SmeWarm` removes.

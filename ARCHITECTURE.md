@@ -226,7 +226,20 @@ high halves in separate accumulators; the values take FMLAL against f16-rounded
 probabilities selected by lane. A transposed key layout would drop the
 horizontal sums but cost a strided write per element on every append.
 `attention_kv_causal_f16` runs a block of query rows (row i sees keys
-`0..=start+i`) as independent rows of the same kernel, spread across cores.
+`0..=start+i`). Below 32 rows they are independent rows of the same kernel,
+spread across cores. From 32 the block's products go to the SME unit
+(`csrc/attention_kv_sme.h`) with the same roundings — q·scale and the
+probabilities to f16, f32 sums — on the widening MOPA, since f32 logits are
+what the softmax needs. Each KV head's keys and values are packed once as MOPA
+bands. A unit is one KV head and a tile of R query positions times the head's
+g query heads (M = g·R rows, one 32-row tile when g divides 32), so the
+group's heads share every K and V load. Per chunk of 1024 keys a unit stores
+its scores row-major from ZA, takes the masked softmax in NEON with flash
+attention's running max and sum (§2.5), rounds and packs P, and adds P·V from
+the MOPA into an f32 output it normalizes at the end. Units go out longest
+first, from one cursor. Only the order of the sums differs from the one-row
+kernel, so a block row agrees with it to an f16 rounding of a probability, not
+bit for bit.
 
 ### 2.8 Small m: ZA-vector GEMV
 
@@ -480,10 +493,10 @@ ones, because the expansion is cheap enough to let them pay:
   `ZERO` constrains where groups go. A pass of R rows and B bands with C sum
   chains per (row, band) uses R·B·(2C+1) of the 16 vg1x4 groups: one row runs 3
   bands with alternate quads in two chains, more rows fewer bands, up to 5 rows.
-  Larger m runs as balanced groups of at most 5 rows, each a GEMV of its own:
-  low-bit layers serve generation, where m is small, and keep that rate instead
-  of switching to a MOPA path at larger m. A fold costs about a quarter of a
-  128-deep block's SDOT time, which is why small blocks run slower.
+  Larger m runs as balanced groups of at most 5 rows, each a GEMV of its own,
+  so int8 results never depend on m; the MOPA path below is a separate opt-in.
+  A fold costs about a quarter of a 128-deep block's SDOT time, which is why
+  small blocks run slower.
 - **Streaming.** A one-row call is bound by reading its weights, and on M5 the
   P-cluster as a whole reads DRAM at ~83 GB/s, one core's SME unit at ~62 on
   its own. Each step therefore issues a `PRFB` for the same depths of the next
@@ -499,6 +512,27 @@ ones, because the expansion is cheap enough to let them pay:
   its own column, not on m, the passes, or how a call splits over cores, and
   `src/kernels/lowbit/matmul.rs` computes the same bits in Rust: the fallback,
   and the unit tests' oracle.
+- **MOPA path.** `matmul_q{1,2}_mopa` (and `Linear::lowbit_mopa`, from
+  `Linear::LOWBIT_MOPA_ROWS` rows) trade int8 activations for the f16 MOPA
+  rate, twice the GEMV's at prompt-sized m (`csrc/gemm_f16f16_lowbit.h`). Each
+  N-block unpacks into f16 panels in the §2.9 ring and the dense kernel
+  multiplies them, so the result is the eager dequant plus the dense GEMM bit
+  for bit. A 1-bit weight is its scale, sign flipped for a clear bit (exact):
+  per quad each column's nibble becomes the high byte of a u16 TBL index whose
+  low byte, 0xff, reads as 0, so one TBL per 8 columns and depth gives the f16
+  sign bit to XOR onto −scale. A 2-bit weight is one f16 multiply of its
+  codebook value (TBLs of its low and high bytes) by its scale, rounded once.
+  The unpack is NEON rather than ZA work as Q4's is: the GEMM keeps the SME
+  unit busy, the cores are free, and `STNP` stores keep the panels' lines out
+  of their caches (§2.14). The panels carry 16 times a 1-bit code's bytes, so
+  at small m the path is bound by writing and reading them, and its cost steps
+  with the 32-row tile: on Bonsai's projections it ties the GEMV at 32 rows
+  and wins from about 54, hence a threshold of 64. It is opt-in because the f16
+  accumulator's error grows with k: with random weights and activations about
+  0.65% of the output's RMS at k = 2048 and 1.1% at 6144, against 0.4% from
+  int8 activations. Chunks of K chained through C would bound it, but each
+  chunk is another pass over the ring: 1024-deep chunks cost 20-45% of the
+  rate for 0.47%.
 
 ## 3. Translation units and feature gating
 
@@ -556,8 +590,9 @@ owns them:
 | TU               | fragments                                   |
 | ---------------- | ------------------------------------------- |
 | `epilogue.h`     | `epilogue_{scalar,f16,f32,f64,tile}.h`      |
-| `gemm_f16f16.cc` | `gemm_f16f16_q4.h`                          |
+| `gemm_f16f16.cc` | `gemm_f16f16_q4.h`, `gemm_f16f16_lowbit.h`  |
 | `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                          |
+| `attention.cc`   | `attention_kv_sme.h`                        |
 
 The split is for navigability, not compilation. Each fragment closes over its
 parent's `static` kernels and typedefs, so it cannot be its own TU without
@@ -646,7 +681,8 @@ P-core count (`hw.perflevel0.physicalcpu`) that sizes a `HotPool` (§2.12).
   count: the Q4 GEMV below 8 rows, where reading the weights is the cost, and
   the dense f16 GEMM on the panel from 8, where the Q4 MOPA path would unpack
   every block again per call (the two agree bit for bit). 2-bit and 1-bit
-  weights run their GEMM at every row count (§2.15). Its bias goes in front of
+  weights run their int8 GEMM at every row count, or with `lowbit_mopa` the
+  f16 MOPA path from 64 rows (§2.15). Its bias goes in front of
   any caller epilogue, where it folds into the accumulator; with `rms_norm_input` a per-row
   `1/rms(x)` goes in front of that (the norm's weight is folded into W by
   `WeightLayout::scale_inputs`). `GatedLinear` stores gate and up interleaved in

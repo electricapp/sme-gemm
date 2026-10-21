@@ -79,10 +79,31 @@ fn kv_f16_matches_oracle() {
     }
 }
 
+/// Blocks below 32 rows are the one-row call bit for bit. Larger ones run on
+/// the SME unit (both products on the MOPA, keys in chunks of 1024), whose sums
+/// run in another order: there a row is checked against the one-row call to
+/// within an f16 rounding of a probability, and every 37th against the f64
+/// oracle. Grouped heads with a tile of fewer than 32 positions (g = 3) or more
+/// heads than a tile (g = 64), a ragged `head_dim`, a cache past one chunk.
 #[test]
 fn kv_causal_rows_match_one_row() {
-    for &(heads, kv_heads, hd) in &[(6, 6, 64), (8, 2, 64), (4, 4, 128)] {
-        for &(start, rows) in &[(0usize, 1usize), (0, 7), (5, 3), (0, 256), (100, 300)] {
+    for &(heads, kv_heads, hd) in &[
+        (6, 6, 64),
+        (8, 2, 64),
+        (4, 4, 128),
+        (12, 4, 72),
+        (64, 1, 32),
+    ] {
+        for &(start, rows) in &[
+            (0usize, 1usize),
+            (0, 7),
+            (5, 3),
+            (0, 31),
+            (0, 32),
+            (0, 256),
+            (100, 300),
+            (1500, 40),
+        ] {
             let mut s = 0xca05_0000 ^ ((heads * 100 + start * 7 + rows) as u64);
             let ld = kv_heads * hd;
             let q: Vec<f32> = fill_f32(&mut s, rows * heads * hd)
@@ -111,11 +132,36 @@ fn kv_causal_rows_match_one_row() {
                     scale,
                     &mut one,
                 );
-                assert_eq!(
-                    &out[i * qr..(i + 1) * qr],
-                    &one[..],
-                    "causal row {i} of {start}+{rows}, {heads}/{kv_heads}x{hd}"
-                );
+                let got = &out[i * qr..(i + 1) * qr];
+                let tag = format!("causal row {i} of {start}+{rows}, {heads}/{kv_heads}x{hd}");
+                if rows < 32 {
+                    assert_eq!(got, &one[..], "{tag}");
+                    continue;
+                }
+                let err = got
+                    .iter()
+                    .zip(&one)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(err < 1e-3, "{tag}: max abs diff {err} from one row");
+                if i % 37 == 0 || i == rows - 1 {
+                    let want = oracle(
+                        &q[i * qr..(i + 1) * qr],
+                        &k[..n * ld],
+                        &v[..n * ld],
+                        n,
+                        heads,
+                        kv_heads,
+                        hd,
+                        scale,
+                    );
+                    let err = got
+                        .iter()
+                        .zip(&want)
+                        .map(|(a, b)| (f64::from(*a) - b).abs())
+                        .fold(0.0, f64::max);
+                    assert!(err < 2e-3, "{tag}: max abs err {err} from the oracle");
+                }
             }
         }
     }

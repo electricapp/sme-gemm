@@ -120,6 +120,32 @@ unsafe extern "C" {
     /// Whether `gemm_sme_f16f16_q4` runs an `m`-row call as a single GEMV on
     /// the calling thread (non-zero), as a chained call always does.
     pub(crate) fn gemm_sme_f16f16_q4_single(m: usize, n: usize, k: usize) -> core::ffi::c_int;
+    /// `gemm_sme_f16_q1`'s weights on the f16 MOPA path
+    /// (`csrc/gemm_f16f16_lowbit.h`).
+    pub(crate) fn gemm_sme_f16f16_q1(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut u16,
+        lhs: *const u16,
+        signs: *const u8,
+        scales: *const u16,
+        block: usize,
+        ep: *const EpDesc16,
+    ) -> core::ffi::c_int;
+    /// `gemm_sme_f16_q2`'s weights on the f16 MOPA path.
+    pub(crate) fn gemm_sme_f16f16_q2(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut u16,
+        lhs: *const u16,
+        codes: *const u8,
+        scales: *const u16,
+        codebook: *const i8,
+        block: usize,
+        ep: *const EpDesc16,
+    ) -> core::ffi::c_int;
     /// `gemm_sme_f16f16_q4` as one link of a chain: raises `done` to each
     /// stored output column and waits on `ready` for A's depths (either null).
     pub(crate) fn gemm_sme_f16f16_q4_chained(
@@ -429,6 +455,21 @@ unsafe extern "C" {
     );
     /// A block of query rows against an f16 KV cache, rows across cores.
     pub(crate) fn attn_kv_causal_f16(
+        out: *mut f32,
+        q: *const f32,
+        k: *const u16,
+        v: *const u16,
+        start: usize,
+        rows: usize,
+        ld: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        hd: usize,
+        scale: f32,
+    ) -> i32;
+    /// `attn_kv_causal_f16` with both products on the SME unit
+    /// (`attention_kv_sme.h`).
+    pub(crate) fn attn_kv_causal_sme_f16(
         out: *mut f32,
         q: *const f32,
         k: *const u16,

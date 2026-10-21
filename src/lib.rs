@@ -101,8 +101,8 @@ pub use kernels::int::{
 };
 pub use kernels::kv_attention::{KvCache, attention_kv_causal_f16, attention_kv_f16};
 pub use kernels::lowbit::{
-    Q1Weights, Q2_BLOCK, Q2_TERNARY, Q2Params, Q2Weights, matmul_q1, matmul_q1_ep, matmul_q2,
-    matmul_q2_ep,
+    Q1Weights, Q2_BLOCK, Q2_TERNARY, Q2Params, Q2Weights, matmul_q1, matmul_q1_ep, matmul_q1_mopa,
+    matmul_q1_mopa_ep, matmul_q2, matmul_q2_ep, matmul_q2_mopa, matmul_q2_mopa_ep,
 };
 pub use kernels::q4::{
     Q4_BLOCK, Q4Form, Q4Params, Q4Weights, dequant_q4, dequant_q4_bf16, dequant_q4_bf16_with,

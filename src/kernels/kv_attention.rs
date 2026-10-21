@@ -131,15 +131,22 @@ fn groups_in_parallel(
     })
 }
 
+/// Query rows from which [`attention_kv_causal_f16`] runs on the SME unit: a
+/// unit's 32-row tile of query positions times their group's heads.
+pub(crate) const SME_ROWS: usize = 32;
+
 /// Causal attention for `rows` query rows at positions `start..start + rows`.
 ///
 /// The f16 KV cache has the layout of [`attention_kv_f16`]. Query row `i`
 /// attends to keys `0..=start + i`, so the cache must already hold the block's
 /// own keys and values (`start + rows` rows).
 ///
-/// `q` and `out` are `[rows][heads][head_dim]` f32. Rows are independent, so a
-/// large block spreads across cores; each row matches [`attention_kv_f16`]
-/// over its prefix exactly.
+/// `q` and `out` are `[rows][heads][head_dim]` f32. Below 32 rows each row is
+/// [`attention_kv_f16`] over its prefix exactly, the rows spread across cores.
+/// From there both products run on the SME unit, in key chunks of 1024 with
+/// flash attention's running max: the same roundings (q and the probabilities
+/// to f16, f32 sums), summed in another order, so a row agrees with the
+/// one-row call to an f16 rounding of a probability rather than bit for bit.
 ///
 /// # Panics
 /// As [`attention_kv_f16`], with the caches holding `start + rows` rows.
@@ -187,10 +194,15 @@ pub fn attention_kv_causal_f16(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
+        let kernel = if rows >= SME_ROWS {
+            crate::ffi::attn_kv_causal_sme_f16
+        } else {
+            crate::ffi::attn_kv_causal_f16
+        };
         // SAFETY: shapes checked above: k/v cover start+rows rows of ld, q and
         // out cover rows*heads*head_dim; f16 is repr(transparent) over u16.
         let rc = unsafe {
-            crate::ffi::attn_kv_causal_f16(
+            kernel(
                 out.as_mut_ptr(),
                 q.as_ptr(),
                 k.as_ptr().cast::<u16>(),

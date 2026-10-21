@@ -14,7 +14,10 @@ mod matmul;
 mod q1;
 mod q2;
 
-pub use matmul::{matmul_q1, matmul_q1_ep, matmul_q2, matmul_q2_ep};
+pub use matmul::{
+    matmul_q1, matmul_q1_ep, matmul_q1_mopa, matmul_q1_mopa_ep, matmul_q2, matmul_q2_ep,
+    matmul_q2_mopa, matmul_q2_mopa_ep,
+};
 pub use q1::Q1Weights;
 pub use q2::Q2Weights;
 

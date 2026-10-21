@@ -159,7 +159,13 @@ fn q1(g: &Gguf, names: &[&str]) -> io::Result<Q1Weights> {
 }
 
 impl Model {
-    pub(crate) fn load(g: &Gguf) -> io::Result<Self> {
+    /// With `mopa`, prompts of [`Linear::LOWBIT_MOPA_ROWS`] or more tokens run
+    /// the projections on the f16 MOPA path ([`Linear::lowbit_mopa`]).
+    pub(crate) fn load(g: &Gguf, mopa: bool) -> io::Result<Self> {
+        let lin = |w: Q1Weights| {
+            let l = Linear::from_q1(w);
+            if mopa { l.lowbit_mopa() } else { l }
+        };
         let arch = g.str("general.architecture").unwrap_or("qwen3").to_string();
         let key = |k: &str| format!("{arch}.{k}");
         let d = g.int(&key("embedding_length"))?;
@@ -181,18 +187,21 @@ impl Model {
             let t = |s: &str| format!("blk.{i}.{s}.weight");
             layers.push(Layer {
                 attn_norm: Norm::rms(f32s(g, &t("attn_norm"))?, cfg.eps),
-                qkv: Linear::from_q1(q1(g, &[&t("attn_q"), &t("attn_k"), &t("attn_v")])?),
+                qkv: lin(q1(g, &[&t("attn_q"), &t("attn_k"), &t("attn_v")])?),
                 q_norm: f32s(g, &t("attn_q_norm"))?,
                 k_norm: f32s(g, &t("attn_k_norm"))?,
-                out: Linear::from_q1(q1(g, &[&t("attn_output")])?),
+                out: lin(q1(g, &[&t("attn_output")])?),
                 ffn_norm: Norm::rms(f32s(g, &t("ffn_norm"))?, cfg.eps),
                 mlp: Mlp::gated(
-                    GatedLinear::from_q1(
-                        &q1(g, &[&t("ffn_gate")])?,
-                        &q1(g, &[&t("ffn_up")])?,
-                        Gate::Silu,
-                    ),
-                    Linear::from_q1(q1(g, &[&t("ffn_down")])?),
+                    {
+                        let up = GatedLinear::from_q1(
+                            &q1(g, &[&t("ffn_gate")])?,
+                            &q1(g, &[&t("ffn_up")])?,
+                            Gate::Silu,
+                        );
+                        if mopa { up.lowbit_mopa() } else { up }
+                    },
+                    lin(q1(g, &[&t("ffn_down")])?),
                 ),
             });
         }

@@ -1,5 +1,6 @@
 // Native f16 GEMM (Apple M5+, FEAT_SME_F16F16): gemm_half.h instantiated for
-// __fp16, plus the 4-bit-resident path (gemm_f16f16_q4.h).
+// __fp16, plus the 4-bit-resident path (gemm_f16f16_q4.h) and the MOPA path
+// for 1- and 2-bit weights (gemm_f16f16_lowbit.h).
 
 #include "sme_gemm_api.h"
 
@@ -44,6 +45,8 @@ int gemm_sme_f16f16_batched(size_t count, size_t m, size_t n, size_t k, uint16_t
     return run_batched_ep<f16>(count, m, n, k, dst, lhs, rhs, NULL);
 }
 
-// The 4-bit-resident path, kept in its own file (it builds on the dense
-// kernels above, so it is included rather than compiled separately).
+// The 4-bit-resident path and the 1-/2-bit MOPA path, kept in their own files
+// (they build on the dense kernels above, so they are included rather than
+// compiled separately).
+#include "gemm_f16f16_lowbit.h"
 #include "gemm_f16f16_q4.h"

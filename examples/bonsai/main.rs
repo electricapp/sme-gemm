@@ -1,16 +1,17 @@
 //! `PrismML`'s Bonsai (1-bit Qwen3) on the SME unit, from its `Q1_0` GGUF.
 //!
-//! Every projection and the tied head run `matmul_q1` through `Linear`; the
-//! rest is the library's norms, `KvCache` and `SwiGLU` `Mlp` (`model.rs`). One
-//! stream, CPU only.
+//! Every projection and the tied head run `matmul_q1` through `Linear`, and
+//! prompts of 64 or more tokens the projections' f16 MOPA path
+//! (`Linear::lowbit_mopa`); the rest is the library's norms, `KvCache` and
+//! `SwiGLU` `Mlp` (`model.rs`). One stream, CPU only.
 //!
 //!   examples/bonsai/fetch.sh                      # once: the 1.7B GGUF, 248 MB
 //!   cargo run --release --example bonsai -- "Why is the sky blue?"
-//!   cargo run --release --example bonsai -- --bench     # decode tok/s, as llama-bench tg128
+//!   cargo run --release --example bonsai -- --bench     # tok/s, as llama-bench tg128 and pp512
 //!
 //! Options: `-n N` tokens (default 256), `--temp T` (0.5; 0 is greedy),
 //! `--top-k K` (20), `--top-p P` (0.85), `--seed S`, `--raw` (no chat
-//! template), `--model PATH`.
+//! template), `--int8` (prompts on the int8 GEMV too), `--model PATH`.
 
 mod gguf;
 mod model;
@@ -31,6 +32,7 @@ struct Opts {
     seed: u64,
     raw: bool,
     bench: bool,
+    int8: bool,
     model: std::path::PathBuf,
 }
 
@@ -52,6 +54,7 @@ fn opts() -> Result<Opts, String> {
         seed: 0x5eed,
         raw: false,
         bench: false,
+        int8: false,
         model: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples/bonsai/data/Bonsai-1.7B-Q1_0.gguf"),
     };
@@ -68,6 +71,7 @@ fn opts() -> Result<Opts, String> {
             "--model" => o.model = val()?.into(),
             "--raw" => o.raw = true,
             "--bench" => o.bench = true,
+            "--int8" => o.int8 = true,
             _ => words.push(a),
         }
     }
@@ -220,7 +224,7 @@ fn run() -> Result<(), String> {
         )
     })?;
     let tok = tokenizer::Tokenizer::from_gguf(&g).map_err(|e| e.to_string())?;
-    let model = model::Model::load(&g).map_err(|e| e.to_string())?;
+    let model = model::Model::load(&g, !o.int8).map_err(|e| e.to_string())?;
     drop(g);
     let vocab = model.cfg.vocab;
     eprintln!(

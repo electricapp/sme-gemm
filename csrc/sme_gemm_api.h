@@ -49,6 +49,11 @@ void attn_kv_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v, s
 int attn_kv_causal_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v, size_t start,
                        size_t rows, size_t ld, size_t n_heads, size_t n_kv_heads, size_t hd,
                        float scale);
+// The same on the SME unit (attention_kv_sme.h): both products on the widening
+// MOPA, the softmax in NEON. 0, or -1 on OOM.
+int attn_kv_causal_sme_f16(float *out, const float *q, const __fp16 *k, const __fp16 *v,
+                           size_t start, size_t rows, size_t ld, size_t n_heads, size_t n_kv_heads,
+                           size_t hd, float scale);
 
 // gemm_b16b16.cc: native bf16 GEMM (FEAT_SME_B16B16) and its Q4 path.
 int gemm_sme_b16b16_batched(size_t count, size_t m, size_t n, size_t k, uint16_t *dst,
@@ -100,6 +105,14 @@ int gemm_sme_f16f16_q4_chained(size_t m, size_t n, size_t k, uint16_t *dst, cons
                                const std::atomic<size_t> *ready);
 // Whether an m-row Q4 call runs as one GEMV on the calling thread.
 int gemm_sme_f16f16_q4_single(size_t m, size_t n, size_t k);
+// The 1- and 2-bit weights of gemm_sme_f16_q1 / _q2 on the f16 MOPA path
+// (gemm_f16f16_lowbit.h): f16 activations and accumulation.
+int gemm_sme_f16f16_q1(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
+                       const uint8_t *signs, const uint16_t *scales, size_t block,
+                       const ep_desc16 *ep);
+int gemm_sme_f16f16_q2(size_t m, size_t n, size_t k, uint16_t *dst, const uint16_t *lhs,
+                       const uint8_t *codes, const uint16_t *scales, const int8_t *codebook,
+                       size_t block, const ep_desc16 *ep);
 int gemm_sme_f16f16_run(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs, long dst_rs,
                         int read_dst, const uint16_t *lhs, long lhs_cs, long lhs_rs,
                         const uint16_t *rhs, long rhs_cs, long rhs_rs, uint16_t alpha_bits,
