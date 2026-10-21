@@ -16,50 +16,6 @@
 #include <stdlib.h>
 #include <type_traits>
 
-// Scalar tail for one (partial) p-group: dst[p*32 + 4*i + s] = src[i, 4p+s].
-static inline void pack_band_scalar_p(int16_t *dst, const int16_t *src, long lane_stride,
-                                      long depth_stride, size_t k, size_t valid, size_t p) {
-    for (size_t i = 0; i < 8; i++)
-        for (size_t s = 0; s < 4; s++) {
-            size_t d = 4 * p + s;
-            dst[p * 32 + 4 * i + s] =
-                (i < valid && d < k) ? src[(long)i * lane_stride + (long)d * depth_stride] : 0;
-        }
-}
-
-// Pack one 8-wide band into [ceil(K/4), 32]: dst[p*32 + 4*i + s] = src[i, 4p+s].
-// NEON fast paths for the full-8-lane case (the 4-way SMOPA interleave):
-//   * depth contiguous (row-major A): the 4 s-values are one 64-bit word per (p,i).
-//   * lanes contiguous (row-major B): LD4 of 4 depth-vectors of 8 u16, ST4 to
-//     interleave them straight into the layout.
-static void pack_band(int16_t *dst, const int16_t *src, long lane_stride, long depth_stride,
-                      size_t k, size_t valid) {
-    size_t kp4 = (k + 3) / 4;
-    size_t pfull = (k & ~(size_t)3) / 4; // full groups of 4 depths
-
-    if (valid == 8 && depth_stride == 1) {
-        for (size_t p = 0; p < pfull; p++) {
-            const int16_t *sp = src + 4 * (long)p;
-            int16_t *d = dst + p * 32;
-            for (size_t i = 0; i < 8; i++)
-                __builtin_memcpy(d + 4 * i, sp + (long)i * lane_stride, 8);
-        }
-    } else if (valid == 8 && lane_stride == 1) {
-        for (size_t p = 0; p < pfull; p++) {
-            uint16x8x4_t v;
-            v.val[0] = vld1q_u16((const uint16_t *)(src + (long)(4 * p + 0) * depth_stride));
-            v.val[1] = vld1q_u16((const uint16_t *)(src + (long)(4 * p + 1) * depth_stride));
-            v.val[2] = vld1q_u16((const uint16_t *)(src + (long)(4 * p + 2) * depth_stride));
-            v.val[3] = vld1q_u16((const uint16_t *)(src + (long)(4 * p + 3) * depth_stride));
-            vst4q_u16((uint16_t *)(dst + p * 32), v);
-        }
-    } else {
-        pfull = 0;
-    }
-    for (size_t p = pfull; p < kp4; p++)
-        pack_band_scalar_p(dst, src, lane_stride, depth_stride, k, valid, p);
-}
-
 #include "gemm_int.h"
 
 using I16 = IntMopa<int16_t>;
@@ -183,8 +139,8 @@ __arm_locally_streaming __arm_new("za") static void run_small(
         int16_t *b_hi = b_scratch + per_tile;
         // Clamp the hi-band base when vc_hi==0 (no lane read): forming
         // rhs + n0 + 8 past one-past-end would be UB.
-        pack_band(b_lo, rhs + (long)n0, 1, rhs_rs, k, vc_lo);
-        pack_band(b_hi, vc_hi ? rhs + (long)n0 + 8 : rhs, 1, rhs_rs, k, vc_hi);
+        pack_band<I16>(b_lo, rhs + (long)n0, 1, rhs_rs, k, vc_lo);
+        pack_band<I16>(b_hi, vc_hi ? rhs + (long)n0 + 8 : rhs, 1, rhs_rs, k, vc_hi);
         for (size_t mt = mt_lo; mt < mt_hi; mt++) {
             const int16_t *a_lo = a_pack + 2 * mt * per_tile, *a_hi = a_lo + per_tile;
             size_t m0 = mt * 16, mr = m - m0 < 16 ? m - m0 : 16;
@@ -200,50 +156,11 @@ size_t gemm_sme_i16i64_packed_b_elems(size_t n, size_t k) {
     return ep_cmul(2 * ((n + 15) / 16), ep_cmul((k + 3) / 4, 32));
 }
 
-// Row-major B, four full bands at once. One band alone reads 8 lanes = 16 bytes
-// per (depth, band), so it uses a quarter of each 64-byte line and comes back for
-// the rest on the next three bands -- and at large n the rows are far enough
-// apart that the line is gone by then. Four bands together consume the whole line
-// on first touch. (i8 does not need this: its bands are 16 lanes of one byte, so
-// a single band already reads a natural chunk.)
-static void pack_bands4_rowmajor(int16_t *dst, size_t per_tile, const int16_t *src,
-                                 long depth_stride, size_t k) {
-    size_t pfull = (k & ~(size_t)3) / 4;
-    for (size_t p = 0; p < pfull; p++) {
-        uint16x8_t w[4][4];
-        for (size_t s = 0; s < 4; s++) {
-            const uint16_t *row = (const uint16_t *)(src + (long)(4 * p + s) * depth_stride);
-            for (size_t g = 0; g < 4; g++)
-                w[s][g] = vld1q_u16(row + 8 * g);
-        }
-        for (size_t g = 0; g < 4; g++) {
-            uint16x8x4_t v = {{w[0][g], w[1][g], w[2][g], w[3][g]}};
-            vst4q_u16((uint16_t *)(dst + g * per_tile + p * 32), v);
-        }
-    }
-    // K tail: the scalar per-group filler, per band.
-    for (size_t g = 0; g < 4; g++)
-        for (size_t p = pfull; p < (k + 3) / 4; p++)
-            pack_band_scalar_p(dst + g * per_tile, src + 8 * (long)g, 1, depth_stride, k, 8, p);
-}
-
 // Pack B once into a caller-allocated buffer of gemm_sme_i16i64_packed_b_elems
 // int16: [2*n_tiles][ceil(k/4), 32] 4-way-interleaved 8-wide bands.
 void gemm_sme_i16i64_packb(int16_t *b_pack, const int16_t *rhs, size_t n, size_t k, long rhs_rs,
                            long rhs_cs) {
-    size_t per_tile = ep_cmul((k + 3) / 4, 32);
-    size_t n_tiles = (n + 15) / 16;
-    size_t st = 0;
-    if (rhs_cs == 1) {
-        for (; st + 4 <= 2 * n_tiles && (st + 4) * 8 <= n; st += 4)
-            pack_bands4_rowmajor(b_pack + st * per_tile, per_tile, rhs + (long)st * 8, rhs_rs, k);
-    }
-    for (; st < 2 * n_tiles; st++) {
-        size_t c0 = st * 8;
-        size_t vc = (c0 < n) ? ((n - c0 < 8) ? (n - c0) : 8) : 0;
-        // vc==0 bands are zero-filled without reading src; clamp the base.
-        pack_band(b_pack + st * per_tile, vc ? rhs + (long)c0 * rhs_cs : rhs, rhs_cs, rhs_rs, k, vc);
-    }
+    pack_bands<I16>(b_pack, rhs, rhs_cs, rhs_rs, n, k, 0, 2 * ((n + 15) / 16));
 }
 
 // Packed-B i16 GEMM. No run_small arm -- that packs B per N-tile from a
@@ -258,11 +175,7 @@ static int run_packed(size_t m, size_t n, size_t k, Out out, long dst_cs, long d
     size_t per_tile = ep_cmul(kp4, 32);
 
 #define PACKA_RANGE(AP, MT0, MT1)                                                                  \
-    for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                             \
-        size_t r0 = st * 8;                                                                        \
-        size_t vr = (r0 < m) ? ((m - r0 < 8) ? (m - r0) : 8) : 0;                                  \
-        pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr); \
-    }
+    pack_bands<I16>((AP) + 2 * (MT0) * per_tile, lhs, lhs_rs, lhs_cs, m, k, 2 * (MT0), 2 * (MT1))
 
     size_t M_CHUNK = 2;
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;
@@ -354,12 +267,7 @@ static int run_impl(size_t m, size_t n, size_t k, Out out, long dst_cs, long dst
     // Small + row-major B: pack B per-tile into a small scratch (no full B-pack
     // malloc/pass), light dispatch. See gemm_f64.cc.
 #define PACKA_SMALL(AP, MT0, MT1)                                                                  \
-    for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                            \
-        size_t r0 = st * 8;                                                                        \
-        size_t vr = (r0 < m) ? ((m - r0 < 8) ? (m - r0) : 8) : 0;                                  \
-        pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k,     \
-                  vr);                                                                             \
-    }
+    pack_bands<I16>((AP) + 2 * (MT0) * per_tile, lhs, lhs_rs, lhs_cs, m, k, 2 * (MT0), 2 * (MT1))
     if (rhs_cs == 1 && ep_flops(m, n, k) < (1u << 25)) {
         size_t sc_chunk = 2;
         size_t sc_n = (m_tiles + sc_chunk - 1) / sc_chunk;

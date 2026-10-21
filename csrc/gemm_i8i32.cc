@@ -18,53 +18,6 @@
 #include <stdlib.h>
 #include <type_traits>
 
-// Scalar tail for one (partial) p-group: fills dst[p*64 + 4*i + s] with the
-// 4-interleaved source, zero past the K and lane edges.
-static inline void pack_band_scalar_p(int8_t *dst, const int8_t *src, long lane_stride,
-                                      long depth_stride, size_t k, size_t valid, size_t p) {
-    for (size_t i = 0; i < 16; i++)
-        for (size_t s = 0; s < 4; s++) {
-            size_t d = 4 * p + s;
-            dst[p * 64 + 4 * i + s] =
-                (i < valid && d < k) ? src[(long)i * lane_stride + (long)d * depth_stride] : 0;
-        }
-}
-
-// Pack one 16-wide band into [ceil(K/4), 64]: dst[p*64 + 4*i + s] = src[i, 4p+s].
-// Two NEON fast paths for the full-16-lane case (the SMOPA 4-way interleave was
-// the dominant small/medium-tile cost as a scalar byte loop):
-//   * depth contiguous (row-major A, depth_stride==1): the 4 s-values are one
-//     32-bit word per (p,i) -- a strided 32-bit gather.
-//   * lanes contiguous (row-major B, lane_stride==1): load 4 depth-vectors of
-//     16 bytes and ST4 to interleave them byte-wise straight into the layout.
-static void pack_band(int8_t *dst, const int8_t *src, long lane_stride, long depth_stride, size_t k,
-                      size_t valid) {
-    size_t kp4 = (k + 3) / 4;
-    size_t pfull = (k & ~(size_t)3) / 4; // full groups of 4 depths
-
-    if (valid == 16 && depth_stride == 1) {
-        for (size_t p = 0; p < pfull; p++) {
-            const int8_t *sp = src + 4 * (long)p;
-            int8_t *d = dst + p * 64;
-            for (size_t i = 0; i < 16; i++)
-                __builtin_memcpy(d + 4 * i, sp + (long)i * lane_stride, 4);
-        }
-    } else if (valid == 16 && lane_stride == 1) {
-        for (size_t p = 0; p < pfull; p++) {
-            uint8x16x4_t v;
-            v.val[0] = vld1q_u8((const uint8_t *)(src + (long)(4 * p + 0) * depth_stride));
-            v.val[1] = vld1q_u8((const uint8_t *)(src + (long)(4 * p + 1) * depth_stride));
-            v.val[2] = vld1q_u8((const uint8_t *)(src + (long)(4 * p + 2) * depth_stride));
-            v.val[3] = vld1q_u8((const uint8_t *)(src + (long)(4 * p + 3) * depth_stride));
-            vst4q_u8((uint8_t *)(dst + p * 64), v);
-        }
-    } else {
-        pfull = 0; // no fast path -- fall through to scalar for all p
-    }
-    for (size_t p = pfull; p < kp4; p++)
-        pack_band_scalar_p(dst, src, lane_stride, depth_stride, k, valid, p);
-}
-
 #include "gemm_int.h"
 
 using I8 = IntMopa<int8_t>;
@@ -258,16 +211,7 @@ size_t gemm_sme_i8i32_packed_b_elems(size_t n, size_t k) {
 // int8. Reuse across many GEMMs (quantized weights packed once).
 void gemm_sme_i8i32_packb(int8_t *b_pack, const int8_t *rhs, size_t n, size_t k, long rhs_rs,
                           long rhs_cs) {
-    size_t kp4 = (k + 3) / 4;
-    size_t n_tiles = (n + 31) / 32;
-    size_t per_tile = ep_cmul(kp4, 64);
-    for (size_t st = 0; st < 2 * n_tiles; st++) {
-        size_t c0 = st * 16;
-        size_t vc = (c0 < n) ? ((n - c0 < 16) ? (n - c0) : 16) : 0;
-        // vc==0 bands are zero-filled without reading src; clamp the base so no
-        // out-of-bounds pointer is even formed (UB without a deref).
-        pack_band(b_pack + st * per_tile, vc ? rhs + (long)c0 * rhs_cs : rhs, rhs_cs, rhs_rs, k, vc);
-    }
+    pack_bands<I8>(b_pack, rhs, rhs_cs, rhs_rs, n, k, 0, 2 * ((n + 31) / 32));
 }
 
 // Per-thread reusable A-pack scratch. Small/medium GEMMs call repeatedly; a
@@ -317,11 +261,7 @@ static int run_packed(size_t m, size_t n, size_t k, Out out, long dst_cs, long d
     size_t per_tile = ep_cmul(kp4, 64);
 
 #define PACKA_RANGE(AP, MT0, MT1)                                                                  \
-    for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                            \
-        size_t r0 = st * 16;                                                                       \
-        size_t vr = (r0 < m) ? ((m - r0 < 16) ? (m - r0) : 16) : 0;                                \
-        pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr); \
-    }
+    pack_bands<I8>((AP) + 2 * (MT0) * per_tile, lhs, lhs_rs, lhs_cs, m, k, 2 * (MT0), 2 * (MT1))
 
     // n<=16 (single ZA32 N-band) row-major: pair two M-tiles against the one
     // N-band (run_narrow_rowmajor) instead of wasting tiles 1,3 on pad. Same

@@ -24,9 +24,9 @@
 
 #include "epilogue.h"
 #include "neon_act.h"
+#include "pack.h"
 #include "panel_ring.h"
 #include "sme_tile.h"
-#include "transpose16.h"
 
 // What differs between the element types: the spellings that do not overload on
 // argument type, and the epilogue. f16 runs the op-graph natively; bf16 runs it
@@ -85,102 +85,6 @@ SME_INLINE void ep_rows(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst,
             return svread_hor_za16_m(z16, p16, Z, s);
         },
         0, mrows, vb, va, read_dst, nodes, n_nodes, i_base, n0);
-}
-
-// Pack one 32-row M-tile of A into [K, 32]: dst[d*32 + i] = A[i, d].
-template <class T>
-static void pack_a_tile(T *dst, const T *a, long rs, long cs, size_t k, size_t vr) {
-    if (rs == 1 && vr == 32) {
-        // Fast path: rows contiguous, full tile -> 64-byte copy per depth.
-        for (size_t d = 0; d < k; d++)
-            memcpy(dst + d * 32, a + (long)d * cs, 32 * sizeof(T));
-        return;
-    }
-    for (size_t d = 0; d < k; d++)
-        for (size_t i = 0; i < 32; i++)
-            dst[d * 32 + i] = (i < vr) ? a[(long)i * rs + (long)d * cs] : (T)0.0f;
-}
-
-// Transpose 32 depth-contiguous lanes into a [K, 32] tile: dst[d*32 + i] is lane
-// i at depth d, where lane i starts at src + i*lane_stride and runs contiguously
-// in depth. Lanes >= `valid` are zero-filled.
-//
-// This is the same shape for both operands -- row-major A (each ROW contiguous in
-// depth) and column-major B (each COLUMN contiguous in depth) -- so both packs
-// call it. NEON 8x8 transpose over the aligned bulk; the lane and depth edges go
-// scalar, depth-outer so their stores stay within a cache line.
-template <class T>
-static void pack_lanes_depth_major(T *dt, const T *src, long lane_stride, size_t k, size_t valid) {
-    size_t kfull = k & ~(size_t)7;
-    size_t lfull = valid & ~(size_t)7;
-    // Interleave two independent 8x8 transposes per step: the vtrn ladder is a
-    // long dependency chain over strided loads, so a single block runs
-    // latency-bound (~14 GB/s). Two blocks in flight overlap their chains and the
-    // strided-load latency -> the pack stops being the small/medium-tile
-    // bottleneck.
-    size_t kfull2 = kfull & ~(size_t)15;
-    for (size_t lg = 0; lg < lfull; lg += 8) {
-        size_t kg = 0;
-        for (; kg < kfull2; kg += 16) {
-            uint16x8_t r[8], s[8];
-            for (int i = 0; i < 8; i++) {
-                const uint16_t *lane = (const uint16_t *)(src + (long)(lg + i) * lane_stride + kg);
-                r[i] = vld1q_u16(lane);
-                s[i] = vld1q_u16(lane + 8);
-            }
-            transpose_8x8_u16(r);
-            transpose_8x8_u16(s);
-            for (int i = 0; i < 8; i++) {
-                vst1q_u16((uint16_t *)(dt + (kg + i) * 32 + lg), r[i]);
-                vst1q_u16((uint16_t *)(dt + (kg + 8 + i) * 32 + lg), s[i]);
-            }
-        }
-        for (; kg < kfull; kg += 8) {
-            uint16x8_t r[8];
-            for (int i = 0; i < 8; i++)
-                r[i] = vld1q_u16((const uint16_t *)(src + (long)(lg + i) * lane_stride + kg));
-            transpose_8x8_u16(r);
-            for (int i = 0; i < 8; i++)
-                vst1q_u16((uint16_t *)(dt + (kg + i) * 32 + lg), r[i]);
-        }
-    }
-    // Lane tail (i in [lfull,32), all depths): real lanes up to `valid`, zero
-    // past them. DEPTH-OUTER on purpose. The lane-outer form strides 32 elements
-    // (one cache line) per store, so it re-walks the whole k*32 panel once per
-    // lane -- at valid==1, lfull is 0 and that is 32 passes over the panel to
-    // write a single lane, with 31 of them pure zero fill.
-    for (size_t d = 0; d < k && lfull < 32; d++) {
-        T *dp = dt + d * 32;
-        for (size_t i = lfull; i < valid; i++)
-            dp[i] = src[(long)i * lane_stride + d];
-        for (size_t i = valid; i < 32; i++)
-            dp[i] = (T)0.0f;
-    }
-    // Depth tail (whole lanes, depths [kfull,k)).
-    for (size_t i = 0; i < lfull; i++)
-        for (size_t d = kfull; d < k; d++)
-            dt[d * 32 + i] = src[(long)i * lane_stride + d];
-}
-
-// Pack one 32-col N-tile of B into [K, 32]: dst[d*32 + j] = B[d, j].
-template <class T>
-static void pack_b_tile(T *dst, const T *b, long rs, long cs, size_t k, size_t vc) {
-    if (cs == 1 && vc == 32) {
-        // Row-major B (e.g. [N,K] weights): contiguous 32 N-values per depth.
-        for (size_t d = 0; d < k; d++)
-            memcpy(dst + d * 32, b + (long)d * rs, 32 * sizeof(T));
-        return;
-    }
-    if (rs == 1) {
-        // Col-major B (the transposed-B / Q@K^T case): each N-column is
-        // contiguous in depth, which is the A-pack's layout with columns for
-        // rows -- so it takes the same NEON transpose.
-        pack_lanes_depth_major(dst, b, cs, k, vc);
-        return;
-    }
-    for (size_t d = 0; d < k; d++)
-        for (size_t j = 0; j < 32; j++)
-            dst[d * 32 + j] = (j < vc) ? b[(long)d * rs + (long)j * cs] : (T)0.0f;
 }
 
 // Narrow/combine/store one extracted ZA16 column or row (already 32 contiguous
@@ -906,73 +810,18 @@ __arm_locally_streaming __arm_new("za") static void run_direct(
     }
 }
 
-// Pack A into [m_tiles, k, 32]. Fast paths for col-major (lhs_rs==1, memcpy)
-// and row-major (lhs_cs==1, cache-blocked transpose); strided gather otherwise.
+// Pack A's M-tiles [mt_lo, mt_hi) into their [k, 32] slots of a_pack (pack.h).
 template <class T>
 static void packa(T *a_pack, const T *a, size_t m, size_t k, long lhs_rs, long lhs_cs, size_t mt_lo,
                   size_t mt_hi, size_t per_tile) {
-    if (lhs_rs == 1) {
-        const size_t TB = 8; // tiles per block: bounds the write streams
-        for (size_t tb = mt_lo; tb < mt_hi; tb += TB) {
-            size_t tb_end = tb + TB < mt_hi ? tb + TB : mt_hi;
-            for (size_t d = 0; d < k; d++) {
-                const T *col = a + (long)d * lhs_cs;
-                for (size_t mt = tb; mt < tb_end; mt++) {
-                    size_t r0 = mt * 32;
-                    size_t vr = (m - r0 < 32) ? (m - r0) : 32;
-                    T *dp = a_pack + mt * per_tile + d * 32;
-                    if (vr == 32) {
-                        memcpy(dp, col + r0, 32 * sizeof(T));
-                    } else {
-                        memcpy(dp, col + r0, vr * sizeof(T));
-                        for (size_t i = vr; i < 32; i++)
-                            dp[i] = (T)0.0f;
-                    }
-                }
-            }
-        }
-    } else if (lhs_cs == 1) {
-        // Row-major A: each row is contiguous in depth, which is exactly the
-        // layout pack_lanes_depth_major transposes (rows as lanes).
-        for (size_t mt = mt_lo; mt < mt_hi; mt++) {
-            size_t r0 = mt * 32;
-            size_t mrows = (m - r0 < 32) ? (m - r0) : 32;
-            pack_lanes_depth_major(a_pack + mt * per_tile, a + (long)r0 * lhs_rs, lhs_rs, k, mrows);
-        }
-    } else {
-        for (size_t mt = mt_lo; mt < mt_hi; mt++) {
-            size_t r0 = mt * 32;
-            size_t vr = (m - r0 < 32) ? (m - r0) : 32;
-            pack_a_tile(a_pack + mt * per_tile, a + (long)r0 * lhs_rs, lhs_rs, lhs_cs, k, vr);
-        }
-    }
+    pack_bands<Mopa<T, T>>(a_pack + mt_lo * per_tile, a, lhs_rs, lhs_cs, m, k, mt_lo, mt_hi);
 }
 
-// Pack B into [n_tiles_pad, k, 32]; caller zeroes pad tiles. Fast path for
-// row-major weights (rhs_cs==1); strided gather otherwise.
+// Pack B's n_tiles N-tiles into [n_tiles, k, 32]; the caller zeroes the pad tile.
 template <class T>
 static void packb(T *b_pack, const T *b, size_t n, size_t k, long rhs_rs, long rhs_cs,
-                  size_t n_tiles, size_t per_tile) {
-    if (rhs_cs == 1) {
-        const size_t TB = 8;
-        for (size_t tb = 0; tb < n_tiles; tb += TB) {
-            size_t tb_end = tb + TB < n_tiles ? tb + TB : n_tiles;
-            for (size_t d = 0; d < k; d++) {
-                const T *row = b + (long)d * rhs_rs;
-                for (size_t nt = tb; nt < tb_end; nt++) {
-                    size_t c0 = nt * 32;
-                    size_t vc = (n - c0 < 32) ? (n - c0) : 32;
-                    memcpy(b_pack + nt * per_tile + d * 32, row + c0, vc * sizeof(T));
-                }
-            }
-        }
-    } else {
-        for (size_t nt = 0; nt < n_tiles; nt++) {
-            size_t c0 = nt * 32;
-            size_t vc = (n - c0 < 32) ? (n - c0) : 32;
-            pack_b_tile(b_pack + nt * per_tile, b + (long)c0 * rhs_cs, rhs_rs, rhs_cs, k, vc);
-        }
-    }
+                  size_t n_tiles) {
+    pack_bands<Mopa<T, T>>(b_pack, b, rhs_cs, rhs_rs, n, k, 0, n_tiles);
 }
 
 // Packed-B GEMM: caller supplies B pre-packed via packb. Only A is packed here --
@@ -1181,7 +1030,7 @@ static int run_packed(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs, 
 template <class T>
 static void half_packb(uint16_t *b_pack, const uint16_t *rhs, size_t n, size_t k, long rhs_rs,
                        long rhs_cs) {
-    packb((T *)b_pack, (const T *)rhs, n, k, rhs_rs, rhs_cs, (n + 31) / 32, ep_cmul(k, 32));
+    packb((T *)b_pack, (const T *)rhs, n, k, rhs_rs, rhs_cs, (n + 31) / 32);
 }
 
 // Saturating: SIZE_MAX on overflow (see gemm_sme_i8i32_packed_b_elems).
@@ -1194,27 +1043,8 @@ static inline size_t half_packed_b_elems(size_t n, size_t k) {
 // columns past n.
 template <class T>
 static void pack_b_range(T *dst, const T *b, long rs, long cs, size_t n, size_t k, size_t t0,
-                         size_t t1, size_t per_tile) {
-    if (cs != 1) {
-        for (size_t t = t0; t < t1; t++) {
-            size_t vc = n - t * 32 < 32 ? n - t * 32 : 32;
-            pack_b_tile(dst + (t - t0) * per_tile, b + (long)(t * 32) * cs, rs, cs, k, vc);
-        }
-        return;
-    }
-    size_t tf = t1 < n / 32 ? t1 : n / 32; // full tiles end
-    for (size_t d = 0; d < k; d++) {
-        const T *row = b + (long)d * rs;
-        T *dp = dst + d * 32;
-
-        for (size_t t = t0; t < tf; t++)
-            memcpy(dp + (t - t0) * per_tile, row + t * 32, 32 * sizeof(T));
-        if (tf < t1) {
-            size_t vc = n - tf * 32;
-            memcpy(dp + (tf - t0) * per_tile, row + tf * 32, vc * sizeof(T));
-            memset(dp + (tf - t0) * per_tile + vc, 0, (32 - vc) * sizeof(T));
-        }
-    }
+                         size_t t1) {
+    pack_bands<Mopa<T, T>>(dst, b, cs, rs, n, k, t0, t1);
 }
 
 // MOPA driver for a B built per call (unpacked B, Q4): each N-block of B is
@@ -1353,11 +1183,11 @@ static int run_cols(T *dst, long dst_cs, long dst_rs, const T *a, long lhs_rs, l
                          alpha, beta, read_dst);
           } else {
               size_t tq = t1 < n_tiles ? t1 : n_tiles;
-              if (t0 < tq) pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, tq, per_tile);
+              if (t0 < tq) pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, tq);
               for (size_t t = t0 > tq ? t0 : tq; t < t1; t++) // zero pad tile
                   memset(bt + (t - t0) * per_tile, 0, per_tile * sizeof(T));
               tail = odd_tail && it == n_items - 1;
-              if (tail) pack_b_range(bo, b, rhs_rs, rhs_cs, n, k, n_tiles - 1, n_tiles, per_tile);
+              if (tail) pack_b_range(bo, b, rhs_rs, rhs_cs, n, k, n_tiles - 1, n_tiles);
           }
           // All of A packed: one pass. Otherwise M-chunk by M-chunk as each lands.
           int all = a_cnt->load(std::memory_order_acquire) == n_chunks;
@@ -1400,7 +1230,7 @@ static int run_gemv_cols(T *dst, long dst_rs, const T *a, long lhs_rs, long lhs_
       T *bt = pool + w * G * per_tile;
       for (size_t i; (i = cur->fetch_add(1, std::memory_order_relaxed)) < n_items;) {
           size_t t0 = i * G, t1 = t0 + G < n_tiles ? t0 + G : n_tiles;
-          pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, t1, per_tile);
+          pack_b_range(bt, b, rhs_rs, rhs_cs, n, k, t0, t1);
           run_gemv(dst, dst_rs, abc, (const T *)NULL, 0, m, bt, n, k, t0, t1, alpha, beta, read_dst,
                    (const ep_desc16 *)NULL);
       }
@@ -1451,13 +1281,13 @@ static int run(size_t m, size_t n, size_t k, uint16_t *dst, long dst_cs, long ds
         return run_panels(d, dst_cs, dst_rs, a, lhs_rs, lhs_cs, m, n, k, alpha, beta, read_dst,
                           (const ep_desc16 *)NULL, (size_t)1 << 16,
                           ^(T *out, size_t t0, size_t t1) {
-                            pack_b_range(out, b, rhs_rs, rhs_cs, n, k, t0, t1, per_tile);
+                            pack_b_range(out, b, rhs_rs, rhs_cs, n, k, t0, t1);
                           });
     }
     size_t n_tiles_pad = (((n + 31) / 32) + 1) & ~(size_t)1;
     T *b_pack = (T *)calloc(ep_cmul(n_tiles_pad, per_tile), sizeof(T));
     if (!b_pack) return -1;
-    packb(b_pack, (const T *)rhs, n, k, rhs_rs, rhs_cs, (n + 31) / 32, per_tile);
+    packb(b_pack, (const T *)rhs, n, k, rhs_rs, rhs_cs, (n + 31) / 32);
     int rc = run_packed<T>(m, n, k, dst, dst_cs, dst_rs, read_dst, lhs, lhs_cs, lhs_rs,
                            (const uint16_t *)b_pack, alpha_bits, beta_bits, NULL);
     free(b_pack);

@@ -4,9 +4,8 @@
 // interleaved. The output is the raw accumulator or, through a dequant
 // descriptor, f32 = nodes(scale * acc) computed in-register at the store.
 // Included by gemm_i8i32.cc and gemm_i16i64.cc, which instantiate it under their
-// own target features and keep the packing, GEMV and dtype-specific paths; each
-// defines pack_band(T *dst, const T *src, long lane_stride, long depth_stride,
-// size_t k, size_t valid) for its 4-way interleave before including this.
+// own target features and keep the GEMV and dtype-specific paths. Packing is
+// pack.h's, over the same atom.
 #ifndef SME_GEMM_INT_H
 #define SME_GEMM_INT_H
 
@@ -17,6 +16,7 @@
 #include <type_traits>
 
 #include "epilogue.h"
+#include "pack.h"
 #include "sme_tile.h"
 
 // i8 accumulates into i32, i16 into i64.
@@ -210,7 +210,7 @@ static int run_batched_impl(size_t count, size_t m, size_t n, size_t k, Out out,
     size_t per_tile = ep_cmul(kp4, A::kRow);
     size_t a_per = 2 * m_tiles * per_tile, b_per = 2 * n_tiles * per_tile;
 
-    // pack_band fully writes every band (zero-filling empty and partial bands
+    // pack_bands fully writes every band (zero-filling empty and partial bands
     // and partial p-groups), so the buffers need no zeroing. `count` is the one
     // factor no C-side size invariant bounds, so the byte products are checked
     // (-1 makes the Rust side fall back).
@@ -227,16 +227,8 @@ static int run_batched_impl(size_t count, size_t m, size_t n, size_t k, Out out,
     }
     for (size_t bi = 0; bi < count; bi++) {
         const T *li = lhs + bi * (m * k), *ri = rhs + bi * (k * n);
-        for (size_t st = 0; st < 2 * m_tiles; st++) {
-            size_t r0 = st * W, vr = r0 < m ? (m - r0 < W ? m - r0 : W) : 0;
-            pack_band(a_packs + bi * a_per + st * per_tile, vr ? li + (long)r0 * (long)k : li,
-                      (long)k, 1, k, vr);
-        }
-        for (size_t st = 0; st < 2 * n_tiles; st++) {
-            size_t c0 = st * W, vc = c0 < n ? (n - c0 < W ? n - c0 : W) : 0;
-            pack_band(b_packs + bi * b_per + st * per_tile, vc ? ri + (long)c0 : ri, 1, (long)n, k,
-                      vc);
-        }
+        pack_bands<A>(a_packs + bi * a_per, li, (long)k, 1, m, k, 0, 2 * m_tiles);
+        pack_bands<A>(b_packs + bi * b_per, ri, 1, (long)n, n, k, 0, 2 * n_tiles);
     }
     run_batched(count, out, a_packs, b_packs, m, n, kp4, per_tile, a_per, b_per);
     free(a_packs);

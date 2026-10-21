@@ -12,9 +12,9 @@
 
 #include "sme_gemm_api.h"
 
+#include "pack.h"
 #include "panel_ring.h"
 #include "sme_tile.h"
-#include "transpose16.h"
 #include <arm_neon.h>
 #include <arm_sme.h>
 #include <dispatch/dispatch.h>
@@ -57,93 +57,6 @@ template <class E> static float from_bits(uint16_t b) {
     typename E::T h;
     memcpy(&h, &b, sizeof h);
     return (float)h;
-}
-
-// Both operands pack into the same [KP, 32] pair-interleaved band -- 16 lanes,
-// two depths per group, dst[p*32 + 2*lane + s] = src[lane, 2p+s]. A's lanes are
-// rows and B's are columns, so the two only differ in which stride is which.
-// Packing moves 16-bit patterns, so these serve f16 and bf16 alike:
-//
-//   lanes contiguous at each depth  -> pack_lane_contig   (row-major B, col-major A)
-//   each lane contiguous in depth   -> pack_depth_contig  (row-major A, col-major B)
-//   anything else / ragged bands    -> pack_scalar
-//
-// Each fast path returns the first p-group it did NOT fill, which pack_scalar takes.
-
-// 16 lanes contiguous per depth: load the two s-depths and ST2 interleave
-// straight into the layout.
-static size_t pack_lane_contig(uint16_t *dst, const uint16_t *src, long depth_stride, size_t k) {
-    for (size_t p = 0; p < k / 2; p++) {
-        const uint16_t *s0 = src + (long)(2 * p) * depth_stride, *s1 = s0 + depth_stride;
-        uint16x8x2_t lo = {{vld1q_u16(s0), vld1q_u16(s1)}};
-        uint16x8x2_t hi = {{vld1q_u16(s0 + 8), vld1q_u16(s1 + 8)}};
-        vst2q_u16(dst + p * 32, lo);
-        vst2q_u16(dst + p * 32 + 16, hi);
-    }
-    return k / 2;
-}
-
-// One 8-lane x 8-depth block: transpose so each vector is one depth across the
-// 8 lanes, then zip the two depths of a p-group -- that zip IS the pair
-// interleave the layout wants.
-static inline void pack_block8(uint16_t *dst, const uint16_t *src, long lane_stride, size_t lg,
-                               size_t d0) {
-    uint16x8_t r[8];
-    for (int i = 0; i < 8; i++)
-        r[i] = vld1q_u16(src + (long)(lg + i) * lane_stride + (long)d0);
-    transpose_8x8_u16(r); // r[t] = depth d0+t across the 8 lanes
-    for (int t = 0; t < 4; t++) {
-        uint16_t *o = dst + (d0 / 2 + (size_t)t) * 32 + 2 * lg;
-        vst1q_u16(o, vzip1q_u16(r[2 * t], r[2 * t + 1]));
-        vst1q_u16(o + 8, vzip2q_u16(r[2 * t], r[2 * t + 1]));
-    }
-}
-
-// Each lane contiguous in depth. The 32-bit-gather alternative issues 16 strided
-// loads per p-group; blocking through the transpose measured ~1.4-2x over it.
-static size_t pack_depth_contig(uint16_t *dst, const uint16_t *src, long lane_stride, size_t k) {
-    size_t kt = k & ~(size_t)7; // whole 8-depth blocks
-    for (size_t lg = 0; lg < 16; lg += 8)
-        for (size_t d0 = 0; d0 < kt; d0 += 8)
-            pack_block8(dst, src, lane_stride, lg, d0);
-    // Depth remainder below 8: the 32-bit gather, still cheaper than scalar.
-    for (size_t p = kt / 2; p < k / 2; p++)
-        for (size_t i = 0; i < 16; i++)
-            memcpy(dst + p * 32 + 2 * i, src + (long)i * lane_stride + 2 * (long)p, 4);
-    return k / 2;
-}
-
-// Scalar filler from p-group `p0` on: ragged bands, odd-K slices, and layouts
-// with neither stride equal to 1. Zero past the lane and depth edges.
-static void pack_scalar(uint16_t *dst, const uint16_t *src, long lane_stride, long depth_stride,
-                        size_t k, size_t valid, size_t p0) {
-    for (size_t p = p0; p < (k + 1) / 2; p++)
-        for (size_t i = 0; i < 16; i++)
-            for (size_t s = 0; s < 2; s++) {
-                size_t d = 2 * p + s;
-                dst[p * 32 + 2 * i + s] =
-                    i < valid && d < k ? src[(long)i * lane_stride + (long)d * depth_stride] : 0;
-            }
-}
-
-// Pack 16-lane bands [s0, s1) of an operand with `lanes` lanes into consecutive
-// [KP, 32] bands at dst. Bands past the edge zero-fill without reading src (the
-// base is clamped, so no out-of-bounds pointer is even formed).
-static void pack_bands(void *dst_v, const void *src_v, long lane_stride, long depth_stride,
-                       size_t lanes, size_t k, size_t s0, size_t s1) {
-    uint16_t *dst = (uint16_t *)dst_v;
-    const uint16_t *src = (const uint16_t *)src_v;
-    size_t per_tile = ep_cmul((k + 1) / 2, 32);
-    for (size_t st = s0; st < s1; st++, dst += per_tile) {
-        size_t l0 = st * 16, v = l0 < lanes ? (lanes - l0 < 16 ? lanes - l0 : 16) : 0;
-        const uint16_t *s = v ? src + (long)l0 * lane_stride : src;
-        size_t p0 = 0;
-        if (v == 16 && depth_stride == 1)
-            p0 = pack_depth_contig(dst, s, lane_stride, k);
-        else if (v == 16 && lane_stride == 1)
-            p0 = pack_lane_contig(dst, s, depth_stride, k);
-        pack_scalar(dst, s, lane_stride, depth_stride, k, v, p0);
-    }
 }
 
 // Given the two f32 halves of one 32-lane C slice, already scaled by beta, add
@@ -363,7 +276,8 @@ static int run_cols(typename E::T *dst, long dst_cs, long dst_rs, const typename
       for (size_t i; (i = cur->fetch_add(1, std::memory_order_relaxed)) < n_units;) {
           if (i < n_chunks) {
               size_t mt0 = i * M_CHUNK, mt1 = mt0 + M_CHUNK < m_tiles ? mt0 + M_CHUNK : m_tiles;
-              pack_bands(a_pack + 2 * mt0 * per_tile, a, lhs_rs, lhs_cs, m, k, 2 * mt0, 2 * mt1);
+              pack_bands<Mopa<T, float>>(a_pack + 2 * mt0 * per_tile, a, lhs_rs, lhs_cs, m, k,
+                                         2 * mt0, 2 * mt1);
               a_done[i].store(1, std::memory_order_release);
               a_cnt->fetch_add(1, std::memory_order_release);
               continue;
@@ -381,7 +295,7 @@ static int run_cols(typename E::T *dst, long dst_cs, long dst_rs, const typename
                                    t1, kp, alpha, beta, read_dst);
               mt_lo = 1;
           } else {
-              pack_bands(bt, b, rhs_cs, rhs_rs, n, k, 2 * t0, 2 * t1);
+              pack_bands<Mopa<T, float>>(bt, b, rhs_cs, rhs_rs, n, k, 2 * t0, 2 * t1);
           }
           // All of A packed: one pass. Otherwise M-chunk by M-chunk as each lands.
           int all = a_cnt->load(std::memory_order_acquire) == n_chunks;
@@ -432,7 +346,7 @@ static int run_panels(typename E::T *dst, long dst_cs, long dst_rs, const typena
     T *a_pack = (T *)apack_scratch(ep_cmul(ep_cmul(2 * m_tiles, per_tile), sizeof(T)));
     if (!pool || !a_pack) return -1;
     std::atomic<size_t> *a_done = ctr + 2 * n_blocks + 2;
-    if (n_chunks <= 1) pack_bands(a_pack, a, lhs_rs, lhs_cs, m, k, 0, 2 * m_tiles);
+    if (n_chunks <= 1) pack_bands<Mopa<T, float>>(a_pack, a, lhs_rs, lhs_cs, m, k, 0, 2 * m_tiles);
 
     ring_run(
         n_blocks, n_d, n_chunks * n_sub, ctr,
@@ -440,7 +354,8 @@ static int run_panels(typename E::T *dst, long dst_cs, long dst_rs, const typena
           size_t lo = sd * nc_blk, hi = lo + nc_blk < n_tiles ? lo + nc_blk : n_tiles;
           size_t t0 = lo + j * dt, t1 = t0 + dt < hi ? t0 + dt : hi;
           T *slot = pool + (sd % RING_SLOTS) * slot_elems;
-          pack_bands(slot + (t0 - lo) * tile, b, rhs_cs, rhs_rs, n, k, 2 * t0, 2 * t1);
+          pack_bands<Mopa<T, float>>(slot + (t0 - lo) * tile, b, rhs_cs, rhs_rs, n, k, 2 * t0,
+                                     2 * t1);
         },
         ^(size_t sg, size_t j) {
           size_t lo = sg * nc_blk, hi = lo + nc_blk < n_tiles ? lo + nc_blk : n_tiles;
@@ -449,7 +364,8 @@ static int run_panels(typename E::T *dst, long dst_cs, long dst_rs, const typena
           size_t n0 = lo + sj * ns < hi ? lo + sj * ns : hi, n1 = n0 + ns < hi ? n0 + ns : hi;
           // Block 0's first item per M-chunk packs that chunk of A.
           if (n_chunks > 1 && sg == 0 && sj == 0) {
-              pack_bands(a_pack + 2 * mt0 * per_tile, a, lhs_rs, lhs_cs, m, k, 2 * mt0, 2 * mt1);
+              pack_bands<Mopa<T, float>>(a_pack + 2 * mt0 * per_tile, a, lhs_rs, lhs_cs, m, k,
+                                         2 * mt0, 2 * mt1);
               a_done[ci].store(1, std::memory_order_release);
           } else if (n_chunks > 1) {
               while (!a_done[ci].load(std::memory_order_acquire))
@@ -491,8 +407,8 @@ static int run(size_t m, size_t n, size_t k, uint16_t *dst_bits, long dst_cs, lo
         free(b_pack);
         return -1;
     }
-    pack_bands(b_pack, b, rhs_cs, rhs_rs, n, k, 0, 2 * n_tiles);
-    pack_bands(a_pack, a, lhs_rs, lhs_cs, m, k, 0, 2 * m_tiles);
+    pack_bands<Mopa<T, float>>(b_pack, b, rhs_cs, rhs_rs, n, k, 0, 2 * n_tiles);
+    pack_bands<Mopa<T, float>>(a_pack, a, lhs_rs, lhs_cs, m, k, 0, 2 * m_tiles);
     run_streaming<E>(dst, dst_cs, dst_rs, a_pack, b_pack, m, n, 0, m_tiles, 0, n_tiles, kp, alpha,
                      beta, read_dst);
     free(b_pack);

@@ -17,40 +17,10 @@
 
 #include "epilogue.h"
 #include "gemm_float.h"
+#include "pack.h"
 
-// Pack one 8-wide band into [k, 8]: dst[d*8 + i] = src[i, d]. NEON fast paths
-// for the full-8-lane case: lanes contiguous (B) -> copy per depth; depth
-// contiguous (row-major A) -> 2x2 f64 transpose.
-static void pack_band(double *dst, const double *src, long lane_stride, long depth_stride, size_t k,
-                      size_t valid) {
-    if (valid == 8 && lane_stride == 1) {
-        for (size_t d = 0; d < k; d++)
-            memcpy(dst + d * 8, src + (long)d * depth_stride, 8 * sizeof(double));
-        return;
-    }
-    if (valid == 8 && depth_stride == 1) {
-        // Depth-outer so the four lane groups of one depth fill its 64-byte line
-        // consecutively; lane-group-outer walks the whole panel four times. Same
-        // reasoning as the f32 twin.
-        size_t kf = k & ~(size_t)1;
-        for (size_t d = 0; d < kf; d += 2) {
-            for (size_t rg = 0; rg < 8; rg += 2) {
-                float64x2_t r0 = vld1q_f64(src + (long)(rg + 0) * lane_stride + d);
-                float64x2_t r1 = vld1q_f64(src + (long)(rg + 1) * lane_stride + d);
-                vst1q_f64(dst + (d + 0) * 8 + rg, vtrn1q_f64(r0, r1));
-                vst1q_f64(dst + (d + 1) * 8 + rg, vtrn2q_f64(r0, r1));
-            }
-        }
-        for (size_t d = kf; d < k; d++)
-            for (size_t i = 0; i < 8; i++)
-                dst[d * 8 + i] = src[(long)i * lane_stride + d];
-        return;
-    }
-    for (size_t d = 0; d < k; d++)
-        for (size_t i = 0; i < 8; i++)
-            dst[d * 8 + i] =
-                (i < valid) ? src[(long)i * lane_stride + (long)d * depth_stride] : 0.0;
-}
+// The packing atom: [k, 8] bands of 8 lanes, one depth per group (pack.h).
+using DA = Mopa<double, double>;
 
 // Largest B (n*k*8 bytes) the direct-B path may read unpacked, and the flop
 // count below which it stays on one cluster; see gemm_f32.cc. The budget is well
@@ -159,11 +129,7 @@ int gemm_sme_f64_run(size_t m, size_t n, size_t k, double *dst, long dst_cs, lon
 
     // Small + row-major B: direct B load (no B pack), light dispatch. See gemm_f32.cc.
 #define PACKA_SMALL(AP, MT0, MT1)                                                                  \
-    for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                             \
-        size_t r0 = st * 8;                                                                        \
-        size_t vr = (r0 < m) ? ((m - r0 < 8) ? (m - r0) : 8) : 0;                                  \
-        pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr); \
-    }
+    pack_bands<DA>((AP) + 2 * (MT0) * per_tile, lhs, lhs_rs, lhs_cs, m, k, 2 * (MT0), 2 * (MT1))
     // Direct-B gate is B's footprint, and the serial gate a flop floor; see
     // gemm_f32.cc for why.
     size_t b_budget = SME_F64_DIRECT_B_BYTES / sizeof(double);
@@ -227,14 +193,7 @@ size_t gemm_sme_f64_packed_b_elems(size_t n, size_t k) {
 // doubles: [2*n_tiles][k, 8] bands, the layout run_streaming consumes.
 void gemm_sme_f64_packb(double *b_pack, const double *rhs, size_t n, size_t k, long rhs_rs,
                         long rhs_cs) {
-    size_t per_tile = ep_cmul(k, 8);
-    size_t n_tiles = (n + 15) / 16;
-    for (size_t st = 0; st < 2 * n_tiles; st++) {
-        size_t c0 = st * 8;
-        size_t vc = (c0 < n) ? ((n - c0 < 8) ? (n - c0) : 8) : 0;
-        // vc==0 bands are zero-filled without reading src; clamp the base.
-        pack_band(b_pack + st * per_tile, vc ? rhs + (long)c0 * rhs_cs : rhs, rhs_cs, rhs_rs, k, vc);
-    }
+    pack_bands<DA>(b_pack, rhs, rhs_cs, rhs_rs, n, k, 0, 2 * ((n + 15) / 16));
 }
 
 // Packed-B f64 GEMM: caller supplies B pre-packed via gemm_sme_f64_packb. No
@@ -250,13 +209,7 @@ int gemm_sme_f64_run_packed(size_t m, size_t n, size_t k, double *dst, long dst_
     size_t per_tile = ep_cmul(k, 8);
 
 #define PACKA_RANGE(AP, MT0, MT1)                                                                  \
-    for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                             \
-        size_t r0 = st * 8;                                                                        \
-        size_t vr = (r0 < m) ? ((m - r0 < 8) ? (m - r0) : 8) : 0;                                  \
-        /* vr==0 bands are zero-filled without reading src; clamp the base so no   */               \
-        /* out-of-bounds pointer is even formed (UB without a deref), as the B band above. */       \
-        pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr); \
-    }
+    pack_bands<DA>((AP) + 2 * (MT0) * per_tile, lhs, lhs_rs, lhs_cs, m, k, 2 * (MT0), 2 * (MT1))
 
     size_t M_CHUNK = 2;
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;

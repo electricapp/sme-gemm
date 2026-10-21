@@ -151,30 +151,35 @@ streaming loop; stepping a separate block counter avoids it.
 
 ### 2.6 Operand packing
 
-Both operands land in the same tile-major panel, so each kernel needs two pack
-routines, chosen by which stride is 1. A and B differ only in which stride that
-is — A's lanes are rows, B's are columns.
+Both operands land in the same tile-major panel, packed by one template over the
+MOPA atom (`csrc/pack.h`). A band is `kTile` lanes — A's rows or B's columns —
+by K, stored as `ceil(K / kGroup)` depth groups of one 64-byte vector:
+`band[p*kRow + kGroup*i + s] = src[i, kGroup*p + s]`. One lane's group is a
+unit of `kGroup × sizeof(T)` bytes (2, 4 or 8), and in every kernel a depth group
+is four lane groups of `16 / unit` lanes, so all six atoms pack the same way,
+chosen by which stride is 1:
 
-| operand layout           | lanes at each depth | routine                                   |
-| ------------------------ | ------------------- | ----------------------------------------- |
-| row-major A, col-major B | strided             | transpose (lane-contiguous → depth-major) |
-| col-major A, row-major B | contiguous          | direct copy / interleave                  |
+| operand layout           | lanes at each depth | routine                                                           |
+| ------------------------ | ------------------- | ----------------------------------------------------------------- |
+| row-major A, col-major B | strided             | N×N transpose of units: 8×8 of 2 bytes, 4×4 of 4, 2×2 of 8        |
+| col-major A, row-major B | contiguous          | copy each depth row (`kGroup` 1) or interleave `kGroup` (ST2/ST4) |
 
-Both directions are vectorized in every dtype. The transposing side uses NEON
-block transposes: `transpose_8x8_u16`, shared by all four 16-bit drivers via
-`csrc/transpose16.h`, 4×4 for f32, 2×2 for f64. The widening kernels want a
-pair-interleaved destination (`dst[p*32 + 2*lane + s]`), which is compatible
-with a block transpose: an 8×8 transpose yields one depth per vector, and
-zipping the two depth vectors of a p-group is exactly that interleave.
-
-Two rules hold across the layer:
+The rules that hold across the layer:
 
 - **Walk the panel depth-outer.** A store that strides one lane-row is a cache
   line, so a lane-outer loop re-walks the whole `k × lanes` panel once per lane.
+- **Two transposes a step.** Each lane's 32 contiguous bytes load together and
+  the two `vtrn` ladders overlap; one alone runs latency-bound over its strided
+  loads.
+- **Bands share source lines.** With lanes contiguous a band covers
+  `64 / kGroup` bytes of each source row, so `kGroup` bands advance through depth
+  together and every line is consumed on first touch. Past an 8 KB row pitch
+  the rows sit pages apart and four bands go together, one page walk per four
+  lines; below it more bands only add write streams.
 - **Scalar fillers are for edges only** — ragged bands, odd-K slices, and
-  layouts with neither stride equal to 1. A fast path gated on the full-band
-  case would send every narrow-M call down the scalar path, which is where
-  latency matters most.
+  layouts with neither stride equal to 1. Edge bands still take the vector
+  paths for their whole lane groups, and zero what lies past the edge with
+  fixed-size stores.
 
 ### 2.7 Flash attention
 
@@ -535,22 +540,22 @@ streaming functions call `__arm_tpidr2_{save,restore}` from compiler-rt.
 Several kernels are split across `.h` fragments `#include`d into the TU that
 owns them:
 
-| TU               | fragments                              |
-| ---------------- | -------------------------------------- |
-| `epilogue.h`     | `epilogue_{scalar,f16,bf16,f32,f64}.h` |
-| `gemm_f16f16.cc` | `gemm_f16f16_q4.h`                     |
-| `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                     |
+| TU               | fragments                                   |
+| ---------------- | ------------------------------------------- |
+| `epilogue.h`     | `epilogue_{scalar,f16,bf16,f32,f64,rows}.h` |
+| `gemm_f16f16.cc` | `gemm_f16f16_q4.h`                          |
+| `gemm_b16b16.cc` | `gemm_b16b16_q4.h`                          |
 
 The split is for navigability, not compilation. Each fragment closes over its
 parent's `static` kernels and typedefs, so it cannot be its own TU without
 exporting all of that, and each is included at exactly the point its code would
 otherwise occupy, leaving the preprocessed TU and the generated code unchanged.
-`csrc/transpose16.h`, `csrc/panel_ring.h`, `csrc/sme_tile.h`,
-`csrc/gemm_half.h`, `csrc/gemm_float.h` and `csrc/gemm_int.h` are the
-exceptions: genuinely shared headers, the first included by every 16-bit driver,
-the second (the §2.9/§2.10 scheduler) by the f16, bf16, widening and f32
-drivers, the third (§3) by the kernels built from it. The last three are kernel
-templates over the element type, instantiated by each TU under its own target
+`csrc/pack.h`, `csrc/panel_ring.h`, `csrc/sme_tile.h`, `csrc/gemm_half.h`,
+`csrc/gemm_float.h` and `csrc/gemm_int.h` are the exceptions: genuinely shared
+headers, the first (the §2.6 packer) included by every MOPA driver, the second
+(the §2.9/§2.10 scheduler) by the f16, bf16, widening and f32 drivers, the third
+(§3) by the kernels built from it. The last three are kernel templates over the
+element type, instantiated by each TU under its own target
 features: `gemm_half.h` holds the whole native 16-bit GEMM -- packing, GEMV,
 MOPA and batched kernels and their drivers -- for f16 and bf16
 (`gemm_f16f16.cc`, `gemm_b16b16.cc`, whose 4-bit fragments build on it),

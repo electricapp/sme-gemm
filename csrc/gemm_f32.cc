@@ -18,57 +18,11 @@
 
 #include "epilogue.h"
 #include "gemm_float.h"
+#include "pack.h"
 #include "panel_ring.h"
 
-// Pack one 16-wide band into [k, 16]: dst[d*16 + i] = src[i, d]. Two NEON fast
-// paths for the full-16-lane case (a scalar transpose was the dominant
-// small/medium-tile pack cost):
-//   * lanes contiguous (B, lane_stride==1): each depth is a 16-float contiguous
-//     run -> straight copy per depth.
-//   * depth contiguous (row-major A, depth_stride==1): 4x4 f32 NEON transpose
-//     turns 4 rows x 4 depths into 4 packed depth-vectors.
-static void pack_band(float *dst, const float *src, long lane_stride, long depth_stride, size_t k,
-                      size_t valid) {
-    if (valid == 16 && lane_stride == 1) {
-        for (size_t d = 0; d < k; d++)
-            memcpy(dst + d * 16, src + (long)d * depth_stride, 16 * sizeof(float));
-        return;
-    }
-    if (valid == 16 && depth_stride == 1) {
-        // DEPTH-OUTER. Each 4x4 transpose stores 16 bytes at a 64-byte stride, so
-        // with the lane group outer the loop makes four passes over the whole
-        // k*16 panel, touching every destination line four times. Depth-outer
-        // means the four lane groups of one depth fill that line back to back and
-        // the panel is walked once.
-        size_t kf = k & ~(size_t)3;
-        for (size_t d = 0; d < kf; d += 4) {
-            for (size_t rg = 0; rg < 16; rg += 4) {
-                float32x4_t r0 = vld1q_f32(src + (long)(rg + 0) * lane_stride + d);
-                float32x4_t r1 = vld1q_f32(src + (long)(rg + 1) * lane_stride + d);
-                float32x4_t r2 = vld1q_f32(src + (long)(rg + 2) * lane_stride + d);
-                float32x4_t r3 = vld1q_f32(src + (long)(rg + 3) * lane_stride + d);
-                float32x4x2_t t01 = vtrnq_f32(r0, r1);
-                float32x4x2_t t23 = vtrnq_f32(r2, r3);
-                float32x4_t c0 = vcombine_f32(vget_low_f32(t01.val[0]), vget_low_f32(t23.val[0]));
-                float32x4_t c1 = vcombine_f32(vget_low_f32(t01.val[1]), vget_low_f32(t23.val[1]));
-                float32x4_t c2 = vcombine_f32(vget_high_f32(t01.val[0]), vget_high_f32(t23.val[0]));
-                float32x4_t c3 = vcombine_f32(vget_high_f32(t01.val[1]), vget_high_f32(t23.val[1]));
-                vst1q_f32(dst + (d + 0) * 16 + rg, c0);
-                vst1q_f32(dst + (d + 1) * 16 + rg, c1);
-                vst1q_f32(dst + (d + 2) * 16 + rg, c2);
-                vst1q_f32(dst + (d + 3) * 16 + rg, c3);
-            }
-        }
-        for (size_t d = kf; d < k; d++)
-            for (size_t i = 0; i < 16; i++)
-                dst[d * 16 + i] = src[(long)i * lane_stride + d];
-        return;
-    }
-    for (size_t d = 0; d < k; d++)
-        for (size_t i = 0; i < 16; i++)
-            dst[d * 16 + i] =
-                (i < valid) ? src[(long)i * lane_stride + (long)d * depth_stride] : 0.0f;
-}
+// The packing atom: [k, 16] bands of 16 lanes, one depth per group (pack.h).
+using FA = Mopa<float, float>;
 
 // Largest B (n*k*4 bytes) the small path may read unpacked; justified at its use
 // site in gemm_sme_f32_run.
@@ -383,20 +337,13 @@ static float *bcast_rows(const float *a, long rs, long cs, size_t m, size_t k) {
 // Pack super-tiles [t0, t1) of B into consecutive band pairs at dst.
 static void pack_b_range(float *dst, const float *b, long rs, long cs, size_t n, size_t k,
                          size_t t0, size_t t1) {
-    size_t per_tile = ep_cmul(k, 16);
-    for (size_t st = 2 * t0; st < 2 * t1; st++) {
-        size_t c0 = st * 16, vc = c0 < n ? (n - c0 < 16 ? n - c0 : 16) : 0;
-        pack_band(dst + (st - 2 * t0) * per_tile, vc ? b + (long)c0 * cs : b, cs, rs, k, vc);
-    }
+    pack_bands<FA>(dst, b, cs, rs, n, k, 2 * t0, 2 * t1);
 }
 
+// Pack super-tiles [mt0, mt1) of A into their band pairs of a_pack.
 static void pack_a_range(float *a_pack, const float *a, long rs, long cs, size_t m, size_t k,
                          size_t mt0, size_t mt1) {
-    size_t per_tile = ep_cmul(k, 16);
-    for (size_t st = 2 * mt0; st < 2 * mt1; st++) {
-        size_t r0 = st * 16, vr = r0 < m ? (m - r0 < 16 ? m - r0 : 16) : 0;
-        pack_band(a_pack + st * per_tile, vr ? a + (long)r0 * rs : a, rs, cs, k, vr);
-    }
+    pack_bands<FA>(a_pack + 2 * mt0 * ep_cmul(k, 16), a, rs, cs, m, k, 2 * mt0, 2 * mt1);
 }
 
 // Row-major B read in place for super-tile nt (`b` is B's column 0, row stride
@@ -665,12 +612,8 @@ int gemm_sme_f32_run(size_t m, size_t n, size_t k, float *dst, long dst_cs, long
     // Serial when a single chunk; otherwise a light dispatch over both clusters
     // (no B pack and a shared A-pack, so much cheaper than the main path's
     // per-call B packing). The full parallel path's overhead dominates here.
-#define PACKA_SMALL(AP, MT0, MT1)                                                                   \
-    for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                             \
-        size_t r0 = st * 16;                                                                        \
-        size_t vr = (r0 < m) ? ((m - r0 < 16) ? (m - r0) : 16) : 0;                                 \
-        pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr);  \
-    }
+#define PACKA_SMALL(AP, MT0, MT1)                                                                  \
+    pack_bands<FA>((AP) + 2 * (MT0) * per_tile, lhs, lhs_rs, lhs_cs, m, k, 2 * (MT0), 2 * (MT1))
     // Direct-B path: read B straight from the row-major rhs rather than pay a
     // full read and write of it to pack before any MOPA issues. B is then
     // re-read per M-tile, so what decides this is B's FOOTPRINT, not the problem
@@ -769,15 +712,7 @@ size_t gemm_sme_f32_packed_b_elems(size_t n, size_t k) {
 // floats: [2*n_tiles][k, 16] bands, the layout run_streaming consumes.
 void gemm_sme_f32_packb(float *b_pack, const float *rhs, size_t n, size_t k, long rhs_rs,
                         long rhs_cs) {
-    size_t per_tile = ep_cmul(k, 16);
-    size_t n_tiles = (n + 31) / 32;
-    for (size_t st = 0; st < 2 * n_tiles; st++) {
-        size_t c0 = st * 16;
-        size_t vc = (c0 < n) ? ((n - c0 < 16) ? (n - c0) : 16) : 0;
-        // vc==0 bands are zero-filled without reading src; clamp the base so no
-        // out-of-bounds pointer is even formed.
-        pack_band(b_pack + st * per_tile, vc ? rhs + (long)c0 * rhs_cs : rhs, rhs_cs, rhs_rs, k, vc);
-    }
+    pack_bands<FA>(b_pack, rhs, rhs_cs, rhs_rs, n, k, 0, 2 * ((n + 31) / 32));
 }
 
 // Packed-B f32 GEMM: caller supplies B pre-packed via gemm_sme_f32_packb, so only
@@ -794,13 +729,7 @@ int gemm_sme_f32_run_packed(size_t m, size_t n, size_t k, float *dst, long dst_c
 
     // A band: lane = M-row (stride lhs_rs), depth = K (stride lhs_cs).
 #define PACKA_RANGE(AP, MT0, MT1)                                                                  \
-    for (size_t st = 2 * (MT0); st < 2 * (MT1); st++) {                                            \
-        size_t r0 = st * 16;                                                                       \
-        size_t vr = (r0 < m) ? ((m - r0 < 16) ? (m - r0) : 16) : 0;                                \
-        /* vr==0 bands are zero-filled without reading src; clamp the base so no   */              \
-        /* out-of-bounds pointer is even formed (UB without a deref). */                           \
-        pack_band((AP) + st * per_tile, vr ? lhs + (long)r0 * lhs_rs : lhs, lhs_rs, lhs_cs, k, vr);\
-    }
+    pack_bands<FA>((AP) + 2 * (MT0) * per_tile, lhs, lhs_rs, lhs_cs, m, k, 2 * (MT0), 2 * (MT1))
 
     size_t M_CHUNK = 2;
     size_t n_chunks = (m_tiles + M_CHUNK - 1) / M_CHUNK;

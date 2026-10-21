@@ -22,7 +22,7 @@ fn main() {
 /// the `gemm_*_{batched,small,q4}.h` splits), so they need rerun tracking even
 /// though they are never compiled on their own.
 const CSRC: &[&str] = &[
-    "transpose16.h",
+    "pack.h",
     "panel_ring.h",
     "epilogue.h",
     "epilogue_scalar.h",
