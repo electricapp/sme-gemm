@@ -61,16 +61,13 @@
 //       Walk the whole graph for ONE vector slice (a ZA row/col already in a
 //       streaming-SVE register). The per-cell vector form.
 //
-//   ep_block_rowmajor_{f16,bf16,f32,f64}(...) + the EP_STORE_TILE_ROWMAJOR_*
-//   macros
+//   ep_store_rowmajor<E>(...) / ep_store_row<E>(...)   (epilogue_rows.h)
 //       The NODE-MAJOR register-resident store: read a 4-row block of the live ZA
 //       tile into Z registers, then dispatch each op-graph node ONCE across the
 //       block (invariant COL/scalar/act operands hoisted), and store. This is the
 //       hot store path for the common row-major output. Dispatching per row
 //       instead, through an out-of-line node loop, costs ~ms on large outputs.
-//       The EP_BLK_*_OP / EP_OPX / EP_OPL / EP_OPH macro families below each
-//       ep_block_rowmajor_* are the per-op-kind expansions the dispatch switch
-//       expands into.
+//       One template over the stored element type; EpRow<E> holds what differs.
 //
 //   ep_store_{f16,bf16,f32,f64}(p, pst, ptr, acc, vb, va, read_dst, nodes, ...)
 //       The non-row-major / col-major store helper: apply beta, run the op-graph on
@@ -102,10 +99,11 @@
 // FILES. This header holds the enums, EpNode/ep_desc* structs and the shared
 // macros; the evaluators live in the parts it includes at the bottom:
 //   epilogue_scalar.h  ep_act_scalar*, ep_apply_nodes_scalar_*, dequant cells
-//   epilogue_f16.h     ep_*_f16, EP_STORE_TILE_ROWMAJOR_F16, ep_block_rowmajor_f16
+//   epilogue_f16.h     ep_*_f16
 //   epilogue_bf16.h    ep_*_bf16 (the f32-domain bf16 evaluators)
 //   epilogue_f32.h     ep_*_f32; the vector transcendentals live here
 //   epilogue_f64.h     ep_*_f64
+//   epilogue_rows.h    the node-major row-major store, over all four
 // =============================================================================
 
 #ifndef SME_GEMM_EPILOGUE_H
@@ -283,10 +281,14 @@ static inline svfloat32_t ep_act_apply_f32(svbool_t p32, svfloat32_t x, int act,
                                            float alpha) __arm_streaming;
 
 
+// Order matters: each part uses the ones before it.
+// clang-format off
 #include "epilogue_scalar.h"
 #include "epilogue_f16.h"
 #include "epilogue_bf16.h"
 #include "epilogue_f32.h"
 #include "epilogue_f64.h"
+#include "epilogue_rows.h"
+// clang-format on
 
 #endif // SME_GEMM_EPILOGUE_H

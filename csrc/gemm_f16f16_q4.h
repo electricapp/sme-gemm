@@ -152,12 +152,10 @@ static int run_q4_panels(f16 *dst, const f16 *a, const uint8_t *nibbles, const f
             if (!n_nodes) {                                                                        \
                 svst1_f16(pst, out, acc);                                                          \
             } else {                                                                               \
-                EP_STORE_TILE_ROWMAJOR_F16(p16, pst, out, (long)n, EP_Q4G_RD, 1, vb, va, 0, nodes, \
-                                           n_nodes, r, n0);                                        \
+                ep_store_row(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, r, n0);           \
             }                                                                                      \
         }                                                                                          \
     } while (0)
-#define EP_Q4G_RD(s) acc
 
 // One row. The K-block sums are double-buffered: block b accumulates in sum
 // set b%2, and its fold into the totals runs one 8-deep step into block b+1.
@@ -433,7 +431,6 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv(
 }
 #undef Q4_DR
 #undef Q4_ST
-#undef EP_Q4G_RD
 
 // The GEMV for `rows` rows over bands [b_lo, b_hi).
 static void q4_gemv(f16 *dst, const f16 *a, const f16 *asum, size_t rows, const uint8_t *nibbles,

@@ -74,37 +74,18 @@ SME_INLINE void ep_col(svbool_t p16, svbool_t pst, T *ptr, Vec<T> acc, Vec<T> vb
         ep_store_f16(p16, pst, ptr, acc, vb, va, read_dst, nodes, n_nodes, 0, i, n0, m0);
 }
 
-// Node-major store of rows read by RD(slice); see EP_STORE_TILE_ROWMAJOR_F16 in
-// epilogue_f16.h.
-#define HALF_EP_ROWS(RD, mrows)                                                                    \
-    if constexpr (kBf16<T>) {                                                                      \
-        EP_STORE_TILE_ROWMAJOR_BF16(p16, pst, dst, row_stride, RD, mrows, vb, va, read_dst, nodes, \
-                                    n_nodes, i_base, n0);                                          \
-    } else {                                                                                       \
-        EP_STORE_TILE_ROWMAJOR_F16(p16, pst, dst, row_stride, RD, mrows, vb, va, read_dst, nodes,  \
-                                   n_nodes, i_base, n0);                                           \
-    }
-
-// `mrows` rows of ZA tile Z.
+// Node-major store of `mrows` rows of ZA tile Z (epilogue_rows.h).
 template <int Z, class T>
 SME_INLINE void ep_rows(Tile<Z>, svbool_t p16, svbool_t pst, Vec<T> z16, T *dst, long row_stride,
                         size_t mrows, Vec<T> vb, Vec<T> va, int read_dst, const EpNode *nodes,
                         uint32_t n_nodes, size_t i_base, size_t n0) __arm_streaming __arm_in("za") {
-#define HALF_RD(s) svread_hor_za16_m(z16, p16, Z, (s))
-    HALF_EP_ROWS(HALF_RD, mrows)
-#undef HALF_RD
+    ep_store_rowmajor(
+        p16, pst, pst, dst, row_stride,
+        [&] [[gnu::always_inline]] (uint32_t s) __arm_streaming __arm_in("za") {
+            return svread_hor_za16_m(z16, p16, Z, s);
+        },
+        0, mrows, vb, va, read_dst, nodes, n_nodes, i_base, n0);
 }
-
-// One row already in a register.
-template <class T>
-SME_INLINE void ep_row(svbool_t p16, svbool_t pst, Vec<T> acc, T *dst, long row_stride, Vec<T> vb,
-                       Vec<T> va, int read_dst, const EpNode *nodes, uint32_t n_nodes,
-                       size_t i_base, size_t n0) __arm_streaming {
-#define HALF_RD(s) acc
-    HALF_EP_ROWS(HALF_RD, 1)
-#undef HALF_RD
-}
-#undef HALF_EP_ROWS
 
 // Pack one 32-row M-tile of A into [K, 32]: dst[d*32 + i] = A[i, d].
 template <class T>
@@ -417,7 +398,7 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(T *dst, long dst_rs
                 if (pure) {
                     svst1(pst, out, acc);
                 } else if (has_ep) {
-                    ep_row(p16, pst, acc, out, dst_rs, vb, va, read_dst, nodes, n_nodes, r, n0);
+                    ep_store_row(p16, pst, pst, out, acc, vb, va, read_dst, nodes, n_nodes, r, n0);
                 } else {
                     store_slice(p16, pst, out, acc, vb, read_dst, va);
                 }
@@ -604,8 +585,8 @@ template <class T> static void bcast_row(T *abc, const T *a, long lhs_cs, size_t
 //        - col-major with epilogue: read each ZA vertical slice, run the op-graph
 //          (TENSOR ops route to the scalar path, being a strided gather).
 //        - row-major with epilogue: the NODE-MAJOR register-resident store
-//          (EP_STORE_TILE_ROWMAJOR_*) -- read a 4-row block, dispatch each node
-//          once per block. See epilogue.h.
+//          (ep_store_rowmajor, epilogue_rows.h) -- read a 4-row block, dispatch each node
+//          once per block.
 //        - fully strided: materialize a 32x32 scratch tile and store scalar-wise.
 //
 // REGISTER-FRAGILE / DO NOT SPLIT. This function is intentionally monolithic. The

@@ -127,12 +127,8 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(double *dst, const 
                 svst1_f64(plo, rp, lo);
                 svst1_f64(phi, rph, hi);
             } else if (has_ep) {
-#define EP_GEMV_RDL(s) lo
-#define EP_GEMV_RDH(s) hi
-                EP_STORE_TILE_ROWMAJOR_F64(p64, plo, phi, rp, 0, EP_GEMV_RDL, EP_GEMV_RDH, 0, 1, vb,
-                                           va, read_dst, nodes, n_nodes, 0, n0);
-#undef EP_GEMV_RDL
-#undef EP_GEMV_RDH
+                ep_store_row(p64, plo, phi, rp, svcreate2(lo, hi), vb, va, read_dst, nodes, n_nodes,
+                             0, n0);
             } else {
                 lo = svmul_x(p64, lo, vb);
                 hi = svmul_x(p64, hi, vb);

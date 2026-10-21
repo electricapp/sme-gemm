@@ -216,12 +216,10 @@ static inline size_t q2_cap(size_t rows) {
             if (!n_nodes) {                                                                        \
                 svst1_f16(pst, out, acc);                                                          \
             } else {                                                                               \
-                EP_STORE_TILE_ROWMAJOR_F16(p16, pst, out, (long)n, EP_Q2_RD, 1, vb, va, 0, nodes,  \
-                                           n_nodes, row, n0);                                      \
+                ep_store_row(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, row, n0);         \
             }                                                                                      \
         }                                                                                          \
     } while (0)
-#define EP_Q2_RD(s) acc
 
 // One pass: rows r0.. (RR of them) by bands b0.. (BB of them), all of K, with
 // WW-bit codes.
@@ -332,7 +330,6 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q2_gemv(const q2_
 #undef Q2_PASSES
 #undef Q2_PASS
 #undef Q2_ST
-#undef EP_Q2_RD
 #undef Q2_FOLD
 #undef Q2_Q
 #undef Q2_QJ

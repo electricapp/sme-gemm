@@ -30,6 +30,7 @@ const CSRC: &[&str] = &[
     "epilogue_bf16.h",
     "epilogue_f32.h",
     "epilogue_f64.h",
+    "epilogue_rows.h",
     "neon_act.h",
     "sme_gemm_api.h",
     "sme_tile.h",

@@ -43,22 +43,6 @@ static inline double ep_nodes_scalar(const EpNode *nodes, uint32_t n_nodes, doub
                                      size_t j) {
     return ep_apply_nodes_scalar_f64(nodes, n_nodes, x, i, j);
 }
-// Node-major store of tile rows [base_r, rmax) of row-major C, each row read as
-// its lo / hi half by rdl(slice) / rdh(slice).
-template <class T, class RL, class RH>
-SME_INLINE void ep_store_rows(svbool_t plo, svbool_t phi, T *dst, long row_stride, RL &&rdl,
-                              RH &&rdh, size_t base_r, size_t rmax, Vec<T> vb, Vec<T> va,
-                              int read_dst, const EpNode *nodes, uint32_t n_nodes, size_t i_base,
-                              size_t n0) __arm_streaming __arm_in("za") {
-    svbool_t p = ptrue<sizeof(T)>();
-    if constexpr (sizeof(T) == 4)
-        EP_STORE_TILE_ROWMAJOR_F32(p, plo, phi, dst, row_stride, rdl, rdh, base_r, rmax, vb, va,
-                                   read_dst, nodes, n_nodes, i_base, n0);
-    else
-        EP_STORE_TILE_ROWMAJOR_F64(p, plo, phi, dst, row_stride, rdl, rdh, base_r, rmax, vb, va,
-                                   read_dst, nodes, n_nodes, i_base, n0);
-}
-
 // What one call's store does, decided once. A leading per-column bias
 // (ADD_COL) alone folds into ZA through rank-1 MOPAs before the K-loop and is
 // dropped from the graph, so a bias-only graph reverts to the direct store (the
@@ -216,10 +200,10 @@ SME_INLINE void quad_store(T *dst, long dst_cs, long dst_rs, size_t m0, size_t n
             // Node-major: read the live ZA half-rows in 4-row blocks and dispatch
             // each node once per block across all halves.
             T *rbase = dst + (long)m0 * dst_rs + (long)n0;
-            ep_store_rows(plo, phi, rbase, dst_rs, ZaRow<0, T>{}, ZaRow<1, T>{}, 0, mr_lo, vb, va,
-                          read_dst, nodes, n_nodes, m0, n0);
-            ep_store_rows(plo, phi, rbase, dst_rs, ZaRow<2, T>{}, ZaRow<3, T>{}, W, mr, vb, va,
-                          read_dst, nodes, n_nodes, m0, n0);
+            ep_store_rowmajor(p, plo, phi, rbase, dst_rs, ZaRowPair<0, 1, T>{}, 0, mr_lo, vb, va,
+                              read_dst, nodes, n_nodes, m0, n0);
+            ep_store_rowmajor(p, plo, phi, rbase, dst_rs, ZaRowPair<2, 3, T>{}, W, mr, vb, va,
+                              read_dst, nodes, n_nodes, m0, n0);
             return;
         }
         // Clamp so no one-past-end pointer is formed; the hi-N band is empty

@@ -172,12 +172,8 @@ __arm_locally_streaming __arm_new("za") static void run_gemv(float *dst, long ds
                     svst1_f32(plo, rp, lo);
                     svst1_f32(phi, rph, hi);
                 } else if (has_ep) {
-#define EP_GEMV_RDL(s) lo
-#define EP_GEMV_RDH(s) hi
-                    EP_STORE_TILE_ROWMAJOR_F32(p32, plo, phi, rp, dst_rs, EP_GEMV_RDL, EP_GEMV_RDH, 0, 1,
-                                               vb, va, read_dst, nodes, n_nodes, r, n0);
-#undef EP_GEMV_RDL
-#undef EP_GEMV_RDH
+                    ep_store_row(p32, plo, phi, rp, svcreate2(lo, hi), vb, va, read_dst, nodes,
+                                 n_nodes, r, n0);
                 } else {
                     lo = svmul_x(p32, lo, vb);
                     hi = svmul_x(p32, hi, vb);
@@ -300,8 +296,8 @@ __arm_locally_streaming __arm_new("za") static void run_gemv_rm(
             svst1_f32(plo, rp, lo);                                                                \
             svst1_f32(phi, rph, hi);                                                               \
         } else if (has_ep) {                                                                       \
-            EP_STORE_TILE_ROWMAJOR_F32(p32, plo, phi, rp, dst_rs, EP_GEMV_RDL, EP_GEMV_RDH, 0, 1,  \
-                                       vb, va, read_dst, nodes, n_nodes, r, n0);                   \
+            ep_store_row(p32, plo, phi, rp, svcreate2(lo, hi), vb, va, read_dst, nodes, n_nodes,   \
+                         r, n0);                                                                   \
         } else {                                                                                   \
             lo = svmul_x(p32, lo, vb);                                                             \
             hi = svmul_x(p32, hi, vb);                                                             \
@@ -313,12 +309,8 @@ __arm_locally_streaming __arm_new("za") static void run_gemv_rm(
             svst1_f32(phi, rph, hi);                                                               \
         }                                                                                          \
     }
-#define EP_GEMV_RDL(s) lo
-#define EP_GEMV_RDH(s) hi
                 GEMV_ST(0)
                 GEMV_ST(1)
-#undef EP_GEMV_RDL
-#undef EP_GEMV_RDH
 #undef GEMV_ST
 #undef GEMV_BAND
             }

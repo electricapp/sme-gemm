@@ -709,6 +709,13 @@ add/mul/relu nodes still inline. A fused epilogue costs a few percent over the
 bare GEMM when compute-bound and up to about a third at the shallowest
 store-bound K.
 
+The store is one template over the stored element type (`csrc/epilogue_rows.h`);
+`EpRow<E>` says how a row computes. f16 holds a row as one vector, f32 and f64
+as the lo/hi halves that come from two ZA tiles, and bf16 widens its 32 lanes
+into two f32 halves, runs the graph in f32 and rounds once at the store. Each
+kernel hands it a row reader: a ZA slice, with the tile number as a template
+argument, or a GEMV row already in registers.
+
 ### Bias-init MOPA fold
 
 The fastest epilogue is none: a pure overwrite `C = A@B` stores ZA→C in one
@@ -829,8 +836,8 @@ their feature flags.
   `src/kernels/` module re-exported from `src/lib.rs`.
 - **Add an epilogue op:** the opcode in `enum ep_op` (`csrc/epilogue.h`) and the
   mirrored `EpOp` (`src/epilogue/mod.rs`) at the same numeric value; the
-  implementation in the per-dtype `ep_apply_nodes_*` and
-  `EP_STORE_TILE_ROWMAJOR_*` clusters in `csrc/epilogue.h`; a builder method on
+  implementation in the per-dtype `ep_apply_nodes_*` (`csrc/epilogue_*.h`) and
+  the one `ep_block_rowmajor` switch in `csrc/epilogue_rows.h`; a builder method on
   `Epilogue`/`Dequant` and the forwarding method on `Gemm`
   (`src/exec/builder.rs`); and the scalar evaluators (`ep_apply_cell`,
   `ep_apply_cell_f64`, `dq_apply_cell` in `src/exec/scalar.rs`, and

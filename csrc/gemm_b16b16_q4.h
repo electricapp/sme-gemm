@@ -254,17 +254,14 @@ __arm_locally_streaming __arm_new("za", "zt0") static void run_q4_gemv_bf16(
             if (!n_nodes) {                                                                        \
                 svst1_bf16(pst, out, acc);                                                         \
             } else {                                                                               \
-                EP_STORE_TILE_ROWMAJOR_BF16(p16, pst, out, (long)n, EP_Q4G_RD, 1, vb, va, 0,       \
-                                            nodes, n_nodes, r, n0);                                \
+                ep_store_row(p16, pst, pst, out, acc, vb, va, 0, nodes, n_nodes, r, n0);           \
             }                                                                                      \
         }                                                                                          \
     } while (0)
-#define EP_Q4G_RD(s) acc
                 Q4_ST(0);
                 Q4_ST(1);
                 Q4_ST(2);
                 Q4_ST(3);
-#undef EP_Q4G_RD
 #undef Q4_ST
             }
     }
