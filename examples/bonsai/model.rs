@@ -122,8 +122,10 @@ fn f32s(g: &Gguf, name: &str) -> io::Result<Vec<f32>> {
     if t.ty != gguf::F32 {
         return Err(io::Error::other(format!("{name}: expected F32")));
     }
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    Ok(b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
@@ -142,7 +144,7 @@ fn q1(g: &Gguf, names: &[&str]) -> io::Result<Q1Weights> {
             return Err(io::Error::other(format!("{name}: input width differs")));
         }
         n += t.dims[1];
-        for blk in b.chunks_exact(BLOCK_BYTES) {
+        for blk in b.as_chunks::<BLOCK_BYTES>().0 {
             scales.push(f16::from_le_bytes([blk[0], blk[1]]));
             signs.extend_from_slice(&blk[2..]);
         }
@@ -225,7 +227,8 @@ impl Model {
     fn embed(&self, t: u32, out: &mut [f32]) {
         let per_row = self.cfg.d / QK * BLOCK_BYTES;
         let row = &self.embd[t as usize * per_row..][..per_row];
-        for (blk, o) in row.chunks_exact(BLOCK_BYTES).zip(out.chunks_exact_mut(QK)) {
+        let blocks = row.as_chunks::<BLOCK_BYTES>().0;
+        for (blk, o) in blocks.iter().zip(out.as_chunks_mut::<QK>().0) {
             let s = f16::from_le_bytes([blk[0], blk[1]]).to_f32();
             for (i, v) in o.iter_mut().enumerate() {
                 *v = if blk[2 + i / 8] >> (i % 8) & 1 == 1 {

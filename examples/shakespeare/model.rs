@@ -41,8 +41,8 @@ impl Checkpoint {
                 if t.dtype() != Dtype::F32 {
                     return Err(at(&format!("{name} is {:?}, not F32", t.dtype())));
                 }
-                let data = t.data().chunks_exact(4);
-                let data = data.map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                let data = t.data().as_chunks::<4>().0.iter();
+                let data = data.map(|b| f32::from_le_bytes(*b));
                 Ok((name, (t.shape().to_vec(), data.collect())))
             })
             .collect::<Result<_, _>>()

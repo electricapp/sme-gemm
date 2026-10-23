@@ -2,7 +2,7 @@
 name = "sme-gemm"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.99.1"
 description = "Apple-Silicon-tuned SME (Scalable Matrix Extension) GEMM kernels for f16/bf16/f32/f64, i8/i16 and 4-bit weights on M4+"
 license = "MIT OR Apache-2.0"
 keywords = ["gemm", "sme", "matmul", "aarch64", "apple"]

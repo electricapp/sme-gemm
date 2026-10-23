@@ -142,11 +142,12 @@ pub(crate) const SME_ROWS: usize = 32;
 /// own keys and values (`start + rows` rows).
 ///
 /// `q` and `out` are `[rows][heads][head_dim]` f32. Below 32 rows each row is
-/// [`attention_kv_f16`] over its prefix exactly, the rows spread across cores.
-/// From there both products run on the SME unit, in key chunks of 1024 with
-/// flash attention's running max: the same roundings (q and the probabilities
-/// to f16, f32 sums), summed in another order, so a row agrees with the
-/// one-row call to an f16 rounding of a probability rather than bit for bit.
+/// [`attention_kv_f16`] over its prefix exactly, the rows spread across cores,
+/// as are all rows without SME. From there, on SME, both products run on the
+/// SME unit, in key chunks of 1024 with flash attention's running max: the
+/// same roundings (q and the probabilities to f16, f32 sums), summed in
+/// another order, so a row agrees with the one-row call to an f16 rounding of
+/// a probability rather than bit for bit.
 ///
 /// # Panics
 /// As [`attention_kv_f16`], with the caches holding `start + rows` rows.
@@ -194,7 +195,7 @@ pub fn attention_kv_causal_f16(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let kernel = if rows >= SME_ROWS {
+        let kernel = if rows >= SME_ROWS && crate::probe::caps().sme {
             crate::ffi::attn_kv_causal_sme_f16
         } else {
             crate::ffi::attn_kv_causal_f16
