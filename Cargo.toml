@@ -13,8 +13,8 @@ readme = "README.md"
 [dependencies]
 half = { version = "2", default-features = false }
 candle-core = { version = "0.11", optional = true }
-ort = { version = "2.0.0-rc.13", optional = true, features = ["coreml", "xnnpack", "half"] }
-burn = { version = "0.22", optional = true, default-features = false, features = ["ndarray"] }
+ort = { version = "2.0.0-rc.15", optional = true, features = ["coreml", "xnnpack", "half"] }
+burn = { version = "0.22", optional = true, default-features = false, features = ["flex", "simd", "rayon"] }
 
 [build-dependencies]
 cc = "1"
@@ -38,7 +38,8 @@ default = []
 candle = ["dep:candle-core"]
 # Benchmark vs ONNX Runtime (CPU / XNNPACK / CoreML EPs); examples/vs_ort.
 ort = ["dep:ort"]
-# Benchmark vs the burn framework's NdArray CPU backend; examples/vs_burn.
+# A burn adapter (src/burn.rs) and a benchmark vs burn's flex CPU backend;
+# examples/vs_burn.
 burn = ["dep:burn"]
 # Metal MPS + MLCompute ANE backends for examples/dispatch (not the GEMM lib).
 dispatch-cmp = []

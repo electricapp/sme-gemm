@@ -183,20 +183,21 @@ MACs/instr):
 | Q4→bf16  | 1.98 | 3.52 | 4.52  | 4.83  | 4.92  | 4.72         | 4.79          | 0.47          |
 
 **vs. other backends**, unpacked strided GEMM
-(`examples/vs_{accelerate,candle,burn}`, `inference_value`). Accel has no
-f16/`cblas`; † is upcast + `sgemm` + downcast. B is packed inside the parallel
-GEMM (ARCHITECTURE.md §2.10), so f16 here is within ~3% of pre-packed from
-2048³. Accelerate leads only at 256³ f32 (see dispatch table: the call is ~20
-µs, so streaming entry is a real slice):
+(`examples/vs_{accelerate,candle,burn}`, `inference_value`). burn is its flex
+CPU backend with `simd` + `rayon`. Accel has no f16/`cblas`; † is upcast +
+`sgemm` + downcast. B is packed inside the parallel GEMM (ARCHITECTURE.md
+§2.10), so f16 here is within ~3% of pre-packed from 2048³. Accelerate leads
+only at 256³ f32 (see dispatch table: the call is ~20 µs, so streaming entry
+is a real slice):
 
 | shape           | sme f32 | accel | candle | burn | sme f16 | accel † | candle | sme f64 | accel |
 | --------------- | ------- | ----- | ------ | ---- | ------- | ------- | ------ | ------- | ----- |
-| 256³            | 1.50    | 1.64  | 0.24   | 0.11 | 1.56    | —       | 0.31   | 0.46    | 0.45  |
-| 512³            | 1.91    | 1.61  | 0.39   | 0.11 | 3.69    | 0.95    | 0.74   | 0.57    | 0.46  |
-| 1024³           | 2.34    | 2.05  | 0.45   | 0.12 | 4.38    | 1.43    | 0.86   | 0.55    | 0.53  |
-| 2048³           | 2.29    | 2.08  | 0.45   | 0.12 | 4.83    | 1.73    | 0.88   | 0.55    | 0.52  |
+| 256³            | 1.50    | 1.64  | 0.24   | 0.23 | 1.56    | —       | 0.31   | 0.46    | 0.45  |
+| 512³            | 1.91    | 1.61  | 0.39   | 0.48 | 3.69    | 0.95    | 0.74   | 0.57    | 0.46  |
+| 1024³           | 2.34    | 2.05  | 0.45   | 0.56 | 4.38    | 1.43    | 0.86   | 0.55    | 0.53  |
+| 2048³           | 2.29    | 2.08  | 0.45   | 0.56 | 4.83    | 1.73    | 0.88   | 0.55    | 0.52  |
 | 4096³           | 2.33    | 2.06  | 0.45   | —    | 4.88    | 1.85    | 0.86   | 0.55    | 0.52  |
-| 4096×512×512    | 2.30    | 1.93  | 0.41   | 0.11 | 4.05    | —       | 0.81   | 0.61    | 0.52  |
+| 4096×512×512    | 2.30    | 1.93  | 0.41   | 0.53 | 4.05    | —       | 0.81   | 0.61    | 0.52  |
 | 16384×512×512   | 2.30    | 2.01  | 0.42   | —    | 4.22    | —       | 0.84   | 0.61    | 0.52  |
 | 4096×11008×4096 | —       | —     | —      | —    | 4.88    | 1.91    | —      | —       | —     |
 

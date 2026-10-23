@@ -1,12 +1,10 @@
-//! sme-gemm vs the burn framework's `NdArray` CPU backend, same data/best-of-N.
-//! (`NdArray` is f32/f64 only -- no f16 -- so this is the f32 fight.)
+//! sme-gemm vs the burn framework's flex (pure-Rust) CPU backend, f32, same
+//! data/best-of-N.
 //!   cargo run --release --features burn --example `vs_burn`
 
 use std::time::Instant;
 
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
-use burn::tensor::{Distribution, Tensor};
+use burn::tensor::{Device, Distribution, Tensor};
 use sme_gemm::matmul_f32;
 
 /// Best-of-N for both backends, INTERLEAVED: one timed round of each per pass.
@@ -40,9 +38,9 @@ fn main() {
         (2048, 2048, 2048),
         (4096, 512, 512),
     ];
-    let dev = NdArrayDevice::default();
+    let dev = Device::flex();
 
-    println!("== f32: sme-gemm vs burn NdArray (TF/s) ==");
+    println!("== f32: sme-gemm vs burn flex (TF/s) ==");
     println!(
         "  {:>16}  {:>8}  {:>8}  {:>8}",
         "shape", "sme", "burn", "speedup"
@@ -53,8 +51,8 @@ fn main() {
         let av = vec![0.02f32; m * k];
         let bv = vec![0.03f32; k * n];
         let mut c = vec![0.0f32; m * n];
-        let a = Tensor::<NdArray<f32>, 2>::random([m, k], Distribution::Default, &dev);
-        let b = Tensor::<NdArray<f32>, 2>::random([k, n], Distribution::Default, &dev);
+        let a = Tensor::<2>::random([m, k], Distribution::Default, &dev);
+        let b = Tensor::<2>::random([k, n], Distribution::Default, &dev);
         let mut s_sme = || matmul_f32(&av, &bv, &mut c, m, n, k);
         let mut s_burn = || {
             std::hint::black_box(a.clone().matmul(b.clone()));

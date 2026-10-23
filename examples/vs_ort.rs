@@ -4,9 +4,11 @@
 //!   uv run `models/gen_onnx.py`          # once, to build the .onnx models
 //!   cargo run --release --features ort --example `vs_ort`
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use half::f16;
+use ort::environment::Environment;
 use ort::ep::{CPU, CoreML, ExecutionProviderDispatch, XNNPACK};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -37,7 +39,9 @@ fn best_interleaved(big: bool, fs: &mut [&mut dyn FnMut()]) -> Vec<f64> {
 }
 
 fn session(model: &str, eps: Vec<ExecutionProviderDispatch>) -> Session {
-    Session::builder()
+    static ENV: OnceLock<Environment> = OnceLock::new();
+    let env = ENV.get_or_init(|| ort::init().build().expect("ort init failed"));
+    Session::builder(env)
         .expect("ort call failed")
         .with_execution_providers(eps)
         .expect("ort call failed")
