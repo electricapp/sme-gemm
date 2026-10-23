@@ -234,18 +234,14 @@ impl Norm {
 pub(crate) fn rms_scales(x: &[half::f16], k: usize, eps: f32, out: &mut [half::f16]) {
     for (row, o) in x.chunks_exact(k).zip(out.iter_mut()) {
         let mut acc = [0f32; 8];
-        let mut chunks = row.chunks_exact(8);
-        for c in &mut chunks {
+        let (chunks, tail) = row.as_chunks::<8>();
+        for c in chunks {
             for (a, v) in acc.iter_mut().zip(c) {
                 let v = v.to_f32();
                 *a += v * v;
             }
         }
-        let tail: f32 = chunks
-            .remainder()
-            .iter()
-            .map(|v| v.to_f32() * v.to_f32())
-            .sum();
+        let tail: f32 = tail.iter().map(|v| v.to_f32() * v.to_f32()).sum();
         let ms = (acc.iter().sum::<f32>() + tail) / k as f32;
         *o = half::f16::from_f32(1.0 / (ms + eps).sqrt());
     }
